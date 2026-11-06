@@ -1,6 +1,6 @@
 # TABX QMIX：服务器运行说明
 
-本分支默认 `timeout_rule=hp`；共同代码也支持 `loss`，两规则均有测试。模拟器固定使用仓库内官方子模块 `third_party/TABX`，任务 JSON 和模型/数据输出路径由运行参数指定。训练划分、逐局种子和 CPU 队列协议沿用原方案；旧快照和旧采集数据不混入这次迁移。
+本分支 `codex/tabx-timeout-loss` 默认 `timeout_rule=loss`：双方在时限仍存活时，友方判负；最后一步歼灭敌方仍判胜。复用 `codex/tabx-timeout-hp` 的共同实现，两规则均有测试。模拟器固定使用仓库内官方子模块 `third_party/TABX`，任务 JSON 和模型/数据输出路径由运行参数指定。训练划分、逐局种子和 CPU 队列协议沿用原方案；旧快照和旧采集数据不混入这次迁移。
 
 ## 1. 安装和指定路径
 
@@ -24,7 +24,7 @@ python -m pip install -r requirements-tabx.txt
 export TASK_BANK="data/tasks/1106_tasks_merged_multiagent.json"
 export TASK_SHA256="775cee683a650a726f056f05a20b1dc67d9b09104ceff9fb26ca0d11b4ac6887"
 export RESULT_ROOT="$EPYMARL_ROOT/results/tabx-official-v1"
-export RULE=hp
+export RULE=loss
 ```
 
 任务库可以放在项目的 `data/tasks/` 后随整目录迁移，也可以通过绝对路径使用外部文件。相对任务路径始终按 EPyMARL 项目根目录解析，和当前 shell 目录无关；任务 JSON 不随 Git 提交。
@@ -38,15 +38,15 @@ export RULE=hp
 | 任务文件校验 | `env_args.expected_bank_hash` | `--bank-sha256` |
 | 模型、日志、评估和数据根目录 | `tabx_output_root`，必填 | `--root`，必填 |
 | 任务 ID | `env_args.key`，内部统一为字符串 | `--task` / `--tasks` |
-| 实验规则 | `env_args.timeout_rule`，默认 hp | `--rule`，默认 hp |
+| 实验规则 | `env_args.timeout_rule`，默认 loss | `--rule`，从环境 YAML 读取，默认 loss |
 | 训练尝试名称 | `tabx_run_id`，默认生成唯一 ID | `--run-id` 定位一次训练 |
 
-TABX 的 `local_results_path` 自动设为本次 run 目录。模型和数据均位于：
+TABX 的 `local_results_path` 自动设为本次 run 目录。训练及 CPU CLI 默认规则均来自 `src/config/envs/tabx.yaml`；可用 `env_args.timeout_rule=hp` / `--rule hp` 显式覆盖。模型和数据均位于：
 
 ```text
 RESULT_ROOT/
   tabx_semantics.json               # 官方 commit、参数 JSON hash、布局与裁决定义
-  hp/<task_id>/<train_seed>/<run_id>/
+  loss/<task_id>/<train_seed>/<run_id>/
     manifest.json                   # 任务/任务库 hash、版本、种子协议、部署信息
     config.json                     # 运行配置
     checkpoints/<实际环境步数>/

@@ -526,11 +526,15 @@ def report(args):
 
 
 def parser():
+    import yaml
+    with (Path(__file__).resolve().parent / "config/envs/tabx.yaml").open(encoding="utf-8") as stream:
+        default_rule = yaml.safe_load(stream)["env_args"]["timeout_rule"]
     result = argparse.ArgumentParser(description=__doc__)
     commands = result.add_subparsers(dest="command", required=True)
     def common(name, help_text, bank=False, root=False):
         command = commands.add_parser(name, help=help_text)
-        command.add_argument("--rule", choices=("hp", "loss"), default="hp")
+        command.add_argument("--rule", choices=("hp", "loss"), default=default_rule,
+                             help=f"Timeout rule (default: {default_rule}, from config/envs/tabx.yaml)")
         if bank:
             command.add_argument("--bank", required=True, help="Task-bank JSON on this machine")
             command.add_argument("--tabx-root", default=None, help="Optional assertion of the pinned third_party/TABX path; external roots rejected")
