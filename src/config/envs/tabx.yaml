@@ -1,0 +1,18 @@
+env: tabx
+env_args:
+  key: "23"
+  task_bank: null  # Required: set on the command line
+  tabx_root: null  # AnyTABX checkout; alternatively set TABX_ROOT or PYTHONPATH
+  timeout_rule: hp
+  max_episode_steps: 512
+  world_state_type: global
+  jit: true
+  expected_task_hash: null
+  expected_bank_hash: null
+common_reward: true
+tabx_async_eval: true
+tabx_output_root: null  # Required; contains models, logs, evaluation and data
+tabx_run_id: null  # Generate a unique ID unless explicitly supplied
+tabx_master_seed: 0
+tabx_screen_episodes: 32
+tabx_max_pending_evals: 16

@@ -47,7 +47,7 @@ class Logger:
         if "map_name" in config["env_args"]:
             env_name += "_" + config["env_args"]["map_name"]
         elif "key" in config["env_args"]:
-            env_name += "_" + config["env_args"]["key"]
+            env_name += "_" + str(config["env_args"]["key"])
 
         non_hash_keys = ["seed"]
         self.config_hash = sha256(
@@ -65,6 +65,7 @@ class Logger:
             config=config,
             group=group_name,
             mode=mode,
+            **({"dir": config["local_results_path"]} if config.get("env") == "tabx" else {}),
         )
 
         self.console_logger.info("*******************")

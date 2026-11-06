@@ -9,6 +9,7 @@ import os
 from os.path import dirname, abspath
 import sys
 import yaml
+import ast
 
 import numpy as np
 from sacred import Experiment, SETTINGS
@@ -121,11 +122,23 @@ if __name__ == "__main__":
         elif param.startswith("env_args.key"):
             map_name = param.split("=")[1]
 
-    # Save to disk by default for sacred
-    logger.info("Saving to FileStorageObserver in results/sacred.")
+    # Resolve the output option before Sacred starts its observer. TABX never
+    # writes logs to the checkout's results/ directory.
+    output_root = config_dict.get("tabx_output_root") if config_dict["env"] == "tabx" else results_path
+    for param in params:
+        option, separator, value = param.partition("=")
+        if separator and option in (("tabx_output_root",) if config_dict["env"] == "tabx" else ("local_results_path",)):
+            try:
+                output_root = ast.literal_eval(value)
+            except (ValueError, SyntaxError):
+                output_root = value
+    if not output_root:
+        raise ValueError("TABX requires tabx_output_root=<server output directory>")
     file_obs_path = os.path.join(
-        results_path, f"sacred/{config_dict['name']}/{map_name}"
+        os.path.expanduser(str(output_root)), "_sacred" if config_dict["env"] == "tabx" else "sacred",
+        config_dict['name'], str(map_name).strip('\"\'')
     )
+    logger.info("Saving FileStorageObserver to %s", file_obs_path)
 
     # ex.observers.append(MongoObserver(db_name="marlbench")) #url='172.31.5.187:27017'))
     ex.observers.append(FileStorageObserver.create(file_obs_path))

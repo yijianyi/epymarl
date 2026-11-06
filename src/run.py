@@ -1,4 +1,5 @@
 import datetime
+import json
 import os
 from os.path import dirname, abspath
 import pprint
@@ -11,7 +12,7 @@ import torch as th
 
 from controllers import REGISTRY as mac_REGISTRY
 from components.episode_buffer import ReplayBuffer
-from components.transforms import OneHot
+from components.batch_schema import build_batch_schema
 from learners import REGISTRY as le_REGISTRY
 from runners import REGISTRY as r_REGISTRY
 from utils.general_reward_support import test_alg_config_supports_reward
@@ -25,6 +26,29 @@ def run(_run, _config, _log):
 
     args = SN(**_config)
     args.device = "cuda" if args.use_cuda else "cpu"
+    if args.env == "tabx":
+        if args.runner != "episode" or args.batch_size_run != 1:
+            raise ValueError("TABX currently requires runner=episode and batch_size_run=1")
+        if getattr(args, "tabx_async_eval", False) and not args.save_model:
+            raise ValueError("TABX asynchronous evaluation requires save_model=True")
+        if getattr(args, "tabx_async_eval", False) and (args.tabx_screen_episodes < 2 or args.tabx_max_pending_evals < 1):
+            raise ValueError("TABX requires tabx_screen_episodes>=2 and tabx_max_pending_evals>=1")
+        import logging
+        logging.getLogger("jax").setLevel(logging.WARNING)
+        logging.getLogger("jaxlib").setLevel(logging.WARNING)
+        from envs.tabx_tasks import import_tabx, load_task
+        from tabx_storage import create_run
+        import_tabx(args.env_args.get("tabx_root"))
+        _, task_manifest = load_task(args.env_args.get("task_bank"), args.env_args["key"])
+        _config["device"] = args.device
+        run_dir = create_run(_config, task_manifest)
+        import jax
+        jax.config.update("jax_compilation_cache_dir", os.environ.get(
+            "JAX_COMPILATION_CACHE_DIR", str(run_dir.parents[3] / "_jax_cache")))
+        _config["env_args"]["seed"] = int(args.seed)
+        from tabx_storage import atomic_json
+        atomic_json(run_dir / "config.json", _config)
+        args = SN(**_config)
     assert test_alg_config_supports_reward(
         args
     ), "The specified algorithm does not support the general reward setup. Please choose a different algorithm or set `common_reward=True`."
@@ -49,9 +73,7 @@ def run(_run, _config, _log):
 
     args.unique_token = unique_token
     if args.use_tensorboard:
-        tb_logs_direc = os.path.join(
-            dirname(dirname(abspath(__file__))), "results", "tb_logs"
-        )
+        tb_logs_direc = os.path.join(args.local_results_path, "tb_logs")
         tb_exp_direc = os.path.join(tb_logs_direc, "{}").format(unique_token)
         logger.setup_tb(tb_exp_direc)
 
@@ -105,25 +127,7 @@ def run_sequential(args, logger):
     args.n_actions = env_info["n_actions"]
     args.state_shape = env_info["state_shape"]
 
-    # Default/Base scheme
-    scheme = {
-        "state": {"vshape": env_info["state_shape"]},
-        "obs": {"vshape": env_info["obs_shape"], "group": "agents"},
-        "actions": {"vshape": (1,), "group": "agents", "dtype": th.long},
-        "avail_actions": {
-            "vshape": (env_info["n_actions"],),
-            "group": "agents",
-            "dtype": th.int,
-        },
-        "terminated": {"vshape": (1,), "dtype": th.uint8},
-    }
-    # For individual rewards in gymmai reward is of shape (1, n_agents)
-    if args.common_reward:
-        scheme["reward"] = {"vshape": (1,)}
-    else:
-        scheme["reward"] = {"vshape": (args.n_agents,)}
-    groups = {"agents": args.n_agents}
-    preprocess = {"actions": ("actions_onehot", [OneHot(out_dim=args.n_actions)])}
+    scheme, groups, preprocess = build_batch_schema(env_info, args.common_reward)
 
     buffer = ReplayBuffer(
         scheme,
@@ -146,6 +150,10 @@ def run_sequential(args, logger):
     if args.use_cuda:
         learner.cuda()
 
+    async_tabx = getattr(args, "tabx_async_eval", False)
+    if async_tabx and (args.env != "tabx" or args.runner != "episode" or args.batch_size_run != 1 or not args.save_model):
+        raise ValueError("tabx_async_eval requires TABX, episode runner, batch_size_run=1 and save_model=True")
+
     if args.checkpoint_path != "":
         timesteps = []
         timestep_to_load = 0
@@ -156,6 +164,13 @@ def run_sequential(args, logger):
             )
             return
 
+        # Accept either a concrete snapshot or an existing numbered parent.
+        if os.path.isfile(os.path.join(args.checkpoint_path, "agent.th")):
+            model_path = args.checkpoint_path
+            from pathlib import Path
+            timestep_to_load = int(Path(model_path).name) if Path(model_path).name.isdigit() else 0
+        else:
+            model_path = None
         # Go through all files in args.checkpoint_path
         for name in os.listdir(args.checkpoint_path):
             full_name = os.path.join(args.checkpoint_path, name)
@@ -163,14 +178,20 @@ def run_sequential(args, logger):
             if os.path.isdir(full_name) and name.isdigit():
                 timesteps.append(int(name))
 
-        if args.load_step == 0:
+        if model_path is None and not timesteps:
+            raise ValueError(f"No checkpoints found in {args.checkpoint_path}")
+        if model_path is None and args.load_step == 0:
             # choose the max timestep
             timestep_to_load = max(timesteps)
-        else:
+        elif model_path is None:
             # choose the timestep closest to load_step
             timestep_to_load = min(timesteps, key=lambda x: abs(x - args.load_step))
 
-        model_path = os.path.join(args.checkpoint_path, str(timestep_to_load))
+        model_path = model_path or os.path.join(args.checkpoint_path, str(timestep_to_load))
+
+        if args.env == "tabx":
+            from tabx_storage import validate_snapshot
+            validate_snapshot(model_path, runner.env.manifest, runner.env.rule)
 
         logger.console_logger.info("Loading model from {}".format(model_path))
         learner.load_models(model_path)
@@ -184,6 +205,16 @@ def run_sequential(args, logger):
             logger.console_logger.info("Finished Evaluation")
             return
 
+    publisher = None
+    if async_tabx:
+        from tabx_storage import SnapshotPublisher
+        publisher = SnapshotPublisher(args, runner.env)
+        # Restored weights start a NEW attempt. Never label them random step 0.
+        if not args.checkpoint_path:
+            publisher.publish(learner, 0, force_eval=True)
+        else:
+            publisher.next_save = (runner.t_env // publisher.interval + 1) * publisher.interval
+
     # start training
     episode = 0
     last_test_T = -args.test_interval - 1
@@ -195,9 +226,16 @@ def run_sequential(args, logger):
 
     logger.console_logger.info("Beginning training for {} timesteps".format(args.t_max))
 
-    while runner.t_env <= args.t_max:
+    while runner.t_env < args.t_max or (not async_tabx and runner.t_env == args.t_max):
         # Run for a whole episode at a time
         episode_batch = runner.run(test_mode=False)
+        if args.env == "tabx":
+            from pathlib import Path
+            record = dict(episode_index=runner.env.last_train_episode_index,
+                          episode_seed=runner.env.last_episode_seed, t_env=runner.t_env,
+                          **runner.last_episode_info)
+            with (Path(args.tabx_run_dir) / "training_episodes.jsonl").open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(record, sort_keys=True, allow_nan=False) + "\n")
         buffer.insert_episode_batch(episode_batch)
 
         if buffer.can_sample(args.batch_size):
@@ -211,10 +249,12 @@ def run_sequential(args, logger):
                 episode_sample.to(args.device)
 
             learner.train(episode_sample, runner.t_env, episode)
+            if async_tabx:
+                logger.log_stat("learner_updates", learner.training_steps, runner.t_env)
 
         # Execute test runs once in a while
         n_test_runs = max(1, args.test_nepisode // runner.batch_size)
-        if (runner.t_env - last_test_T) / args.test_interval >= 1.0:
+        if not async_tabx and (runner.t_env - last_test_T) / args.test_interval >= 1.0:
             logger.console_logger.info(
                 "t_env: {} / {}".format(runner.t_env, args.t_max)
             )
@@ -230,7 +270,10 @@ def run_sequential(args, logger):
             for _ in range(n_test_runs):
                 runner.run(test_mode=True)
 
-        if args.save_model and (
+        if publisher is not None and runner.t_env >= publisher.next_save:
+            publisher.publish(learner, runner.t_env)
+
+        if not async_tabx and args.save_model and (
             runner.t_env - model_save_time >= args.save_model_interval
             or model_save_time == 0
         ):
@@ -263,6 +306,13 @@ def run_sequential(args, logger):
             logger.print_recent_stats()
             last_log_T = runner.t_env
 
+    if publisher is not None:
+        import resource
+        publisher.complete(learner, runner.t_env, dict(
+            t_env=runner.t_env, learner_updates=learner.training_steps, episodes=episode,
+            elapsed_seconds=time.time() - start_time,
+            peak_rss_kib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+            peak_cuda_bytes=th.cuda.max_memory_allocated() if args.use_cuda else 0))
     runner.close_env()
     logger.console_logger.info("Finished Training")
 

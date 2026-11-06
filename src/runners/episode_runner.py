@@ -60,13 +60,18 @@ class EpisodeRunner:
     def close_env(self):
         self.env.close()
 
-    def reset(self):
+    def reset(self, episode_seed=None):
         self.batch = self.new_batch()
-        self.env.reset()
+        if episode_seed is None:
+            self.env.reset()
+        else:
+            self.env.reset(seed=episode_seed)
         self.t = 0
 
-    def run(self, test_mode=False):
-        self.reset()
+    def run(self, test_mode=False, *, episode_seed=None, recorder=None):
+        self.reset(episode_seed=episode_seed)
+        if recorder is not None:
+            recorder.start(self.env.get_frame(), episode_seed)
 
         terminated = False
         if self.args.common_reward:
@@ -106,6 +111,9 @@ class EpisodeRunner:
                 post_transition_data["reward"] = [tuple(reward)]
 
             self.batch.update(post_transition_data, ts=self.t)
+            if recorder is not None:
+                recorder.step(actions[0], reward, post_transition_data["terminated"][0][0],
+                              self.env.get_frame(), env_info)
 
             self.t += 1
 
@@ -135,6 +143,9 @@ class EpisodeRunner:
         )
         cur_stats["n_episodes"] = 1 + cur_stats.get("n_episodes", 0)
         cur_stats["ep_length"] = self.t + cur_stats.get("ep_length", 0)
+        self.last_episode_info = dict(env_info, length=self.t, return_value=float(np.sum(episode_return)))
+        if recorder is not None:
+            recorder.finish(self.last_episode_info)
 
         if not test_mode:
             self.t_env += self.t

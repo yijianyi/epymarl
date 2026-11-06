@@ -1,5 +1,9 @@
 # Extended Python MARL framework - EPyMARL
 
+## TABX QMIX integration
+
+See [TABX_RUN_GUIDE.md](TABX_RUN_GUIDE.md) for server-side setup, runtime paths, training, CPU evaluation and HDF5 collection. The `tabx` environment defaults to the `hp` timeout rule on this branch.
+
 EPyMARL is  an extension of [PyMARL](https://github.com/oxwhirl/pymarl), and includes
 - **New!** Support for training in environments with individual rewards for all agents (for all algorithms that support such settings)
 - **New!** Updated EPyMARL to use maintained [Gymnasium](https://gymnasium.farama.org/index.html) library instead of deprecated OpenAI Gym version 0.21.

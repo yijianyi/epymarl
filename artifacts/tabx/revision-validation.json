@@ -1,0 +1,136 @@
+{
+  "bank_hash": "775cee683a650a726f056f05a20b1dc67d9b09104ceff9fb26ca0d11b4ac6887",
+  "different_train_seed_changes_sequence": true,
+  "max_episode_steps": 8,
+  "pilot": {
+    "crossing_parent_families": 0,
+    "layout_count": 9,
+    "path": "pilot-v2.json",
+    "positive_timeout_tertiles": [
+      0.03125,
+      0.0625
+    ],
+    "regenerated_with_different_pythonhashseed_is_byte_identical": true,
+    "sha256": "490a6fb36e55f29431ff1b45295b3c5fe3d98ccfd87c7153fc9cf51f7b79ab3e",
+    "split_counts": {
+      "test": 662,
+      "train": 5299,
+      "validation": 663
+    },
+    "task_881_and_1275_split": "train",
+    "timeout_counts": {
+      "high": {
+        "pilot": 8,
+        "test": 114,
+        "train": 818,
+        "validation": 79
+      },
+      "low": {
+        "pilot": 8,
+        "test": 151,
+        "train": 1344,
+        "validation": 161
+      },
+      "medium": {
+        "pilot": 8,
+        "test": 89,
+        "train": 811,
+        "validation": 93
+      },
+      "zero": {
+        "pilot": 8,
+        "test": 308,
+        "train": 2326,
+        "validation": 330
+      }
+    },
+    "trusted_parent_identifiers": 1984
+  },
+  "regression_tests": {
+    "explicit_two_rule_smoke_passed": 1,
+    "passed": 36,
+    "smoke_opt_in_skipped_by_default": 1
+  },
+  "rules": {
+    "hp": {
+      "completed_checkpoint_steps": [
+        0,
+        32,
+        64,
+        80
+      ],
+      "episode_seeds": [
+        2986789306,
+        1305787784,
+        2699177805,
+        1164996771,
+        1973543582,
+        381451469,
+        409535942,
+        1536367830,
+        527327399,
+        564125967
+      ],
+      "final_t_env": 80,
+      "formal_candidate_steps": [
+        0,
+        32,
+        64,
+        80
+      ],
+      "learner_updates": 9,
+      "run_id": "pair-hp",
+      "training_complete_sha256": "4b59691f738fc758e91a6e057b6447916c395bba45f4660a55cbeb1bd7e598c1",
+      "training_episode_log_sha256": "83c0dc4d6b006a7f845441f544a704cd39f963b9dce4952572ecbc09f8ef0eb6",
+      "training_in_progress_observed": true
+    },
+    "loss": {
+      "completed_checkpoint_steps": [
+        0,
+        32,
+        64,
+        80
+      ],
+      "episode_seeds": [
+        2986789306,
+        1305787784,
+        2699177805,
+        1164996771,
+        1973543582,
+        381451469,
+        409535942,
+        1536367830,
+        527327399,
+        564125967
+      ],
+      "final_t_env": 80,
+      "formal_candidate_steps": [
+        0,
+        32,
+        64,
+        80
+      ],
+      "learner_updates": 9,
+      "run_id": "pair-loss",
+      "training_complete_sha256": "b97293b8cbb3064794969e9d38bac182a8feeb60f89cab0afad94ccd75a38225",
+      "training_episode_log_sha256": "83c0dc4d6b006a7f845441f544a704cd39f963b9dce4952572ecbc09f8ef0eb6",
+      "training_in_progress_observed": true
+    }
+  },
+  "same_train_seed_pairs_across_rules": true,
+  "schema_version": "tabx-revision-acceptance-1",
+  "source_hash": "5249df1647217933bca20bb2a9093097d9e79bc37649214d3c13f9a2449837e8",
+  "task_id": "23",
+  "train_seed": 7,
+  "train_seed_protocol": "sha256-json-v2:uint32(task_content_hash,train_seed,'train',episode_index)",
+  "versions": {
+    "chex": "0.1.90",
+    "flax": "0.10.6",
+    "h5py": "3.12.1",
+    "jax": "0.6.2",
+    "jaxlib": "0.6.2",
+    "numpy": "2.2.6",
+    "python": "3.10.12",
+    "torch": "2.6.0+cpu"
+  }
+}
