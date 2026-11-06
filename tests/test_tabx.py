@@ -13,6 +13,7 @@ import torch
 from components.batch_schema import build_batch_schema
 from envs.tabx_outcome import adjudicate, replace_terminal_reward
 from envs.tabx_tasks import load_task, task_hash
+from envs.tabx_layout import TABXLayout, LAYOUT_VERSION, SIMULATOR_CONTRACT
 from tabx_dataset import EpisodeRecorder, read_episode, read_episode_batch, verify_shard, write_shard
 from tabx_storage import EvalQueue, SnapshotPublisher, atomic_json, read_json, stable_seed
 
@@ -139,6 +140,7 @@ def test_wrapper_uses_new_state_and_replaces_terminal_once(rule, enemy_alive, ra
     env = TABXWrapper.__new__(TABXWrapper)
     keys = [f"unit_{i:02d}" for i in range(20)]
     env.base_env = NS(unit_keys=keys, ally_keys=keys[:10], win_reward=1, lose_reward=-1)
+    env.layout = TABXLayout(10, 10, 10)
     env.simulator = NS(get_avail_actions=lambda state: {k: np.ones(8) for k in keys[:10]})
     env.jax = NS(numpy=np, random=NS(split=lambda key: (key, key)))
     env._episode_key = 0
@@ -187,7 +189,9 @@ class ControlledEnv:
         return frame
 
     def get_obs(self):
-        return np.full((10, 378), self.t / 512, dtype=np.float32)
+        obs = np.full((10, 378), self.t / 512, dtype=np.float32)
+        obs[-1] = 0
+        return obs
 
     def get_state(self):
         return np.full(340, self.t / 512, dtype=np.float32)
@@ -241,7 +245,8 @@ def controlled_rollout(monkeypatch, length, seed):
 def test_real_runner_final_frame_and_hdf5_round_trip(monkeypatch, tmp_path, length):
     original, first = controlled_rollout(monkeypatch, length, 11)
     _, second = controlled_rollout(monkeypatch, 2, 12)
-    path = write_shard(tmp_path / "shard.h5", [first, second], {"episode_limit": 512})
+    metadata = dict(episode_limit=512, **TABXLayout(9, 1, 0).metadata())
+    path = write_shard(tmp_path / "shard.h5", [first, second], metadata)
     result = verify_shard(path)
     assert result["frames"] == length + 4 and result["steps"] == length + 2
     batch, lengths = read_episode_batch(path)
@@ -255,10 +260,10 @@ def test_real_runner_final_frame_and_hdf5_round_trip(monkeypatch, tmp_path, leng
     assert batch["filled"][1].sum() == 3
     assert read_episode(path, 1)["frames"]["obs"].shape[0] == 3
     with pytest.raises(FileExistsError):
-        write_shard(path, [first], {})
+        write_shard(path, [first], metadata)
     first["transitions"]["actions"][0, -1, 0] = 0
     with pytest.raises(ValueError, match="Illegal"):
-        write_shard(tmp_path / "illegal.h5", [first], {})
+        write_shard(tmp_path / "illegal.h5", [first], metadata)
 
 
 def test_queue_retry_and_owner_fencing(tmp_path):
@@ -325,6 +330,7 @@ def test_training_seed_pairing_ignores_run_rule_and_previous_lengths():
         env._cache = lambda obs: None
         env._obs = np.zeros((10, 378), dtype=np.float32)
         env._all_alive = np.ones(20, dtype=bool)
+        env._native_alive = np.ones(20, dtype=bool)
         env.seed(seed)
         seeds = []
         for index, length in enumerate(lengths):
@@ -399,7 +405,8 @@ def test_snapshot_identity_hashes_and_portable_paths(tmp_path):
     path.mkdir()
     (path / "agent.th").write_bytes(b"test")
     atomic_json(path / "config.json", dict(env="tabx"))
-    atomic_json(path / "manifest.json", dict(**task, timeout_rule="hp", agent_sha256=file_sha256(path / "agent.th"),
+    atomic_json(path / "manifest.json", dict(**task, timeout_rule="hp", simulator_contract=SIMULATOR_CONTRACT, layout_version=LAYOUT_VERSION,
+                                            agent_sha256=file_sha256(path / "agent.th"),
                                             config_sha256=file_sha256(path / "config.json")))
     assert validate_snapshot(path, task, "hp", check_runtime=False)["task_id"] == "23"
     with pytest.raises(ValueError, match="timeout_rule"):
@@ -427,7 +434,7 @@ def test_collect_resume_extend_and_verify(monkeypatch, tmp_path):
     monkeypatch.setattr(tabx_pipeline, "build_rollout", factory)
     run_relative = "hp/23/1/run"
     identity = dict(task_id="23", task_hash="a", bank_hash="b", timeout_rule="hp", run_id="run",
-                    master_seed=0, seed_protocol="test", provenance={})
+                    master_seed=0, seed_protocol="test", provenance={}, **TABXLayout(9, 1, 0).metadata())
     atomic_json(tmp_path / run_relative / "manifest.json", identity)
     tiers = dict(identity, schema_version="tabx-tiers-1", run=run_relative, action_selection="greedy",
                  evaluation_epsilon=0, tiers={}, R0={}, RH={}, paired_difference={})
@@ -498,56 +505,10 @@ def test_selection_reentrant_and_held_out_phases(tmp_path, values, expected_stat
     assert select_tiers(root, run_dir, 4, 4, 4)["status"] == "complete"
 
 
-@pytest.mark.skipif(not (os.environ.get("TABX_BANK") and os.environ.get("TABX_ROOT")), reason="Set TABX_BANK and TABX_ROOT for simulator tests")
+@pytest.mark.skipif(not os.environ.get("TABX_BANK"), reason="Set TABX_BANK for official simulator tests")
 def test_actual_tabx_shapes_masks_and_native_physics():
     # Mirror deployment: fresh interpreter, EPyMARL/src as script root. pytest
     # may have already imported the checkout's unrelated `src` package.
     code = ("import sys,runpy;sys.path.insert(0,'src');"
-            "runpy.run_path('tests/test_tabx.py')['_native_tabx_checks']()")
+            "runpy.run_path('tests/test_tabx_official.py')['native_checks']()")
     subprocess.run([sys.executable, "-c", code], check=True)
-
-
-def _native_tabx_checks():
-    from envs.tabx_wrapper import TABXWrapper
-    import jax
-    for key in ("23", "651", "657", "647"):
-        env = TABXWrapper(key, task_bank=os.environ["TABX_BANK"], tabx_root=os.environ["TABX_ROOT"])
-        env.reset(seed=7)
-        initial = env.get_frame()
-        state = deepcopy(env.env_state)
-        next_key = jax.random.split(env._episode_key)[1]
-        actions = np.full(10, 7)
-        native = env._step(next_key, state, {k: jax.numpy.asarray(actions[i]) for i, k in enumerate(env.base_env.ally_keys)})
-        _, reward, _, _, _ = env.step(actions)
-        for native_leaf, adapter_leaf in zip(jax.tree.leaves(native[1]), jax.tree.leaves(env.env_state)):
-            np.testing.assert_array_equal(native_leaf, adapter_leaf)
-        for name, value in native[0].items():
-            expected = env.get_state() if name == "world_state" else env.get_obs()[env.base_env.ally_keys.index(name)]
-            np.testing.assert_array_equal(value, expected)
-        assert reward == pytest.approx(float(native[2]["__all__"]) - float(native[4]["done_reward"][0]))
-        frame = env.get_frame()
-        env.reset(seed=7)
-        for name in initial:
-            np.testing.assert_array_equal(initial[name], env.get_frame()[name])
-        env.step(actions)
-        for name in frame:
-            np.testing.assert_array_equal(frame[name], env.get_frame()[name])
-        counts = {"23": 2, "651": 5, "657": 4, "647": 10}
-        assert env.get_frame()["present"].sum() == counts[key]
-        env.close()
-    # Exercise the simulator's stale pre-action alive cache at the real time
-    # boundary. Lethal health is resolved by TABX during this very step.
-    for rule in ("hp", "loss"):
-        env = TABXWrapper("23", task_bank=os.environ["TABX_BANK"], tabx_root=os.environ["TABX_ROOT"], timeout_rule=rule)
-        env.reset(seed=7)
-        state = dict(env.env_state["state"])
-        for key in env.base_env.enemy_keys:
-            unit = state[key]
-            state[key] = unit.replace(status=unit.status.replace(health=jax.numpy.zeros_like(unit.status.health)))
-        state["game_manager"] = state["game_manager"].replace(timestep=jax.numpy.array([511]))
-        env.env_state = dict(env.env_state, state=state)
-        _, reward, ended, _, info = env.step(np.full(10, 7))
-        assert ended and info["is_win"] and info["end_reason"] == 1
-        assert info["hit_time_limit"] and not info["episode_limit"]
-        assert reward == pytest.approx(2.0)
-        env.close()

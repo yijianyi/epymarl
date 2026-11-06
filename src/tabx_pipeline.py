@@ -41,7 +41,8 @@ def build_rollout(snapshot, bank, rule, tabx_root=None, random_policy=False):
     from components.batch_schema import build_batch_schema
     from components.episode_buffer import EpisodeBatch
     from controllers import REGISTRY
-    from envs.tabx_tasks import load_task, import_tabx
+    from envs.tabx_tasks import load_task, import_tabx, validate_task_structure
+    from envs.tabx_layout import TABXLayout
     from runners.episode_runner import EpisodeRunner
     from tabx_storage import read_json, validate_snapshot
 
@@ -52,7 +53,8 @@ def build_rollout(snapshot, bank, rule, tabx_root=None, random_policy=False):
         raise ValueError("Worker rule differs from snapshot config")
     # The snapshot can be moved to another machine; paths are supplied anew.
     import_tabx(tabx_root)
-    _, task_manifest = load_task(bank, config["env_args"]["key"])
+    task, task_manifest = load_task(bank, config["env_args"]["key"])
+    task_manifest.update(TABXLayout(*validate_task_structure(task)).metadata())
     validate_snapshot(snapshot, task_manifest, rule)
     config.update(device="cpu", use_cuda=False, batch_size_run=1, render=False,
                   evaluation_epsilon=0.0, test_greedy=True, test_nepisode=10**9)
@@ -102,7 +104,7 @@ def process_request(queue, claim, bank, tabx_root=None):
     import jax
     import resource
     import torch
-    from tabx_storage import atomic_json, read_json, resolve_under
+    from tabx_storage import atomic_json, read_json, resolve_under, provenance
     key, owner, request = claim
     runner = None
     try:
@@ -123,7 +125,8 @@ def process_request(queue, claim, bank, tabx_root=None):
                 queue.record(key, owner, rollout(runner, seed))
         rows = queue.results(key)
         total_seconds = sum(row["elapsed_seconds"] for row in rows)
-        report = dict(request=request, episodes=rows, worker=dict(
+        report = dict(request=request, episodes=rows, provenance=provenance(), layout=runner.get_env_info(),
+                      native_layout=runner.env.get_layout_info(), worker=dict(
             jax_backend=jax.default_backend(), cuda_visible_devices=os.environ["CUDA_VISIBLE_DEVICES"],
             torch_device="cpu", torch_threads=torch.get_num_threads(),
             peak_rss_kib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
@@ -213,6 +216,9 @@ def collection_lock(directory):
 def load_tiers(root, path, rule):
     from tabx_storage import file_sha256, read_json, resolve_under
     tiers = read_json(path)
+    from envs.tabx_layout import LAYOUT_VERSION, SIMULATOR_CONTRACT
+    if tiers.get("layout_version") != LAYOUT_VERSION or tiers.get("simulator_contract") != SIMULATOR_CONTRACT:
+        raise ValueError("tiers.json uses legacy TABX layout/simulator semantics")
     if tiers.get("schema_version") != "tabx-tiers-1" or tiers["timeout_rule"] != rule:
         raise ValueError("tiers.json schema or rule mismatch")
     if tiers["action_selection"] != "greedy" or tiers["evaluation_epsilon"] != 0:
@@ -252,6 +258,8 @@ def collect(args):
                             checkpoint_hash=tiers["tiers"][tier]["checkpoint_hash"], tiers_hash=tiers_hash,
                             seed_protocol=tiers["seed_protocol"], action_selection="greedy", provenance=tiers["provenance"],
                             tier_metrics=tiers["tiers"][tier], selection_metrics={k: tiers[k] for k in ("R0", "RH", "paired_difference")})
+            metadata.update(layout_version=tiers["layout_version"], simulator_contract=tiers["simulator_contract"],
+                            native_shape=tiers["native_shape"], official_tabx=tiers["provenance"].get("tabx", {}))
             complete = set()
             for shard in sorted(target.glob("*.h5")):
                 verified = verify_shard(shard, {k: metadata[k] for k in ("task_hash", "timeout_rule", "tier", "checkpoint_hash", "tiers_hash")})
@@ -350,17 +358,61 @@ def check_env(args):
     configure_cpu(args.threads, args.cpu_affinity)
     import numpy as np
     from envs.tabx_wrapper import TABXWrapper
-    from tabx_storage import provenance
-    for task_id in args.tasks.split(","):
-        env = TABXWrapper(task_id, task_bank=args.bank, timeout_rule=args.rule, tabx_root=args.tabx_root)
+    from envs.tabx_tasks import index_bank, validate_task_structure
+    from tabx_storage import provenance, read_json, stable_seed, atomic_json
+    runtime = provenance()
+    print(json.dumps(dict(imports=runtime["imports"], official_tabx=runtime["tabx"])), flush=True)
+    task_ids = args.tasks.split(",")
+    if args.pilot:
+        pilot = read_json(args.pilot)
+        _, tasks, digest = index_bank(args.bank)
+        if pilot["bank_hash"] != digest:
+            raise ValueError("Pilot task-bank hash mismatch")
+        task_ids = sorted(pilot["pilot"], key=lambda key: (validate_task_structure(tasks[key]), key))
+    reports = []
+    for task_id in task_ids:
+        env = TABXWrapper(task_id, task_bank=args.bank, timeout_rule=args.rule, tabx_root=args.tabx_root,
+                          expected_bank_hash=args.bank_sha256)
         try:
             actions, frames, rewards = [], [], []
+            import jax
+            started = time.monotonic()
             env.reset(seed=args.seed)
+            reset_seconds = time.monotonic() - started
             initial = env.get_frame()
+            native_key, reset_key = jax.random.split(jax.random.PRNGKey(args.seed))
+            native_obs, native_state = env._reset(reset_key, env.params)
+            def compare_native():
+                for first, second in zip(jax.tree.leaves(native_state), jax.tree.leaves(env.env_state)):
+                    np.testing.assert_array_equal(first, second)
+                for observer, key in enumerate(env.base_env.ally_keys):
+                    np.testing.assert_array_equal(env.layout.unpack_local(env.get_obs()[observer], observer), native_obs[key])
+                np.testing.assert_array_equal(env.layout.unpack_state(env.get_state()), native_obs["world_state"])
+                avail = env.simulator.get_avail_actions(native_state)
+                expected = env.layout.pack_avail_actions([avail[key] for key in env.base_env.ally_keys],
+                                                          env._native_alive[:env.layout.n_ally])
+                np.testing.assert_array_equal(env.get_avail_actions(), expected)
+            compare_native()
+            rng = np.random.default_rng(args.seed)
+            first_step_seconds = None
+            first_native_seconds = None
             for _ in range(args.steps):
                 available = env.get_avail_actions()
-                action = np.array([np.flatnonzero(row)[0] for row in available])
+                action = np.array([rng.choice(np.flatnonzero(row)) for row in available])
+                native_key, step_key = jax.random.split(native_key)
+                native_started = time.monotonic()
+                native_obs, native_state, native_reward, _, native_info = env._step(step_key, native_state,
+                    {key: jax.numpy.asarray(action[i]) for i, key in enumerate(env.base_env.ally_keys)})
+                jax.block_until_ready(native_state)
+                if first_native_seconds is None:
+                    first_native_seconds = time.monotonic() - native_started
+                step_started = time.monotonic()
                 _, reward, ended, _, _ = env.step(action)
+                if first_step_seconds is None:
+                    first_step_seconds = time.monotonic() - step_started
+                compare_native()
+                np.testing.assert_equal(env.last_dense_reward, float(np.asarray(native_reward["__all__"]).item()) -
+                                        float(np.asarray(native_info["done_reward"]).reshape(-1)[0]))
                 actions.append(action)
                 frames.append(env.get_frame())
                 rewards.append(reward)
@@ -380,9 +432,55 @@ def check_env(args):
                                   replay_steps=len(actions), task_hash=env.manifest["task_hash"],
                                   bank_hash=env.manifest["bank_hash"],
                                   canonical_hash_matches=env.manifest["canonical_hash_matches"])), flush=True)
+            report = dict(task_id=task_id, task_hash=env.manifest["task_hash"], native_layout=env.get_layout_info(), fixed_layout=env.get_env_info(),
+                                  native_equivalence="state/observations/masks/dense_reward passed",
+                                  reset_seconds=reset_seconds, first_native_step_seconds=first_native_seconds,
+                                  first_adapter_step_seconds=first_step_seconds)
+            if args.benchmark_episodes:
+                started, samples = time.monotonic(), []
+                for episode in range(args.benchmark_episodes):
+                    episode_seed = stable_seed(env.manifest["task_hash"], args.seed, "native_benchmark", episode)
+                    env.reset(seed=episode_seed)
+                    total, length, ended = 0., 0, False
+                    while not ended:
+                        actions = np.array([rng.choice(np.flatnonzero(row)) for row in env.get_avail_actions()])
+                        _, reward, ended, _, info = env.step(actions)
+                        total, length = total + reward, length + 1
+                    samples.append(dict(seed=episode_seed, length=length, return_value=total, **info))
+                report["benchmark"] = dict(policy="uniform_legal", episodes=samples,
+                    steps_per_second=sum(row["length"] for row in samples) / max(time.monotonic() - started, 1e-9),
+                    pure_timeout_rate=float(np.mean([row["pure_timeout"] for row in samples])),
+                    mean_return=float(np.mean([row["return_value"] for row in samples])))
+            reports.append(report)
+            print(json.dumps(report), flush=True)
         finally:
             env.close()
-    print(json.dumps(provenance(), indent=2))
+    if args.output:
+        atomic_json(args.output, dict(schema_version="tabx-official-native-check-1", provenance=runtime, tasks=reports))
+
+
+def check_bank(args):
+    from collections import defaultdict
+    from envs.tabx_tasks import index_bank, validate_task_structure
+    from tabx_storage import atomic_json, simulator_identity
+    _, tasks, digest = index_bank(args.bank)
+    if args.bank_sha256 and args.bank_sha256 != digest:
+        raise ValueError("Task bank SHA-256 mismatch")
+    sizes, failures = defaultdict(list), []
+    for key, task in tasks.items():
+        try:
+            sizes[validate_task_structure(task)].append(key)
+        except (ValueError, TypeError, KeyError, OverflowError) as error:
+            failures.append(dict(task_id=key, error=str(error)))
+    report = dict(schema_version="tabx-official-bank-check-1", bank_sha256=digest,
+                  status="failed" if failures else "passed", tasks=len(tasks), failed_task_ids=[f["task_id"] for f in failures],
+                  failures=failures, simulator=simulator_identity(), native_size_combinations=len(sizes),
+                  size_groups=[dict(native_shape=list(shape), count=len(keys), task_ids=keys) for shape, keys in sorted(sizes.items())])
+    if args.output:
+        atomic_json(args.output, report)
+    print(json.dumps({key: value for key, value in report.items() if key != "size_groups"}, indent=2))
+    if failures:
+        raise SystemExit(1)
 
 
 def report(args):
@@ -435,16 +533,24 @@ def parser():
         command.add_argument("--rule", choices=("hp", "loss"), default="hp")
         if bank:
             command.add_argument("--bank", required=True, help="Task-bank JSON on this machine")
-            command.add_argument("--tabx-root", default=os.environ.get("TABX_ROOT"), help="AnyTABX checkout root")
+            command.add_argument("--tabx-root", default=None, help="Optional assertion of the pinned third_party/TABX path; external roots rejected")
+            command.add_argument("--bank-sha256", help="Optional expected task-file SHA-256")
             command.add_argument("--threads", type=int, default=1)
             command.add_argument("--cpu-affinity", help="Optional allocated CPU cores, e.g. 0-7,16-23")
         if root:
             command.add_argument("--root", required=True, help="Output root used during training")
         return command
     check = common("check-env", "Check shapes, masks and same-seed replay", bank=True)
-    check.add_argument("--tasks", default="23,651,657,647")
+    check.add_argument("--tasks", default="23,647,657,651")
+    check.add_argument("--pilot", help="Use the frozen pilot and group tasks by native size for compilation reuse")
+    check.add_argument("--benchmark-episodes", type=int, default=0, help="Optional 512-step-limit legal-random calibration after semantic checks")
+    check.add_argument("--output", help="Write native equivalence and optional calibration results as JSON")
     check.add_argument("--seed", type=int, default=1)
     check.add_argument("--steps", type=int, default=8)
+    bank_check = commands.add_parser("check-bank", help="Validate every task without constructing/padding a simulator")
+    bank_check.add_argument("--bank", required=True)
+    bank_check.add_argument("--bank-sha256")
+    bank_check.add_argument("--output")
     worker = common("eval-worker", "Run a bounded pool of independent CPU workers", bank=True, root=True)
     worker.add_argument("--workers", type=int, default=1)
     worker.add_argument("--once", action="store_true", help="Drain the current queue, then exit")
@@ -484,11 +590,19 @@ def parser():
 
 def main(argv=None):
     args = parser().parse_args(argv)
+    if getattr(args, "benchmark_episodes", 0) < 0:
+        raise ValueError("benchmark_episodes must be nonnegative")
+    if getattr(args, "bank_sha256", None):
+        from envs.tabx_tasks import task_bank_path, file_sha256
+        if file_sha256(task_bank_path(args.bank)) != args.bank_sha256:
+            raise ValueError("Task bank SHA-256 mismatch")
     for name in ("threads", "workers", "steps", "episodes_per_tier", "shard_episodes", "poll_seconds", "lease_seconds"):
         if hasattr(args, name) and getattr(args, name) <= 0:
             raise ValueError(f"{name} must be positive")
     if args.command == "check-env":
         check_env(args)
+    elif args.command == "check-bank":
+        check_bank(args)
     elif args.command == "eval-worker":
         eval_worker(args)
     elif args.command == "select":

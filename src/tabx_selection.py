@@ -177,6 +177,8 @@ def select_tiers(root, run_dir, baseline_episodes=64, screen_episodes=32, confir
                  bank_hash=run["bank_hash"], timeout_rule=run["timeout_rule"], run_id=run["run_id"],
                  train_seed=run["train_seed"], master_seed=run["master_seed"], run=str(run_dir.relative_to(root)),
                  seed_protocol=run["seed_protocol"], provenance=run["provenance"],
+                 simulator_contract=run.get("simulator_contract"), layout_version=run.get("layout_version"),
+                 native_shape=run.get("native_shape"), layout=run.get("layout"),
                  training_complete=str((run_dir / "training_complete.json").relative_to(root)),
                  training_complete_sha256=completion_hash,
                  selection=options, action_selection="greedy", evaluation_epsilon=0.0,

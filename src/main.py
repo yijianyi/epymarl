@@ -134,6 +134,9 @@ if __name__ == "__main__":
                 output_root = value
     if not output_root:
         raise ValueError("TABX requires tabx_output_root=<server output directory>")
+    if config_dict["env"] == "tabx":
+        from tabx_storage import ensure_output_contract
+        ensure_output_contract(output_root)
     file_obs_path = os.path.join(
         os.path.expanduser(str(output_root)), "_sacred" if config_dict["env"] == "tabx" else "sacred",
         config_dict['name'], str(map_name).strip('\"\'')

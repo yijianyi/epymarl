@@ -3,17 +3,18 @@ import numpy as np
 from functools import lru_cache
 
 from .multiagentenv import MultiAgentEnv
+from .tabx_layout import TABXLayout
 from .tabx_outcome import adjudicate, replace_terminal_reward
 from .tabx_tasks import build_task_params, load_task, training_episode_seed
 
 
-@lru_cache(maxsize=16)
-def _simulator_functions(episode_limit, jit):
+@lru_cache(maxsize=32)
+def _simulator_functions(episode_limit, jit, n_ally, n_enemy, n_zone):
     import jax
     from src.tabx import TABX
     from src.tabx.config import TABXConfig
     from src.tabx.wrappers.wrappers import TABXEnemyHeuristicWrapper
-    base = TABX(TABXConfig(max_n_ally=10, max_n_enemy=10, max_n_zone=10), world_state_type="global",
+    base = TABX(TABXConfig(max_n_ally=n_ally, max_n_enemy=n_enemy, max_n_zone=n_zone), world_state_type="global",
                 max_episode_steps=episode_limit, position_permutation=False)
     simulator = TABXEnemyHeuristicWrapper(base)
     return (base, simulator, jax.jit(simulator.reset) if jit else simulator.reset,
@@ -35,18 +36,21 @@ class TABXWrapper(MultiAgentEnv):
         if world_state_type != "global" or not 1 <= int(max_episode_steps) <= 512:
             raise ValueError("TABX requires global state and a limit in [1,512]")
         self.task, self.manifest = load_task(task_bank, key, expected_task_hash, expected_bank_hash)
-        self.params, _ = build_task_params(self.task, tabx_root)
+        self.params, cfg = build_task_params(self.task, tabx_root)
+        self.layout = TABXLayout(cfg.max_n_ally, cfg.max_n_enemy, cfg.max_n_zone)
+        self.manifest.update(self.layout.metadata())
         import jax
 
         self.jax = jax
         self.episode_limit = int(max_episode_steps)
         self.rule = timeout_rule
-        self.base_env, self.simulator, self._reset, self._step = _simulator_functions(self.episode_limit, bool(jit))
+        self.base_env, self.simulator, self._reset, self._step = _simulator_functions(
+            self.episode_limit, bool(jit), self.layout.n_ally, self.layout.n_enemy, self.layout.n_zone)
         self.seed(seed)
         self.env_state = None
         self.ended = True
-        assert self.base_env.world_state_size() == 340
-        assert self.base_env.observation_spaces[self.base_env.ally_keys[0]].shape == (378,)
+        assert self.base_env.world_state_size() == self.layout.native_state_size
+        assert self.base_env.observation_spaces[self.base_env.ally_keys[0]].shape == (self.layout.native_obs_size,)
 
     def seed(self, seed=None):
         self._train_seed = 0 if seed is None else int(seed)
@@ -71,23 +75,23 @@ class TABXWrapper(MultiAgentEnv):
         self.first_kill = 0  # 0 none; 1 ally; 2 enemy; 3 simultaneous
         self.last_info = {}
         self._cache(obs)
-        self._previous_alive = self._all_alive.copy()
+        self._previous_alive = self._native_alive.copy()
         return self.get_obs(), {}
 
     def _cache(self, obs):
-        self._obs = np.asarray([obs[k] for k in self.base_env.ally_keys], dtype=np.float32)
-        self._state = np.asarray(obs["world_state"], dtype=np.float32).reshape(-1)
+        self._native_obs = {key: np.asarray(value, dtype=np.float32).copy() for key, value in obs.items()}
+        self._obs = self.layout.pack_observations([obs[k] for k in self.base_env.ally_keys])
+        self._state = self.layout.pack_state(obs["world_state"])
         state = self.env_state["state"]
-        self._present_all = np.array([not bool(np.asarray(state[k].status.is_disabled).item())
-                                      for k in self.base_env.unit_keys])
-        self._all_alive = np.array([bool(np.asarray(state[k].status.is_alive).item())
+        self._present_all = self.layout.present
+        self._native_alive = np.array([bool(np.asarray(state[k].status.is_alive).item())
+                                    and not bool(np.asarray(state[k].status.is_disabled).item())
                                     and float(np.asarray(state[k].status.health).item()) > 0
-                                    for k in self.base_env.unit_keys]) & self._present_all
+                                    for k in self.base_env.unit_keys])
+        self._all_alive = self.layout.pack_alive(self._native_alive).astype(bool)
         avail = self.simulator.get_avail_actions(self.env_state)
-        self._avail = np.asarray([avail[k] for k in self.base_env.ally_keys], dtype=np.int32)
-        inactive = ~self._all_alive[:10]
-        self._avail[inactive] = 0
-        self._avail[inactive, self.IDLE] = 1
+        self._native_avail = np.asarray([avail[k] for k in self.base_env.ally_keys], dtype=np.int32)
+        self._avail = self.layout.pack_avail_actions(self._native_avail, self._native_alive[:self.layout.n_ally])
         if (self._obs.shape != (10, 378) or self._state.shape != (340,) or
                 self._avail.shape != (10, 8) or not np.all(self._avail.sum(axis=1) > 0)):
             raise ValueError("Unexpected TABX observation/state/action shape")
@@ -105,7 +109,8 @@ class TABXWrapper(MultiAgentEnv):
         array = array.astype(np.int64)
         if np.any((array < 0) | (array >= 8)) or not self._avail[np.arange(10), array].all():
             raise ValueError(f"Illegal TABX action task={self.manifest['task_id']} t={self.t}: {array.tolist()}")
-        action_dict = {key: self.jax.numpy.asarray(array[i]) for i, key in enumerate(self.base_env.ally_keys)}
+        native_actions = self.layout.native_actions(array)
+        action_dict = {key: self.jax.numpy.asarray(native_actions[i]) for i, key in enumerate(self.base_env.ally_keys)}
         obs, self.env_state, rewards, _, raw_info = self._step(self._next_key(), self.env_state, action_dict)
         self._cache(obs)
         manager = self.env_state["state"]["game_manager"]
@@ -113,17 +118,17 @@ class TABXWrapper(MultiAgentEnv):
         hp = np.asarray(manager.team_hp_ratio).reshape(-1)
         if hp.shape != (2,) or not np.isfinite(hp).all():
             raise ValueError("Invalid TABX team HP ratios")
-        outcome = adjudicate(self._all_alive[:10].any(), self._all_alive[10:].any(),
+        outcome = adjudicate(self._native_alive[:self.layout.n_ally].any(), self._native_alive[self.layout.n_ally:].any(),
                              float(hp[0]), float(hp[1]), self.t, self.episode_limit, self.rule,
                              self.base_env.win_reward, self.base_env.lose_reward)
         reward, dense = replace_terminal_reward(
             np.asarray(rewards["__all__"]).item(), np.asarray(raw_info["done_reward"]).reshape(-1)[0], outcome)
         if not np.isfinite(reward):
             raise ValueError("Non-finite TABX reward")
-        died = self._previous_alive & ~self._all_alive
+        died = self._previous_alive & ~self._native_alive
         if not self.first_kill and died.any():
-            self.first_kill = int(died[10:].any()) + 2 * int(died[:10].any())
-        self._previous_alive = self._all_alive.copy()
+            self.first_kill = int(died[self.layout.n_ally:].any()) + 2 * int(died[:self.layout.n_ally].any())
+        self._previous_alive = self._native_alive.copy()
         self.ended = outcome.ended
         self.last_info = dict(episode_limit=False, hit_time_limit=int(outcome.hit_time_limit),
                               is_win=int(outcome.is_win), battle_won=int(outcome.is_win),
@@ -164,6 +169,12 @@ class TABXWrapper(MultiAgentEnv):
     def get_frame(self):
         return dict(obs=self.get_obs(), state=self.get_state(), avail_actions=self.get_avail_actions(),
                     present=self._present_all[:10].astype(np.uint8), alive=self._all_alive[:10].astype(np.uint8))
+
+    def get_native_observations(self):
+        return {key: value.copy() for key, value in self._native_obs.items()}
+
+    def get_layout_info(self):
+        return self.layout.metadata()
 
     def close(self):
         pass

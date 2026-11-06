@@ -9,8 +9,9 @@ import h5py
 import numpy as np
 
 from envs.tabx_outcome import END_REASONS
+from envs.tabx_layout import TABXLayout, LAYOUT_VERSION, SIMULATOR_CONTRACT
 
-SCHEMA_VERSION = "tabx-hdf5-1"
+SCHEMA_VERSION = "tabx-hdf5-2"
 FRAME_FIELDS = {"obs": (np.float32, (10, 378)), "state": (np.float32, (340,)),
                 "avail_actions": (np.uint8, (10, 8)), "present": (np.uint8, (10,)),
                 "alive": (np.uint8, (10,))}
@@ -98,8 +99,22 @@ def trajectory_hash(episode):
     return digest.hexdigest()
 
 
+def shard_layout(metadata):
+    if metadata.get("layout_version") != LAYOUT_VERSION or metadata.get("simulator_contract") != SIMULATOR_CONTRACT:
+        raise ValueError("HDF5 uses legacy or unspecified TABX layout/simulator semantics")
+    if "native_shape" not in metadata:
+        raise ValueError("HDF5 must record the real native_shape")
+    layout = TABXLayout(*metadata["native_shape"])
+    for name in ("n_ally", "n_enemy", "n_zone"):
+        if name in metadata and metadata[name] != getattr(layout, name):
+            raise ValueError(f"Inconsistent shard metadata: {name}")
+    return layout
+
+
 def write_shard(path, episodes, metadata):
     path = Path(path)
+    metadata = dict(metadata)
+    metadata.update(shard_layout(metadata).metadata())
     if not episodes:
         raise ValueError("Cannot publish an empty shard")
     lengths = [validate_episode(ep, metadata.get("episode_limit", 512)) for ep in episodes]
@@ -152,6 +167,7 @@ def verify_shard(path, expected=None):
         if data.attrs["schema_version"] != SCHEMA_VERSION:
             raise ValueError("Unknown HDF5 schema")
         metadata = json.loads(data.attrs["metadata"])
+        layout = shard_layout(metadata)
         if expected:
             for key, value in expected.items():
                 if metadata.get(key) != value:
@@ -177,6 +193,9 @@ def verify_shard(path, expected=None):
     for index in range(len(lengths)):
         episode = read_episode(path, index)
         validate_episode(episode, metadata.get("episode_limit", 512))
+        expected_present = np.broadcast_to(layout.present[:10], episode["frames"]["present"].shape)
+        if not np.array_equal(episode["frames"]["present"], expected_present):
+            raise ValueError("Present masks differ from the native roster")
         if trajectory_hash(episode) != hashes[index]:
             raise ValueError("Trajectory checksum mismatch")
     return dict(episodes=len(lengths), steps=int(so[-1]), frames=int(fo[-1]), seeds=seeds,
@@ -193,6 +212,9 @@ def read_episode_batch(path, indices=None, device="cpu"):
     from components.episode_buffer import EpisodeBatch
     from components.batch_schema import build_batch_schema
     with h5py.File(path, "r") as data:
+        if data.attrs["schema_version"] != SCHEMA_VERSION:
+            raise ValueError("Legacy TABX HDF5 requires its original layout reader")
+        shard_layout(json.loads(data.attrs["metadata"]))
         count = len(data["episodes/length"])
     indices = list(range(count)) if indices is None else list(indices)
     episodes = [read_episode(path, index) for index in indices]

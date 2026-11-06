@@ -2,7 +2,7 @@ env: tabx
 env_args:
   key: "23"
   task_bank: null  # Required: set on the command line
-  tabx_root: null  # AnyTABX checkout; alternatively set TABX_ROOT or PYTHONPATH
+  tabx_root: null  # Pinned to third_party/TABX; external checkouts are rejected
   timeout_rule: hp
   max_episode_steps: 512
   world_state_type: global

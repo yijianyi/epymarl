@@ -1,0 +1,339 @@
+{
+  "bank_sha256": "775cee683a650a726f056f05a20b1dc67d9b09104ceff9fb26ca0d11b4ac6887",
+  "local_cpu_legal_random_diagnostic": {
+    "episodes": [
+      {
+        "ally_hp_ratio": 0.0,
+        "battle_won": 0,
+        "elimination_win": 0,
+        "end_reason": 1,
+        "enemy_hp_ratio": 1.0,
+        "episode_limit": false,
+        "first_kill_ally": 0,
+        "first_kill_enemy": 1,
+        "first_kill_simultaneous": 0,
+        "hit_time_limit": 0,
+        "is_win": 0,
+        "length": 68,
+        "pure_timeout": 0,
+        "return_value": -2.0000000055879354,
+        "seed": 693395854,
+        "timeout_win": 0
+      },
+      {
+        "ally_hp_ratio": 0.0,
+        "battle_won": 0,
+        "elimination_win": 0,
+        "end_reason": 1,
+        "enemy_hp_ratio": 0.43546149134635925,
+        "episode_limit": false,
+        "first_kill_ally": 0,
+        "first_kill_enemy": 1,
+        "first_kill_simultaneous": 0,
+        "hit_time_limit": 0,
+        "is_win": 0,
+        "length": 152,
+        "pure_timeout": 0,
+        "return_value": -1.4354614913463593,
+        "seed": 61946760,
+        "timeout_win": 0
+      }
+    ],
+    "mean_return": -1.7177307484671474,
+    "policy": "uniform_legal",
+    "pure_timeout_rate": 0.0,
+    "steps_per_second": 239.1297878321758,
+    "task_id": "23"
+  },
+  "native_checks": [
+    {
+      "first_adapter_step_seconds": 0.0041919099749065936,
+      "first_native_step_seconds": 3.1041017150273547,
+      "fixed_layout": {
+        "episode_limit": 512,
+        "n_actions": 8,
+        "n_agents": 10,
+        "obs_shape": 378,
+        "state_shape": 340
+      },
+      "native_equivalence": "state/observations/masks/dense_reward passed",
+      "native_layout": {
+        "layout_version": "tabx-entity-slots-v2",
+        "n_ally": 2,
+        "n_enemy": 3,
+        "n_zone": 0,
+        "native_obs_size": 78,
+        "native_shape": [
+          2,
+          3,
+          0
+        ],
+        "native_state_size": 70,
+        "simulator_contract": "official-tabx-native-v1",
+        "unit_slots": [
+          0,
+          1,
+          10,
+          11,
+          12
+        ]
+      },
+      "reset_seconds": 0.4666194940218702,
+      "task_hash": "48765edeb823334e583e058f94f25907f08a3ac0640e23525fb8562e7ef17af1",
+      "task_id": "23"
+    },
+    {
+      "first_adapter_step_seconds": 0.01577232201816514,
+      "first_native_step_seconds": 42.22618453000905,
+      "fixed_layout": {
+        "episode_limit": 512,
+        "n_actions": 8,
+        "n_agents": 10,
+        "obs_shape": 378,
+        "state_shape": 340
+      },
+      "native_equivalence": "state/observations/masks/dense_reward passed",
+      "native_layout": {
+        "layout_version": "tabx-entity-slots-v2",
+        "n_ally": 10,
+        "n_enemy": 10,
+        "n_zone": 2,
+        "native_obs_size": 330,
+        "native_shape": [
+          10,
+          10,
+          2
+        ],
+        "native_state_size": 292,
+        "simulator_contract": "official-tabx-native-v1",
+        "unit_slots": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19
+        ]
+      },
+      "reset_seconds": 1.2005325609934516,
+      "task_hash": "8abf05374200438069be6d75b1a7af4995560d4bbba134705e8a897ac0c23e08",
+      "task_id": "647"
+    },
+    {
+      "first_adapter_step_seconds": 0.007406718970742077,
+      "first_native_step_seconds": 8.462195530009922,
+      "fixed_layout": {
+        "episode_limit": 512,
+        "n_actions": 8,
+        "n_agents": 10,
+        "obs_shape": 378,
+        "state_shape": 340
+      },
+      "native_equivalence": "state/observations/masks/dense_reward passed",
+      "native_layout": {
+        "layout_version": "tabx-entity-slots-v2",
+        "n_ally": 4,
+        "n_enemy": 4,
+        "n_zone": 10,
+        "native_obs_size": 186,
+        "native_shape": [
+          4,
+          4,
+          10
+        ],
+        "native_state_size": 172,
+        "simulator_contract": "official-tabx-native-v1",
+        "unit_slots": [
+          0,
+          1,
+          2,
+          3,
+          10,
+          11,
+          12,
+          13
+        ]
+      },
+      "reset_seconds": 2.04734573001042,
+      "task_hash": "38e1bb03956d7db8cd29b69eff2fbcdfad33a1cb7efa2eb2611f6f2feb82dffa",
+      "task_id": "657"
+    },
+    {
+      "first_adapter_step_seconds": 0.007814741984475404,
+      "first_native_step_seconds": 9.94308162201196,
+      "fixed_layout": {
+        "episode_limit": 512,
+        "n_actions": 8,
+        "n_agents": 10,
+        "obs_shape": 378,
+        "state_shape": 340
+      },
+      "native_equivalence": "state/observations/masks/dense_reward passed",
+      "native_layout": {
+        "layout_version": "tabx-entity-slots-v2",
+        "n_ally": 5,
+        "n_enemy": 5,
+        "n_zone": 5,
+        "native_obs_size": 188,
+        "native_shape": [
+          5,
+          5,
+          5
+        ],
+        "native_state_size": 170,
+        "simulator_contract": "official-tabx-native-v1",
+        "unit_slots": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          10,
+          11,
+          12,
+          13,
+          14
+        ]
+      },
+      "reset_seconds": 1.17634204600472,
+      "task_hash": "b90212a145aff874ebaa93a6967f97d70da1abcb74a42ccc85012c05e5acf2ad",
+      "task_id": "651"
+    }
+  ],
+  "next_stage": "Recalibrate the frozen 32-task pilot on the server before choosing medium/high tiers or scaling collection",
+  "official": {
+    "layout_version": "tabx-entity-slots-v2",
+    "outcome_definition": {
+      "hp": "raw ally_hp_ratio > enemy_hp_ratio; exact tie loses; no rounding",
+      "loss": "ally loses pure timeout",
+      "official_difference": "official TABX rounds HP ratios to 4 decimal places before deciding",
+      "priority": "post-action elimination before timeout"
+    },
+    "parameter_json_sha256": {
+      "src/tabx/heuristic_policy/parameters/expert.json": "68d62952e8108f34cb3eccb57e451060bde3b207b6fbff8e0ff8f88b051685de",
+      "src/tabx/physics/parameters/default.json": "5b88d1501f80cd0738e802dede064d227075aa629de9d4a3d84e7745848a79dd"
+    },
+    "repository_url": "https://github.com/ku-dmlab/TABX.git",
+    "simulator_contract": "official-tabx-native-v1",
+    "source_hash": "d42f6b18f28932bac661341f1891e6a63602b2de290e3dcc649fdfdec6c841fe",
+    "submodule_commit": "f218a29009d53059cccb0c44ce358ef2ccc3d249"
+  },
+  "outcome_precision": "hp compares raw HP strictly; equal loses; official rounds to 4 decimals; lead of 0.00004 tested",
+  "rules": {
+    "hp": {
+      "checkpoints": [
+        0,
+        32,
+        64,
+        80
+      ],
+      "cpu_evaluated_requests": 5,
+      "first_ten_episode_seeds": [
+        2986789306,
+        1305787784,
+        2699177805,
+        1164996771,
+        1973543582,
+        381451469,
+        409535942,
+        1536367830,
+        527327399,
+        564125967
+      ],
+      "hdf5_roundtrip": {
+        "episodes": 2,
+        "frames": 18,
+        "layout_version": "tabx-entity-slots-v2",
+        "native_shape": [
+          2,
+          3,
+          0
+        ],
+        "steps": 16
+      },
+      "hdf5_sha256": "4fc6cd52a502bd2d82c8e5914720abfb81b03e1979978a559a543b06144bb00c",
+      "official_cpu_worker_verified": true,
+      "training_complete_sha256": "9f9bb92a19ac34d25ff7a42a0837b1c4a5de4c26f4ee0824d5cb03a3c66d4153",
+      "training_in_progress_observed": true,
+      "training_summary": {
+        "elapsed_seconds": 3.872058629989624,
+        "episodes": 10,
+        "learner_updates": 9,
+        "peak_cuda_bytes": 0,
+        "peak_rss_kib": 1213552,
+        "t_env": 80
+      }
+    },
+    "loss": {
+      "checkpoints": [
+        0,
+        32,
+        64,
+        80
+      ],
+      "cpu_evaluated_requests": 5,
+      "first_ten_episode_seeds": [
+        2986789306,
+        1305787784,
+        2699177805,
+        1164996771,
+        1973543582,
+        381451469,
+        409535942,
+        1536367830,
+        527327399,
+        564125967
+      ],
+      "hdf5_roundtrip": {
+        "episodes": 2,
+        "frames": 18,
+        "layout_version": "tabx-entity-slots-v2",
+        "native_shape": [
+          2,
+          3,
+          0
+        ],
+        "steps": 16
+      },
+      "hdf5_sha256": "02ca7bbf347e7f689573d9054d65c0ccc165a09701fff1f7fb2441cbc7158e69",
+      "official_cpu_worker_verified": true,
+      "training_complete_sha256": "24e504abc45a66d699cf5e1a40a8c77c4371197eb0199e81a58d14a0852862dc",
+      "training_in_progress_observed": true,
+      "training_summary": {
+        "elapsed_seconds": 2.509727716445923,
+        "episodes": 10,
+        "learner_updates": 9,
+        "peak_cuda_bytes": 0,
+        "peak_rss_kib": 1194132,
+        "t_env": 80
+      }
+    }
+  },
+  "schema_version": "tabx-official-migration-validation-1",
+  "source_hash": "c4d3dc93dda86839d85383efcbb72bca3fbb5322ffd71f1f8b52b2d3fa6d3a15",
+  "structure": {
+    "failed_task_ids": [],
+    "native_size_combinations": 271,
+    "tasks": 6624
+  },
+  "tests": {
+    "opt_in_smoke_passed": 1,
+    "opt_in_smoke_skipped_in_default_suite": 1,
+    "regressions_passed": 57
+  },
+  "unchanged_pilot_sha256": "490a6fb36e55f29431ff1b45295b3c5fe3d98ccfd87c7153fc9cf51f7b79ab3e"
+}

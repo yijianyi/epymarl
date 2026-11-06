@@ -36,10 +36,13 @@ def run(_run, _config, _log):
         import logging
         logging.getLogger("jax").setLevel(logging.WARNING)
         logging.getLogger("jaxlib").setLevel(logging.WARNING)
-        from envs.tabx_tasks import import_tabx, load_task
+        from envs.tabx_tasks import import_tabx, load_task, validate_task_structure
+        from envs.tabx_layout import TABXLayout
         from tabx_storage import create_run
         import_tabx(args.env_args.get("tabx_root"))
-        _, task_manifest = load_task(args.env_args.get("task_bank"), args.env_args["key"])
+        task, task_manifest = load_task(args.env_args.get("task_bank"), args.env_args["key"],
+                                       args.env_args.get("expected_task_hash"), args.env_args.get("expected_bank_hash"))
+        task_manifest.update(TABXLayout(*validate_task_structure(task)).metadata())
         _config["device"] = args.device
         run_dir = create_run(_config, task_manifest)
         import jax

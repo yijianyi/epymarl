@@ -3,6 +3,8 @@ from copy import deepcopy
 from functools import lru_cache
 import hashlib
 import importlib
+import importlib.machinery
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -54,10 +56,17 @@ def _read_bank(path, size, mtime_ns):
     return bank.get("manifest", {}), index, file_sha256(path)
 
 
-def index_bank(bank_path):
+def task_bank_path(bank_path):
     if not bank_path:
         raise ValueError("Specify env_args.task_bank (or --bank) at runtime")
-    path = Path(bank_path).expanduser().resolve(strict=True)
+    path = Path(bank_path).expanduser()
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parents[2] / path
+    return path.resolve(strict=True)
+
+
+def index_bank(bank_path):
+    path = task_bank_path(bank_path)
     stat = path.stat()
     return _read_bank(str(path), stat.st_size, stat.st_mtime_ns)
 
@@ -85,64 +94,139 @@ def load_task(bank_path, task_id, expected_hash=None, expected_bank_hash=None):
     return deepcopy(task), manifest
 
 
+def official_tabx_root():
+    return Path(__file__).resolve().parents[2] / "third_party" / "TABX"
+
+
+OFFICIAL_TABX_URL = "https://github.com/ku-dmlab/TABX.git"
+UNIT_FIELDS = {
+    "positions": 2, "rotations": 1, "body_weights": 1, "body_radiuss": 1, "teams": 1,
+    "pos_min": 2, "pos_max": 2, "unit_ids": 1, "healths": 1, "attack_damages": 1,
+    "attack_ranges": 1, "attack_cooldowns": 1, "sight_angles": 1, "is_alive": 1,
+    "attack_types": 1, "is_disabled": 1, "speeds": 1,
+}
+ZONE_FIELDS = {"position": 2, "axes": 2, "zone_type": 1, "effect_value": 1}
+
+
 def import_tabx(tabx_root=None):
-    """Resolve AnyTABX's `src` before import and refuse a conflicting src package."""
-    epymarl_root = Path(__file__).resolve().parents[2]
-    # AnyTABX/src is a namespace package, while EPyMARL/src is a regular
-    # package: putting AnyTABX first alone does NOT prevent shadowing.
+    """Pin the src namespace to the vendored official submodule, ignoring env overrides."""
+    root = official_tabx_root().resolve()
+    if tabx_root and Path(tabx_root).expanduser().resolve() != root:
+        raise ValueError(f"TABX must use the official submodule at {root}; external checkouts are unsupported")
+    if not (root / "src/tabx/tabx.py").is_file():
+        raise ImportError(f"TABX submodule is not initialized at {root}. Run: git submodule update --init --recursive")
+    expected = root / "src/tabx"
+    loaded = sys.modules.get("src.tabx")
+    if loaded is not None and Path(loaded.__file__).resolve().parent != expected:
+        raise ImportError(f"Conflicting src.tabx already loaded: {loaded.__file__}; expected {expected}")
     loaded_src = sys.modules.get("src")
-    if loaded_src and getattr(loaded_src, "__file__", None) == str(epymarl_root / "src/__init__.py"):
-        raise ImportError("EPyMARL's src package is already loaded; launch the absolute src/main.py or src/tabx_pipeline.py script")
-    sys.path[:] = [entry for entry in sys.path if Path(entry or os.getcwd()).resolve() != epymarl_root]
-    root = tabx_root or os.environ.get("TABX_ROOT")
-    if root:
-        root = Path(root).expanduser().resolve(strict=True)
-        if not (root / "src/tabx/tabx.py").is_file():
-            raise ValueError(f"Not an AnyTABX checkout: {root}")
-        sys.path.insert(0, str(root)) if str(root) not in sys.path else None
-    try:
-        module = importlib.import_module("src.tabx")
-    except ImportError as exc:
-        raise ImportError("AnyTABX unavailable: set env_args.tabx_root, --tabx-root, "
-                          "TABX_ROOT or PYTHONPATH to its checkout root") from exc
-    if root and Path(module.__file__).resolve().parent != root / "src/tabx":
-        raise ImportError(f"Conflicting src package: loaded {module.__file__}; expected {root}")
+    if loaded_src is not None:
+        locations = [Path(p).resolve() for p in getattr(loaded_src, "__path__", [])]
+        if locations != [root / "src"]:
+            raise ImportError(f"A conflicting src package is already loaded: {locations}. Launch a fresh process with src/main.py or src/tabx_pipeline.py")
+    else:
+        # The official src directory is a namespace package. Binding its search
+        # path explicitly prevents a regular 'src' package elsewhere on sys.path
+        # from taking precedence over the pinned checkout.
+        spec = importlib.machinery.PathFinder.find_spec("src", [str(root)])
+        spec.submodule_search_locations = [str(root / "src")]
+        sys.modules["src"] = importlib.util.module_from_spec(spec)
+    if str(root) in sys.path:
+        sys.path.remove(str(root))
+    sys.path.insert(0, str(root))
+    module = importlib.import_module("src.tabx")
+    if Path(module.__file__).resolve().parent != expected:
+        raise ImportError(f"Unexpected src.tabx import: {module.__file__}; expected {expected}")
     return module
 
 
-def build_task_params(task, tabx_root=None):
-    import_tabx(tabx_root)
-    import jax
+def validate_task_structure(task):
+    """Validate the unmodified JSON and return its real (ally, enemy, zone) sizes."""
     import numpy as np
-    from src.tabx.sample_task import build_batched_env_params_from_tasks
+    scenario, zones = task.get("scenario"), task.get("zone_scenario")
+    if not isinstance(scenario, dict) or set(scenario) != set(UNIT_FIELDS):
+        raise ValueError("scenario fields differ from official VectorizedScenario")
+    if not isinstance(zones, dict) or set(zones) != set(ZONE_FIELDS) | {"n_zone"}:
+        raise ValueError("zone_scenario fields differ from official ZoneScenario")
+    teams = np.asarray(scenario["teams"])
+    if teams.ndim != 2 or teams.shape[1] != 1 or not np.isin(teams, (0, 1)).all():
+        raise ValueError("teams must be [N,1] with values 0 or 1")
+    n_ally, n_enemy = int((teams == 0).sum()), int((teams == 1).sum())
+    if not (1 <= n_ally <= 10 and 1 <= n_enemy <= 10):
+        raise ValueError("Each team must contain between 1 and 10 real units")
+    if not np.array_equal(teams[:, 0], np.r_[np.zeros(n_ally), np.ones(n_enemy)]):
+        raise ValueError("Preserve original order: all team 0 units must precede team 1 units")
+    count = n_ally + n_enemy
+    arrays = {}
+    for name, width in UNIT_FIELDS.items():
+        value = np.asarray(scenario[name])
+        if value.shape != (count, width) or not np.isfinite(value).all():
+            raise ValueError(f"Invalid finite shape for scenario.{name}: {value.shape}")
+        arrays[name] = value
+    for name in ("is_alive", "is_disabled"):
+        if not np.isin(arrays[name], (0, 1)).all():
+            raise ValueError(f"Nonbinary {name}")
+    for name, upper in (("unit_ids", 9), ("attack_types", 1)):
+        value = arrays[name]
+        if not ((value == np.floor(value)) & (value >= 0) & (value <= upper)).all():
+            raise ValueError(f"Invalid integer range for {name}")
+    for name in ("body_weights", "body_radiuss", "attack_cooldowns"):
+        if not (arrays[name] > 0).all():
+            raise ValueError(f"{name} must be positive")
+    for name in ("healths", "attack_ranges", "speeds"):
+        if not (arrays[name] >= 0).all():
+            raise ValueError(f"{name} must be nonnegative")
+    if not ((arrays["sight_angles"] > 0) & (arrays["sight_angles"] <= 2 * np.pi)).all():
+        raise ValueError("sight_angles must be in (0,2pi]")
+    if not (arrays["pos_min"] <= arrays["pos_max"]).all():
+        raise ValueError("Invalid movement bounds")
+    if not ((arrays["positions"] >= arrays["pos_min"]) & (arrays["positions"] <= arrays["pos_max"])).all():
+        raise ValueError("Spawn position lies outside movement bounds")
+    active = arrays["is_alive"][:, 0].astype(bool) & ~arrays["is_disabled"][:, 0].astype(bool) & (arrays["healths"][:, 0] > 0)
+    if not active[:n_ally].any() or not active[n_ally:].any():
+        raise ValueError("Both teams require an active unit at reset")
+    n_zone = zones["n_zone"]
+    if isinstance(n_zone, bool) or not isinstance(n_zone, int) or not 0 <= n_zone <= 10:
+        raise ValueError("n_zone must be an integer in [0,10]")
+    for name, width in ZONE_FIELDS.items():
+        value = np.asarray(zones[name])
+        if n_zone == 0 and value.size == 0:
+            value = value.reshape(0, width)
+        if value.shape != (n_zone, width) or not np.isfinite(value).all():
+            raise ValueError(f"Invalid finite shape for zone_scenario.{name}: {value.shape}")
+        if name == "axes" and not (value > 0).all():
+            raise ValueError("Region axes must be positive")
+        if name == "zone_type" and not (np.isin(value, (0, 1, 2, 3))).all():
+            raise ValueError("Invalid zone_type")
+    # Negative attack damage is healing. Do not clamp or normalize task attributes.
+    return n_ally, n_enemy, n_zone
 
-    converted = deepcopy(task)
-    scenario = converted["scenario"]
-    teams = np.asarray(scenario["teams"]).reshape(-1)
-    if not np.array_equal(teams, np.sort(teams)) or not set(teams).issubset({0, 1}):
-        raise ValueError("TABX padding requires team 0 then team 1, with both teams present")
-    if int(converted["zone_scenario"]["n_zone"]) != 0:
-        params, cfg = build_batched_env_params_from_tasks(
-            [converted], physics="default", heuristic="expert",
-            max_n_ally=10, max_n_enemy=10, max_n_zone=10)
-    else:
-        # 70a97a1's JSON converter turns [] into rank one. Use the same
-        # constructor helpers with correctly ranked EMPTY regions in this case.
-        import jax.numpy as jnp
-        from src.tabx.sample_task import validate_task, task_to_structs
-        from src.tabx.config import TABXConfig
-        from src.tabx.scenarios.utils import generate_padded_unit_scenario, generate_padded_zone_scenario
-        from src.tabx.physics.utils import build_batched_physics_params
-        from src.tabx.heuristic_policy.utils import build_batched_heuristic_params
-        validate_task(converted)
-        scenario, zones = task_to_structs(converted)
-        zones = zones.replace(position=jnp.empty((0, 2)), axes=jnp.empty((0, 2)),
-                              zone_type=jnp.empty((0, 1), dtype=jnp.int32), effect_value=jnp.empty((0, 1)))
-        params = {
-            "scenario": jax.tree.map(lambda x: x[None], generate_padded_unit_scenario(scenario, 10, 10)),
-            "zone_scenario": jax.tree.map(lambda x: x[None], generate_padded_zone_scenario(zones, 10)),
-            "physics_params": build_batched_physics_params(["default"], squeeze_when_single_physics=False),
-            "heuristic_params": build_batched_heuristic_params(["expert"], squeeze_when_single_heuristic=False),
-        }
-        cfg = TABXConfig(max_n_ally=10, max_n_enemy=10, max_n_zone=10)
-    return jax.tree.map(lambda leaf: leaf[0], params), cfg
+
+def build_task_params(task, tabx_root=None):
+    sizes = validate_task_structure(task)
+    import_tabx(tabx_root)
+    import jax.numpy as jnp
+    from src.tabx.config import TABXConfig
+    from src.tabx.scenarios.scenario import VectorizedScenario, ZoneScenario
+    from src.tabx.physics.utils import build_batched_physics_params
+    from src.tabx.heuristic_policy.utils import build_batched_heuristic_params
+
+    if set(VectorizedScenario.__dataclass_fields__) != set(UNIT_FIELDS):
+        raise ValueError("Official scenario schema changed")
+    int_fields = {"teams", "unit_ids", "attack_types"}
+    bool_fields = {"is_alive", "is_disabled"}
+    scenario = VectorizedScenario(**{
+        name: jnp.asarray(task["scenario"][name], dtype=jnp.bool_ if name in bool_fields else
+                          (jnp.int32 if name in int_fields else jnp.float32))
+        for name in UNIT_FIELDS
+    })
+    n_ally, n_enemy, n_zone = sizes
+    zones = ZoneScenario(n_zone=jnp.asarray([[n_zone]], dtype=jnp.int32), **{
+        name: jnp.asarray(task["zone_scenario"][name], dtype=jnp.int32 if name == "zone_type" else jnp.float32).reshape(n_zone, width)
+        for name, width in ZONE_FIELDS.items()
+    })
+    return {
+        "scenario": scenario, "zone_scenario": zones,
+        "physics_params": build_batched_physics_params("default"),
+        "heuristic_params": build_batched_heuristic_params("expert"),
+    }, TABXConfig(max_n_ally=n_ally, max_n_enemy=n_enemy, max_n_zone=n_zone)

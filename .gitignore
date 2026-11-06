@@ -246,3 +246,7 @@ $RECYCLE.BIN/
 *.lnk
 
 # End of https://www.gitignore.io/api/linux,python,windows,pycharm+all,visualstudiocode
+# Local TABX runtime inputs, environments and outputs
+/data/tasks/
+/results/
+/.venv-tabx/

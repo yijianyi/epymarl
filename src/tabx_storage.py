@@ -14,7 +14,8 @@ import tempfile
 import time
 import uuid
 
-from envs.tabx_tasks import TRAIN_SEED_PROTOCOL, file_sha256
+from envs.tabx_tasks import TRAIN_SEED_PROTOCOL, OFFICIAL_TABX_URL, file_sha256, import_tabx, official_tabx_root
+from envs.tabx_layout import LAYOUT_VERSION, SIMULATOR_CONTRACT
 
 SEED_PROTOCOL = "sha256-json-v1:uint32(task_hash,master_seed,phase,index,stream)"
 
@@ -89,19 +90,66 @@ def runtime_versions():
     return versions
 
 
+def simulator_identity():
+    root = official_tabx_root().resolve()
+    files = ("src/tabx/physics/parameters/default.json", "src/tabx/heuristic_policy/parameters/expert.json")
+    if not all((root / name).is_file() for name in files):
+        raise ImportError("Official TABX submodule missing; run git submodule update --init --recursive")
+    return dict(simulator_contract=SIMULATOR_CONTRACT, layout_version=LAYOUT_VERSION,
+                repository_url=OFFICIAL_TABX_URL, submodule_commit=git_version(root)["commit"],
+                source_hash=code_hash(root, "src/tabx/**/*.py"),
+                parameter_json_sha256={name: file_sha256(root / name) for name in files},
+                outcome_definition=dict(hp="raw ally_hp_ratio > enemy_hp_ratio; exact tie loses; no rounding",
+                                        loss="ally loses pure timeout", priority="post-action elimination before timeout",
+                                        official_difference="official TABX rounds HP ratios to 4 decimal places before deciding"))
+
+
+def ensure_output_contract(root):
+    """A migrated simulator starts a fresh output root; old runs stay read-only."""
+    root = Path(root).expanduser().resolve()
+    expected = simulator_identity()
+    marker = root / "tabx_semantics.json"
+    if marker.exists():
+        if read_json(marker) != expected:
+            raise ValueError("Output root uses different TABX semantics/parameters; specify a new output directory")
+        return
+    if (root / "eval_queue.sqlite3").exists() or any(root.glob("hp/*/*/*/manifest.json")) or any(root.glob("loss/*/*/*/manifest.json")):
+        if marker.exists() and read_json(marker) == expected:
+            return
+        raise ValueError("Existing output contains legacy TABX runs; migration requires a new output directory")
+    # Exclusive publish avoids two initial training jobs accepting different
+    # simulator identities into the same root.
+    root.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=".semantics-", dir=root)
+    os.close(descriptor)
+    try:
+        atomic_json(temporary, expected)
+        try:
+            os.link(temporary, marker)
+        except FileExistsError:
+            if read_json(marker) != expected:
+                raise ValueError("Concurrent run initialized a different TABX output contract")
+    finally:
+        os.unlink(temporary)
+
+
 def provenance():
-    import src.tabx
+    module = import_tabx()
     root = Path(__file__).resolve().parent.parent
-    tabx_root = Path(src.tabx.__file__).resolve().parents[2]
+    tabx_root = Path(module.__file__).resolve().parents[2]
     return dict(epymarl={**git_version(root), "source_hash": code_hash(root)},
-                tabx={**git_version(tabx_root), "source_hash": code_hash(tabx_root, "src/tabx/**/*.py")},
-                versions=runtime_versions(), imports={"src.tabx": src.tabx.__file__,
+                tabx={**git_version(tabx_root), "source_hash": code_hash(tabx_root, "src/tabx/**/*.py"),
+                      **simulator_identity()},
+                simulator_contract=SIMULATOR_CONTRACT, layout_version=LAYOUT_VERSION,
+                versions=runtime_versions(), imports={"src.tabx": module.__file__,
                                                        "envs": str(root / "src/envs/__init__.py")})
 
 
 def validate_snapshot(path, task_manifest, rule, *, check_runtime=True):
     path = Path(path)
     manifest = read_json(path / "manifest.json")
+    if manifest.get("simulator_contract") != SIMULATOR_CONTRACT or manifest.get("layout_version") != LAYOUT_VERSION:
+        raise ValueError("Snapshot uses legacy TABX simulator/layout semantics; start a new run")
     for key, expected in (("task_id", task_manifest["task_id"]), ("task_hash", task_manifest["task_hash"]),
                           ("bank_hash", task_manifest["bank_hash"]), ("timeout_rule", rule)):
         if manifest[key] != expected:
@@ -115,6 +163,9 @@ def validate_snapshot(path, task_manifest, rule, *, check_runtime=True):
         for library in ("epymarl", "tabx"):
             if manifest["provenance"][library]["source_hash"] != current[library]["source_hash"]:
                 raise ValueError(f"{library} source differs from the snapshot")
+        for key in ("repository_url", "submodule_commit", "parameter_json_sha256", "outcome_definition"):
+            if manifest["provenance"]["tabx"].get(key) != current["tabx"][key]:
+                raise ValueError(f"Official TABX provenance differs from snapshot: {key}")
         for library in ("jax", "jaxlib", "torch"):
             saved, local = manifest["provenance"]["versions"][library], current["versions"][library]
             if str(saved).split("+")[0] != str(local).split("+")[0]:
@@ -127,6 +178,7 @@ def create_run(config, task_manifest):
     if not root_value:
         raise ValueError("Set tabx_output_root to your server's output directory")
     root = Path(root_value).expanduser().resolve()
+    ensure_output_contract(root)
     rule = config["env_args"]["timeout_rule"]
     if rule not in ("hp", "loss"):
         raise ValueError("Invalid timeout rule")
@@ -144,6 +196,9 @@ def create_run(config, task_manifest):
                     train_seed=int(config["seed"]), master_seed=int(config.get("tabx_master_seed", 0)),
                     seed_protocol=SEED_PROTOCOL, provenance=provenance(),
                     train_seed_protocol=TRAIN_SEED_PROTOCOL,
+                    simulator_contract=SIMULATOR_CONTRACT, layout_version=LAYOUT_VERSION,
+                    native_shape=task_manifest["native_shape"],
+                    layout={key: task_manifest[key] for key in ("native_shape", "n_ally", "n_enemy", "n_zone", "unit_slots", "native_obs_size", "native_state_size")},
                     restored_from=config.get("checkpoint_path") or None,
                     restore_semantics="new_attempt_with_fresh_replay_targets_rng_and_update_count",
                     deployment={"torch_device": config["device"], "jax_platforms": os.environ.get("JAX_PLATFORMS"),
@@ -264,6 +319,8 @@ def evaluation_request(root, run_dir, snapshot, phase, count, *, random_policy=F
                 checkpoint_hash=manifest["agent_sha256"], phase=phase,
                 random_policy=bool(random_policy), action_selection="uniform_legal" if random_policy else "greedy",
                 seed_protocol=SEED_PROTOCOL,
+                simulator_contract=SIMULATOR_CONTRACT, layout_version=LAYOUT_VERSION,
+                official_tabx=run.get("provenance", {}).get("tabx", {}), native_shape=run.get("native_shape"),
                 seeds=[stable_seed(run["task_hash"], run["master_seed"], phase, i) for i in range(count)])
 
 
@@ -304,6 +361,8 @@ class SnapshotPublisher:
                             config_sha256=file_sha256(tmp / "config.json"))
             manifest["train_seed_protocol"] = TRAIN_SEED_PROTOCOL
             manifest["training_episodes"] = getattr(self.env, "_episode_index", None)
+            manifest.update(simulator_contract=SIMULATOR_CONTRACT, layout_version=LAYOUT_VERSION,
+                            native_shape=run.get("native_shape"), official_tabx=run.get("provenance", {}).get("tabx", {}))
             atomic_json(tmp / "manifest.json", manifest)
             if path.exists():
                 raise FileExistsError(f"Refusing to overwrite immutable snapshot {path}")

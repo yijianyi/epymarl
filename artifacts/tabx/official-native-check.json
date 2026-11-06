@@ -1,0 +1,214 @@
+{
+  "provenance": {
+    "epymarl": {
+      "commit": "8e99a2fd9a84606c0f819968240b5261f86a4c1c",
+      "dirty": true,
+      "source_hash": "c4d3dc93dda86839d85383efcbb72bca3fbb5322ffd71f1f8b52b2d3fa6d3a15"
+    },
+    "imports": {
+      "envs": "/home/xqyang/AIRS/epymarl/src/envs/__init__.py",
+      "src.tabx": "/home/xqyang/AIRS/epymarl/third_party/TABX/src/tabx/__init__.py"
+    },
+    "layout_version": "tabx-entity-slots-v2",
+    "simulator_contract": "official-tabx-native-v1",
+    "tabx": {
+      "commit": "f218a29009d53059cccb0c44ce358ef2ccc3d249",
+      "dirty": false,
+      "layout_version": "tabx-entity-slots-v2",
+      "outcome_definition": {
+        "hp": "raw ally_hp_ratio > enemy_hp_ratio; exact tie loses; no rounding",
+        "loss": "ally loses pure timeout",
+        "official_difference": "official TABX rounds HP ratios to 4 decimal places before deciding",
+        "priority": "post-action elimination before timeout"
+      },
+      "parameter_json_sha256": {
+        "src/tabx/heuristic_policy/parameters/expert.json": "68d62952e8108f34cb3eccb57e451060bde3b207b6fbff8e0ff8f88b051685de",
+        "src/tabx/physics/parameters/default.json": "5b88d1501f80cd0738e802dede064d227075aa629de9d4a3d84e7745848a79dd"
+      },
+      "repository_url": "https://github.com/ku-dmlab/TABX.git",
+      "simulator_contract": "official-tabx-native-v1",
+      "source_hash": "d42f6b18f28932bac661341f1891e6a63602b2de290e3dcc649fdfdec6c841fe",
+      "submodule_commit": "f218a29009d53059cccb0c44ce358ef2ccc3d249"
+    },
+    "versions": {
+      "chex": "0.1.90",
+      "flax": "0.10.6",
+      "h5py": "3.12.1",
+      "jax": "0.6.2",
+      "jaxlib": "0.6.2",
+      "numpy": "2.2.6",
+      "python": "3.10.12",
+      "torch": "2.6.0+cpu"
+    }
+  },
+  "schema_version": "tabx-official-native-check-1",
+  "tasks": [
+    {
+      "first_adapter_step_seconds": 0.0041919099749065936,
+      "first_native_step_seconds": 3.1041017150273547,
+      "fixed_layout": {
+        "episode_limit": 512,
+        "n_actions": 8,
+        "n_agents": 10,
+        "obs_shape": 378,
+        "state_shape": 340
+      },
+      "native_equivalence": "state/observations/masks/dense_reward passed",
+      "native_layout": {
+        "layout_version": "tabx-entity-slots-v2",
+        "n_ally": 2,
+        "n_enemy": 3,
+        "n_zone": 0,
+        "native_obs_size": 78,
+        "native_shape": [
+          2,
+          3,
+          0
+        ],
+        "native_state_size": 70,
+        "simulator_contract": "official-tabx-native-v1",
+        "unit_slots": [
+          0,
+          1,
+          10,
+          11,
+          12
+        ]
+      },
+      "reset_seconds": 0.4666194940218702,
+      "task_hash": "48765edeb823334e583e058f94f25907f08a3ac0640e23525fb8562e7ef17af1",
+      "task_id": "23"
+    },
+    {
+      "first_adapter_step_seconds": 0.01577232201816514,
+      "first_native_step_seconds": 42.22618453000905,
+      "fixed_layout": {
+        "episode_limit": 512,
+        "n_actions": 8,
+        "n_agents": 10,
+        "obs_shape": 378,
+        "state_shape": 340
+      },
+      "native_equivalence": "state/observations/masks/dense_reward passed",
+      "native_layout": {
+        "layout_version": "tabx-entity-slots-v2",
+        "n_ally": 10,
+        "n_enemy": 10,
+        "n_zone": 2,
+        "native_obs_size": 330,
+        "native_shape": [
+          10,
+          10,
+          2
+        ],
+        "native_state_size": 292,
+        "simulator_contract": "official-tabx-native-v1",
+        "unit_slots": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19
+        ]
+      },
+      "reset_seconds": 1.2005325609934516,
+      "task_hash": "8abf05374200438069be6d75b1a7af4995560d4bbba134705e8a897ac0c23e08",
+      "task_id": "647"
+    },
+    {
+      "first_adapter_step_seconds": 0.007406718970742077,
+      "first_native_step_seconds": 8.462195530009922,
+      "fixed_layout": {
+        "episode_limit": 512,
+        "n_actions": 8,
+        "n_agents": 10,
+        "obs_shape": 378,
+        "state_shape": 340
+      },
+      "native_equivalence": "state/observations/masks/dense_reward passed",
+      "native_layout": {
+        "layout_version": "tabx-entity-slots-v2",
+        "n_ally": 4,
+        "n_enemy": 4,
+        "n_zone": 10,
+        "native_obs_size": 186,
+        "native_shape": [
+          4,
+          4,
+          10
+        ],
+        "native_state_size": 172,
+        "simulator_contract": "official-tabx-native-v1",
+        "unit_slots": [
+          0,
+          1,
+          2,
+          3,
+          10,
+          11,
+          12,
+          13
+        ]
+      },
+      "reset_seconds": 2.04734573001042,
+      "task_hash": "38e1bb03956d7db8cd29b69eff2fbcdfad33a1cb7efa2eb2611f6f2feb82dffa",
+      "task_id": "657"
+    },
+    {
+      "first_adapter_step_seconds": 0.007814741984475404,
+      "first_native_step_seconds": 9.94308162201196,
+      "fixed_layout": {
+        "episode_limit": 512,
+        "n_actions": 8,
+        "n_agents": 10,
+        "obs_shape": 378,
+        "state_shape": 340
+      },
+      "native_equivalence": "state/observations/masks/dense_reward passed",
+      "native_layout": {
+        "layout_version": "tabx-entity-slots-v2",
+        "n_ally": 5,
+        "n_enemy": 5,
+        "n_zone": 5,
+        "native_obs_size": 188,
+        "native_shape": [
+          5,
+          5,
+          5
+        ],
+        "native_state_size": 170,
+        "simulator_contract": "official-tabx-native-v1",
+        "unit_slots": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          10,
+          11,
+          12,
+          13,
+          14
+        ]
+      },
+      "reset_seconds": 1.17634204600472,
+      "task_hash": "b90212a145aff874ebaa93a6967f97d70da1abcb74a42ccc85012c05e5acf2ad",
+      "task_id": "651"
+    }
+  ]
+}
