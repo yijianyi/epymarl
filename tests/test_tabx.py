@@ -271,14 +271,14 @@ def test_queue_retry_and_owner_fencing(tmp_path):
     payload = dict(rule="hp", seeds=[1, 2], checkpoint_hash="abc")
     key = queue.enqueue(payload, 1)
     assert queue.enqueue(payload, 1) == key
-    assert queue.enqueue(dict(payload, seeds=[3]), 1) is None
     assert other.claim("loss") is None
     _, owner, _ = queue.claim("hp")
     assert other.claim("hp") is None
     queue.record(key, owner, dict(seed=1, return_value=3))
-    with queue.connect() as db:
-        db.execute("UPDATE requests SET updated=0 WHERE id=?", (key,))
-    _, next_owner, _ = other.claim("hp", 1)
+    running = queue.directory("hp") / "running" / f"{key}.json"
+    record = read_json(running)
+    atomic_json(running, dict(record, updated=0))
+    _, next_owner, _ = other.claim("hp", 0)
     with pytest.raises(RuntimeError, match="lease"):
         queue.record(key, owner, dict(seed=2))
     assert queue.results(key) == [dict(seed=1, return_value=3)]
@@ -287,7 +287,7 @@ def test_queue_retry_and_owner_fencing(tmp_path):
     assert queue.status(key)["status"] == "complete"
 
 
-def test_snapshot_schedule_and_hashes(tmp_path):
+def test_snapshot_schedule_and_hashes(tmp_path, monkeypatch):
     run_dir = tmp_path / "hp/23/1/run"
     run = dict(task_id="23", task_hash="a" * 64, bank_hash="b" * 64, timeout_rule="hp",
                train_seed=1, master_seed=0, run_id="run", provenance={})
@@ -300,17 +300,25 @@ def test_snapshot_schedule_and_hashes(tmp_path):
             for name in ("agent.th", "mixer.th", "opt.th"):
                 (Path(path) / name).write_bytes(b"weights")
     publisher = SnapshotPublisher(args, None)
+    publications = []
+    original_enqueue = publisher.queue.enqueue
+    def enqueue_once(request, *args, **kwargs):
+        publications.append(EvalQueue.request_id(request))
+        return original_enqueue(request, *args, **kwargs)
+    monkeypatch.setattr(publisher.queue, "enqueue", enqueue_once)
     publisher.publish(Learner(), 0, force_eval=True)
     assert publisher.next_save == 10
     publisher.publish(Learner(), 12)
     assert publisher.next_save == 20
-    assert read_json(run_dir / "evaluation_requests/12.json")["status"] == "skipped_backpressure"
+    assert read_json(run_dir / "evaluation_requests/12.json")["status"] == "queued"
     publisher.publish(Learner(), 12, force_eval=True)
+    assert len(publications) == 2
     assert read_json(run_dir / "evaluation_requests/12.json")["status"] == "queued"
     assert set(p.name for p in (run_dir / "checkpoints").iterdir()) == {"0", "12"}
     assert read_json(run_dir / "checkpoints/0/manifest.json")["t_env"] == 0
     assert not list((run_dir / "checkpoints").glob(".snapshot-*"))
     completion = publisher.complete(Learner(), 20, dict(t_env=20))
+    assert len(publications) == len(set(publications)) == 3
     assert [entry["t_env"] for entry in read_json(completion)["checkpoints"]] == [0, 12, 20]
     from tabx_storage import completed_checkpoints
     assert [int(path.name) for path in completed_checkpoints(run_dir)[2]] == [0, 12, 20]
@@ -371,7 +379,8 @@ def test_select_waits_for_completion_and_uses_all_checkpoints(tmp_path):
     while claim := queue.claim("hp"):
         key, owner, request = claim
         for seed in request["seeds"]:
-            queue.record(key, owner, dict(seed=seed, return_value=1))
+            queue.record(key, owner, dict(seed=seed, return_value=1, is_win=0, end_reason=2))
+        queue.publish_result(key, owner, dict(request=request, episodes=queue.results(key)))
         queue.finish(key, owner)
     assert select_tiers(tmp_path, run_dir, 2, 2, 2)["status"] == "training_in_progress"
     assert not (run_dir / "selection").exists()
@@ -382,8 +391,7 @@ def test_select_waits_for_completion_and_uses_all_checkpoints(tmp_path):
     state = read_json(result["state"])
     assert [int(Path(p).name) for p in state["snapshots"]] == [0, 25000, 50000]
     assert state["training_complete_sha256"] == file_sha256(complete)
-    with queue.connect() as db:
-        assert db.execute("SELECT COUNT(*) FROM requests").fetchone()[0] == 4
+    assert len(list(queue.index.glob("*.json"))) == 4
     (run_dir / "checkpoints/50000/agent.th").write_bytes(b"tampered")
     with pytest.raises(ValueError, match="checksum"):
         select_tiers(tmp_path, run_dir, 2, 2, 2)
@@ -491,7 +499,8 @@ def test_selection_reentrant_and_held_out_phases(tmp_path, values, expected_stat
             step = int(Path(request["snapshot"]).name)
             value = 0 if request["random_policy"] else values[step]
             for seed in request["seeds"]:
-                queue.record(key, owner, dict(seed=seed, return_value=value))
+                queue.record(key, owner, dict(seed=seed, return_value=value, is_win=0, end_reason=2))
+            queue.publish_result(key, owner, dict(request=request, episodes=queue.results(key)))
             queue.finish(key, owner)
     assert result["status"] == expected_status
     if expected_status != "complete":

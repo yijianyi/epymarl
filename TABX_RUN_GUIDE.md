@@ -52,8 +52,9 @@ RESULT_ROOT/
     checkpoints/<实际环境步数>/
       agent.th  mixer.th  opt.th
       config.json  manifest.json    # 完整配置及 agent/config SHA-256
-    evaluation_requests/<step>.json # queued 或 skipped_backpressure
+    evaluation_requests/<step>.json # 原 request_id、实际 checkpoint_step
     evaluations/<request_id>.json   # 每局回报、终局、HP、吞吐和 CPU 信息
+    evaluations/partial/<request_id>/<seed>.json # 单局原子发布，恢复时复用
     selection/<selection_id>/
       state.json                    # 可重入分档状态
       tiers.json                    # 达标后发布
@@ -65,7 +66,9 @@ RESULT_ROOT/
     training_complete.json          # 正常结束后原子发布的完整 checkpoint 清单
   _sacred/                          # Sacred 日志，仍在指定根目录内
   _jax_cache/                       # JAX 编译缓存，可用 JAX_COMPILATION_CACHE_DIR 覆盖
-  eval_queue.sqlite3
+  _eval_requests/                   # 稳定 request_id 索引和按 ID 的文件锁
+  _eval_queue/<rule>/               # 无 batch_id 的单模型文件队列
+  _batches/<rule>/<batch_id>/eval_queue/ # 批次文件队列
 ```
 
 本次迁移必须选择新的输出目录；已有旧模型/队列的目录会被拒绝。`tabx_semantics.json` 将官方仓库 URL、子模块 commit、实际使用的 `physics/parameters/default.json`、`heuristic_policy/parameters/expert.json` 的 SHA-256、观测布局版本及终局定义绑定到输出根目录。这些字段也写入 run、checkpoint、CPU 评估和 HDF5；加载快照前校验 JSON，即使只修改参数 JSON 而没有修改 Python 源码，也不能悄悄改变模拟器。
@@ -141,7 +144,7 @@ python "$EPYMARL_ROOT/src/tabx_pipeline.py" eval-worker \
   --rule "$RULE" --workers 2 --threads 1
 ```
 
-队列面向**同一台机器、本地磁盘**，用 SQLite 事务认领和每局唯一键防重。两个规则的 worker 并发数合计应落在整机 CPU 预算内。训练最多保留 `tabx_max_pending_evals=16` 个待处理请求，超额快照仍保存并记录跳过原因；选档会补齐缺失评估。失败记录 traceback；修复后以 `--retry-failed` 重启。进程崩溃的请求在 `--lease-seconds`（默认 3600 秒）后可重领；每局成功结果立即入库，重试只补缺失 seed。
+文件队列用按 request_id 的文件锁及同文件系统的原子重命名互斥领取；新输出目录不生成 SQLite 数据库。批量模式把所有请求持久登记在各 run 的请求清单中，再按 run 轮流放入有界 ready 队列；旧参数 tabx_max_pending_evals 仅作兼容保留，不跳过 checkpoint。执行并发由 worker 数控制。失败记录 traceback，可用 --retry-failed 重试。崩溃请求在 --lease-seconds（默认 3600 秒）后可重领；每个成功 seed 单独原子保存，恢复只执行缺失 seed。最终逐局 JSON 完整发布后才发送完成通知。
 
 从训练输出的 manifest 获取 `RUN_ID`，然后执行：
 
@@ -199,7 +202,7 @@ python "$EPYMARL_ROOT/src/tabx_pipeline.py" report \
 
 ```bash
 cd "$EPYMARL_ROOT"
-python -m pytest -q tests/test_tabx.py tests/test_tabx_official.py
+python -m pytest -q tests/test_tabx.py tests/test_tabx_official.py tests/test_tabx_scheduler.py
 # 再执行官方 TABX 物理状态/观测/稠密奖励和同 seed 重放对照：
 TABX_BANK="$TASK_BANK" \
   CUDA_VISIBLE_DEVICES="" JAX_PLATFORMS=cpu OMP_NUM_THREADS=1 \
@@ -211,6 +214,8 @@ TABX_RUN_SMOKE=1 TABX_BANK="$TASK_BANK" \
 ```
 
 短训练测试还会让独立 CPU worker 真实加载官方子模块、排空初筛队列，并用每条规则的最终模型各采两局，写入/校验 HDF5 后逐字段读回 EpisodeBatch。它仅验证链路，不生成达标的 medium/high 档位。
+
+新增批量测试还会用 23、651、647 三个真实任务验证并发训练、共享 CPU worker、全部 checkpoint 初筛、CSV、日志、恢复及不生成 SQLite 文件。常规测试另验证已完成 9 份请求空轮询 100 次零历史访问、两个进程竞争只执行一次，以及评估中断后的状态一致性和缺失 seed 补齐。该本地测试仅在测试内模拟 GPU 分配、实际使用 CPU 训练，不是多卡性能或显存验收；生产 batch-train 仍强制要求 CUDA。
 
 ## 7. 恢复 32 任务试点前重新测量
 
@@ -226,3 +231,122 @@ python "$EPYMARL_ROOT/src/tabx_pipeline.py" check-env \
 ```
 
 该校准按真实尺寸排序以复用 JIT，记录合法随机动作下的 CPU 步/秒、冷编译开销、纯超时率和回报，作为新随机基准的测量；它不代表 QMIX 中高档质量。随后在服务器恢复训练、CPU 评估和结束后选档，用新返回值重新确认中高档差距。GPU/CPU 策略数值对照、满编峰值和正式学习曲线仍需在训练服务器测量，通过这些结果再决定正式放量；不会自动启动 32 任务或全库长训练。
+
+## 8. 批量训练：每个分支一个终端，只写日志
+
+新增的 batch-train 复用上面的单模型训练、不可变 checkpoint 和 CPU rollout。每个 task × seed 独立训练；GPU 名额按每卡分配，CPU 评估池由整个批次共享。默认规则从当前 checkout 的 src/config/envs/tabx.yaml 读取，也可显式传 --rule。公共模块不包含 HP/LOSS 分支专属逻辑。
+
+两个分支同时运行时，使用两个独立 checkout/worktree，各开一个终端，激活相应训练环境。两边可以使用同一个 RESULT_ROOT（同一台机器的本地文件系统），必须遵守整机 GPU 和 CPU 配额。不要切换正在运行的 checkout 的分支或修改其源码。
+
+HP 终端先运行三任务冒烟：
+
+~~~bash
+python src/tabx_pipeline.py batch-train \
+  --bank "$TASK_BANK" --root "$RESULT_ROOT" --rule hp \
+  --tasks 23,651,647 --seeds 1 --gpus 0,1 --jobs-per-gpu 1 \
+  --eval-workers 2 --eval-threads 1 --batch-id hp-smoke-01 \
+  --set t_max=3000 --set batch_size=2 --set buffer_size=4 \
+  --set save_model_interval=1000 --set learner_log_interval=200
+~~~
+
+LOSS 终端：
+
+~~~bash
+python src/tabx_pipeline.py batch-train \
+  --bank "$TASK_BANK" --root "$RESULT_ROOT" --rule loss \
+  --tasks 23,651,647 --seeds 1 --gpus 2,3 --jobs-per-gpu 1 \
+  --eval-workers 2 --eval-threads 1 --batch-id loss-smoke-01 \
+  --set t_max=3000 --set batch_size=2 --set buffer_size=4 \
+  --set save_model_interval=1000 --set learner_log_interval=200
+~~~
+
+--tasks、--pilot、--task-list 必须且只能提供一个，不会默认遍历全库。正式训练去掉冒烟用的 --set，使用 --pilot artifacts/tabx/pilot-v2.json 和新的 batch ID，继承 qmix_tabx.yaml。--task-list 支持 JSON ID 数组，或以空白、逗号分隔的文本 ID 列表。--seeds 1,2,3 会展开每个任务的三个训练作业。
+
+--jobs-per-gpu 是每卡同时训练数，例如两卡各 12 个名额最多训练 24 个模型；--eval-workers 是整个批次的 CPU 进程数。--eval-cpu-affinity 0-7,16-23 可指定评估核心，worker 会分配这些核心；训练线程数沿用启动环境。增大并发前，应以正式 batch_size=32、buffer_size=512 和满编任务测量整卡显存、主机内存、总吞吐与评估积压。
+
+--eval-prefetch 默认 4，限制每个 CPU worker 预留的待领取份数。例如 8 个 worker 时，pending/ 最多 32 份，另有最多 8 份运行中请求。其余请求保留在 run 的持久登记清单中，由轮转队列公平放行；训练进程不等待 CPU，checkpoint 一个也不漏。独立启动的 eval-worker 也支持该参数，并接管该批次的评估放行，后续 select 阶段沿用同样的上限。
+
+GPU 编号使用当前分配范围内的外部编号或 GPU/MIG UUID，不能重复。已有 CUDA_VISIBLE_DEVICES / NVIDIA_VISIBLE_DEVICES 限制时，不能越过该范围。调度器先用当前 sys.executable 独立探测每张卡；每个训练子进程再设置 CUDA_VISIBLE_DEVICES=<外部编号>、JAX_PLATFORMS=cpu 和 tabx_require_cuda=True，验证一次真实 CUDA 分配。进程内 cuda:0 对应它分到的那张卡。GPU 不可用时明确失败，批量入口不会回退到 CPU。run manifest 的 deployment 记录外部 GPU、设备名及 PID。
+
+批次输出：
+
+~~~text
+RESULT_ROOT/_batches/<rule>/<batch_id>/
+  batch.json                         # 冻结任务/seed、超参数、代码和任务库 hash
+  state.json                         # 默认每五分钟的整批快照，含 snapshot_time_utc
+  runtime.json                       # 调度器、worker 和活跃训练 PID，实时更新
+  jobs/<job_id>.json                 # 单 job 变化时原子更新，恢复优先使用
+  jobs.jsonl                         # 实时追加的小事件记录
+  batch.log                          # 与终端相同的批次进度、训练采样及评估结果
+  batch_summary.csv                  # 默认每五分钟生成，每行含 snapshot_time_utc
+  eval-workers.log                   # CPU worker 完整输出/错误
+  eval_queue/
+    pending/                         # 有界 ready 队列，尚未允许领取的请求不放这里
+    running/                         # 原子领取，记录 owner / worker PID
+    finished/                        # 新完成通知，消费后移出
+    failed/                          # 新失败通知，消费后移出
+    archive/<complete|failed>/       # 已消费通知，按 request_id 去重
+  logs/<run_id>/train.log             # 启动参数、PID、完整训练输出
+RESULT_ROOT/<rule>/<task>/<seed>/<run_id>/
+  train.log                          # 指向该 attempt 的完整日志
+  train_metrics.csv                  # 仅所属训练进程追加
+  training_episodes.jsonl             # 每局一行，含实际 epsilon
+  eval_summary.csv                   # 每个 request 一行，重试不重复
+  evaluations/<request_id>.json       # 保留逐局原始评估结果和设备信息
+  evaluations/partial/<request_id>/<seed>.json # 中断后只补缺少的 seed
+  evaluation_requests/requests.jsonl # 每个 checkpoint 的持久登记清单
+  evaluation_requests/registered/    # 已登记但尚未放行的请求
+~~~
+
+train_metrics.csv 的列为 t_env、learner_updates、loss、td_error_abs、grad_norm_before_clip、grad_norm_clip、q_taken_mean、target_mean、lr。由 learner 复用同一组计算值，按 learner_log_interval 采样，默认每 2,000 环境步最多一行；首次更新也会采样。梯度范数是裁剪前的值，阈值单列。逐局 JSON 保留原始回报、局长、末帧血量、终局原因和种子，增加本局动作选择实际使用的探索率。
+
+新 run 的 manifest 记录 training_metrics_version=tabx-train-metrics-v2-mask-mean。q_taken_mean 和 target_mean 现在直接除以展开后 mask 的有效元素数，不再重复除以 n_agents；有效 Q=5、目标=7 时日志就是 5、7。此改动只修正统计，不改变 loss、梯度或参数更新。旧 CSV 保留原值，比较旧 TABX 日志时应注意其 Q 均值曾缩小 10 倍。
+
+eval_summary.csv 记录 request_id、checkpoint_step、phase、action_selection、episodes、wins、win_rate_pct、mean_return、return_std、elimination_wins、timeout_wins、pure_timeouts。胜率是 0–100 的百分数，回报为原始团队奖励之和的均值，return_std 为样本标准差（单局记 0）。评估晚返回也始终使用快照 manifest 的实际训练步数。每个 worker 只用本次新结果和既有 CSV 更新所属 run，不重读历史评估 JSON；run 写锁避免并发写坏和重复计数。批次汇总只由持有批次锁的调度器写入。
+
+终端与 batch.log 按模型指标采样/评估返回输出关键行，并默认每 30 秒刷新批次概况：
+
+~~~text
+[TRAIN] rule=hp task=651 seed=1 gpu=0 step=25048 updates=142 loss=3.821 td_abs=1.247 grad_norm_preclip=18.4 grad_clip=10
+[EVAL] rule=hp task=651 seed=1 checkpoint_step=25048 phase=screen episodes=32 wins=8 win_rate=25.0% mean_return=-0.42 return_std=0.316 elimination_wins=6 timeout_wins=2
+[BATCH] rule=hp gpu_slots=0:4/4,1:4/4 train_running=8 train_done=6 train_pending=18 train_failed=0 eval_registered_waiting=120 eval_ready=16 eval_running=4 eval_done=31 eval_failed=0
+[MODEL] task=23 seed=1 train_status=complete eval_status=interrupted status=evaluation_interrupted eval_done=1 eval_expected=3 eval_remaining=2
+~~~
+
+batch_summary.csv 包含 train_status、eval_status、status、eval_expected、eval_done、eval_pending、eval_running、eval_failed、eval_remaining，以及 run ID/attempt、GPU/PID、退出码、真实训练步数/更新数、耗时、峰值显存（字节）、最后评估的 checkpoint 步数/阶段/局数/胜局/百分比胜率/原始回报及完整日志路径。state.json、CSV 和终端均通过 derive_job_status 生成状态。完整 CSV 保留原始数值。本次没有 PNG、Matplotlib 依赖或重画图命令。
+
+待训练 job 使用 deque 补位，GPU 占用数和批次状态计数按事件更新。dirty_jobs 只重算受影响模型；训练日志使用字节游标，只读取新增完整行，模型结束后释放读游标。没有新事件时只检查活跃子进程和有界评估队列，不遍历所有任务或历史请求。
+
+每个 job 的小 JSON 和 jobs.jsonl 实时更新。整批 state.json 和 CSV 默认每 300 秒生成一次，可用 --snapshot-interval 调整；正常结束或可控中断强制写最终版。--status-interval 默认 30 秒，只打印内存计数，不触发全量 CSV。查看快照时注意 snapshot_time_utc；恢复时读取较新的 jobs/<job_id>.json 并核对持久请求和训练清单。旧 worker 仍存活或其他调度器持有接管锁时，拒绝接管不会改写原状态或 CSV。
+
+每个新 checkpoint 完整发布后只登记一次请求，最终保存同一步快照不会再入队。训练完成时通过 completed_checkpoints 校验封存清单，逐 checkpoint 核对一次并仅补缺失请求；恢复时再核对一次。正常轮询只看 pending/running 和未消费通知，CSV 使用缓存状态；已完成请求不会在空轮询时重读或重复入队。
+
+模型整体 complete 要求训练清单有效，且其中每个 checkpoint 的准确初筛请求 ID 都有完整、有效结果。额外复核或历史 attempt 的结果不能替代当前 attempt 的初筛。训练中 eval_expected 为空；封存后以清单数为准。评估池退出时，有缺项的模型显示 evaluation_interrupted 并记录剩余数，已经全部完成的模型保持 complete。批次返回非零并逐模型列出缺项，不会把训练完成统一改成整体完成。
+
+--resume 仍逐份校验 checkpoint 身份和评估 seed，但按 run 核对 eval_summary.csv：先收集该 run 所有有效初筛、复核、随机基准和留出结果，再在同一把汇总锁内读取一次 CSV。表头、顺序、请求 ID 及按 CSV 规则序列化后的字段值一致时不写盘，保留修改时间；缺行、重复行或数值错误时原子重写一次。没有完整结果且 CSV 不存在时不创建空表。某个 run 中途检查失败不会用部分数据覆盖汇总。正常 CPU worker 完成一份新评估仍即时更新 CSV、照常打印评估结果。
+
+Ctrl+C 会停止派发并回收本批自己的训练/评估进程组；重新执行同一命令并加 --resume。任务、seed、规则、超参数、任务库及源码内容必须匹配；仍需提供相同的 --set。GPU 列表、每卡并发数、评估 worker/线程数可调整。训练和初筛均完成的模型直接跳过；训练完成但评估缺项时复用原模型和逐 seed 结果，仅补缺项。最终 JSON 已写好但通知或 state.json 未更新时，恢复会校验并修正计数。缺少有效训练完成清单的 attempt 保留归档，新建 attempt 从头训练，其旧结果不计入新模型完成数。若旧子进程仍存活，恢复会报出 PID；同一批次的文件锁防止两个终端同时启动。
+
+此命令只完成训练与 checkpoint 初筛。后续继续用 select 生成随机基准、复核和留出评估请求；它们的 phase 在 eval_summary.csv 中单列。批次结束后，若要消费该批的 select 请求，显式启动：
+
+~~~bash
+python src/tabx_pipeline.py eval-worker \
+  --bank "$TASK_BANK" --root "$RESULT_ROOT" --rule "$RULE" \
+  --batch-id "$BATCH_ID" --workers 2 --threads 1
+~~~
+
+省略 --batch-id 的独立 worker 只处理无批次的单模型请求。select 的随机基准、复核和留出阶段使用同一文件队列；原请求 ID 算法、完整结果复用和单模型调用方式保留。部署文件系统需支持同文件系统原子重命名及文件锁；新队列不使用 SQLite。
+
+## 9. 调度规模与显卡容量分别验收
+
+可用 CPU 上的 8,000 个逻辑作业验证调度器，固定 24 个活跃名额，不需要 8,000 个真实场景。现有任务库仍是 6,624 个不同场景；使用多个训练 seed 可以组成超过 8,000 个训练作业，正式训练 8,000 个不同场景则需先更新任务库。
+
+~~~bash
+python -m pytest -q tests/test_tabx_scaling.py
+python tests/test_tabx_scaling.py --polls 100 \
+  --output artifacts/tabx/scheduler-scale-validation.json
+~~~
+
+基准使用相同的 24 个真实 CPU 等待进程，分别测量 800/8,000 逻辑作业的空轮询中位数、P95、CPU、每分钟写盘量及单独的全量快照耗时。结果见 artifacts/tabx/scheduler-scale-validation.json；逻辑任务和快照负载为轻量模拟，不代表真实 QMIX 的显存容量。常规测试还检查单模型事件只更新该 job、重复通知不重复计数、有界预取与恢复、过时整批快照恢复及拒绝接管不改写汇总。
+
+真实服务器仍需用正式 batch_size=32、buffer_size=512 和 10 对 10 任务逐步比较每卡 1、2、4 个模型，再按整卡显存、主机内存、总训练步数/小时和评估积压决定是否升至 12。终端 eval_registered_waiting 持续增长说明 CPU 评估跟不上；增加 GPU 并发不能消除这部分积压。
