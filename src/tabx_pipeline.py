@@ -131,13 +131,17 @@ def process_request(queue, claim, bank, tabx_root=None):
             torch_device="cpu", torch_threads=torch.get_num_threads(),
             peak_rss_kib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
             steps_per_second=sum(row["length"] for row in rows) / max(total_seconds, 1e-9)))
-        atomic_json(resolve_under(queue.root, request["run"]) / "evaluations" / f"{key}.json", report)
+        queue.publish_result(key, owner, report)
         queue.finish(key, owner)
         print(json.dumps(dict(request_id=key, status="complete", episodes=len(rows))), flush=True)
         return True
     except Exception:
         error = traceback.format_exc()
-        queue.finish(key, owner, error)
+        try:
+            queue.finish(key, owner, error)
+        except RuntimeError:
+            # A stale worker must never overwrite the replacement owner's state.
+            pass
         print(json.dumps(dict(request_id=key, status="failed", error=error)), file=sys.stderr, flush=True)
         return False
     finally:
@@ -146,7 +150,30 @@ def process_request(queue, claim, bank, tabx_root=None):
 
 
 def eval_worker(args):
+    """A standalone worker pool also owns bounded admission for managed batches."""
+    from tabx_storage import EvalQueue, ensure_output_contract
     configure_cpu(args.threads, args.cpu_affinity)
+    ensure_output_contract(args.root)
+    queue = EvalQueue(args.root)
+    dispatcher = None
+    batch_id = getattr(args, "batch_id", None)
+    if not getattr(args, "external_dispatch", False) and queue.policy(args.rule, batch_id):
+        from tabx_dispatcher import EvalDispatcher
+        dispatcher = EvalDispatcher(queue, args.rule, batch_id, args.workers, getattr(args, "eval_prefetch", 4))
+        dispatcher.restore()
+        dispatcher.poll()
+    args._dispatcher = dispatcher
+    try:
+        return _eval_worker(args)
+    finally:
+        if dispatcher is not None:
+            dispatcher.close()
+
+
+def _eval_worker(args):
+    configure_cpu(args.threads, args.cpu_affinity)
+    from tabx_storage import ensure_output_contract
+    ensure_output_contract(args.root)
     os.environ.setdefault("JAX_COMPILATION_CACHE_DIR", str(Path(args.root).expanduser().resolve() / "_jax_cache"))
     if args.workers > 1:
         children = []
@@ -155,11 +182,18 @@ def eval_worker(args):
                    "--poll-seconds", str(args.poll_seconds), "--lease-seconds", str(args.lease_seconds)]
         if args.tabx_root:
             command.extend(["--tabx-root", args.tabx_root])
+        if getattr(args, "batch_id", None):
+            command.extend(["--batch-id", args.batch_id])
+        if getattr(args, "external_dispatch", False) or args._dispatcher is not None:
+            command.append("--external-dispatch")
+        command.extend(["--eval-prefetch", str(getattr(args, "eval_prefetch", 4))])
         if args.once:
             command.append("--once")
         if args.retry_failed:
             from tabx_storage import EvalQueue
-            EvalQueue(args.root).retry_failed(args.rule)
+            EvalQueue(args.root).retry_failed(args.rule, getattr(args, "batch_id", None))
+        if args._dispatcher is not None:
+            args._dispatcher.poll()
         try:
             core_groups = [[] for _ in range(args.workers)]
             if args.cpu_affinity:
@@ -172,6 +206,10 @@ def eval_worker(args):
                 child_command = command + (["--cpu-affinity", ",".join(map(str, group))] if group else [])
                 children.append(subprocess.Popen(child_command, env=os.environ.copy()))
             while any(child.poll() is None for child in children):
+                if args._dispatcher is not None:
+                    args._dispatcher.poll()
+                if any(child.poll() is not None and (child.returncode != 0 or not args.once) for child in children):
+                    raise RuntimeError("An evaluation worker process exited unexpectedly")
                 time.sleep(0.5)
             if any(child.returncode for child in children):
                 raise RuntimeError("An evaluation worker process exited unsuccessfully")
@@ -180,19 +218,31 @@ def eval_worker(args):
                 if child.poll() is None:
                     child.terminate()
             for child in children:
-                child.wait()
+                try:
+                    child.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait()
         return
     import torch
     from tabx_storage import EvalQueue
     torch.set_num_threads(args.threads)
     queue = EvalQueue(args.root)
     if args.retry_failed:
-        queue.retry_failed(args.rule)
+        queue.retry_failed(args.rule, getattr(args, "batch_id", None))
     failed = False
     while True:
-        claim = queue.claim(args.rule, args.lease_seconds)
+        if args._dispatcher is not None:
+            args._dispatcher.poll()
+        claim = queue.claim(args.rule, args.lease_seconds, getattr(args, "batch_id", None))
         if claim is None:
             if args.once:
+                admission = queue.directory(args.rule, getattr(args, "batch_id", None)) / "admission.json"
+                if getattr(args, "external_dispatch", False) and admission.exists():
+                    from tabx_storage import read_json
+                    if read_json(admission)["registered_waiting"]:
+                        time.sleep(args.poll_seconds)
+                        continue
                 if failed:
                     raise RuntimeError("One or more evaluation requests failed; inspect the queue errors")
                 return
@@ -526,17 +576,22 @@ def report(args):
 
 
 def parser():
+    import yaml
+    with (Path(__file__).resolve().parent / "config/envs/tabx.yaml").open(encoding="utf-8") as stream:
+        default_rule = yaml.safe_load(stream)["env_args"]["timeout_rule"]
     result = argparse.ArgumentParser(description=__doc__)
     commands = result.add_subparsers(dest="command", required=True)
-    def common(name, help_text, bank=False, root=False):
+    def common(name, help_text, bank=False, root=False, cpu_options=True):
         command = commands.add_parser(name, help=help_text)
-        command.add_argument("--rule", choices=("hp", "loss"), default="hp")
+        command.add_argument("--rule", choices=("hp", "loss"), default=default_rule,
+                             help=f"Timeout rule (default: {default_rule}, from config/envs/tabx.yaml)")
         if bank:
             command.add_argument("--bank", required=True, help="Task-bank JSON on this machine")
             command.add_argument("--tabx-root", default=None, help="Optional assertion of the pinned third_party/TABX path; external roots rejected")
             command.add_argument("--bank-sha256", help="Optional expected task-file SHA-256")
-            command.add_argument("--threads", type=int, default=1)
-            command.add_argument("--cpu-affinity", help="Optional allocated CPU cores, e.g. 0-7,16-23")
+            if cpu_options:
+                command.add_argument("--threads", type=int, default=1)
+                command.add_argument("--cpu-affinity", help="Optional allocated CPU cores, e.g. 0-7,16-23")
         if root:
             command.add_argument("--root", required=True, help="Output root used during training")
         return command
@@ -553,10 +608,31 @@ def parser():
     bank_check.add_argument("--output")
     worker = common("eval-worker", "Run a bounded pool of independent CPU workers", bank=True, root=True)
     worker.add_argument("--workers", type=int, default=1)
+    worker.add_argument("--eval-prefetch", type=int, default=4)
+    worker.add_argument("--external-dispatch", action="store_true", help=argparse.SUPPRESS)
+    worker.add_argument("--batch-id", help="Claim only this batch; omitted claims only unbatched single-run requests")
     worker.add_argument("--once", action="store_true", help="Drain the current queue, then exit")
     worker.add_argument("--retry-failed", action="store_true")
     worker.add_argument("--poll-seconds", type=float, default=2.0)
     worker.add_argument("--lease-seconds", type=float, default=3600)
+    batch = common("batch-train", "Schedule independent QMIX GPU runs and shared CPU checkpoint evaluation", bank=True, root=True, cpu_options=False)
+    source = batch.add_mutually_exclusive_group(required=True)
+    source.add_argument("--tasks", help="Comma-separated task IDs; never defaults to the whole bank")
+    source.add_argument("--pilot", help="Frozen pilot JSON with task-bank hash")
+    source.add_argument("--task-list", help="JSON list or text file with comma/whitespace-separated task IDs")
+    batch.add_argument("--seeds", default="1", help="Comma-separated training seeds")
+    batch.add_argument("--gpus", required=True, help="External GPU IDs from the current allocation, e.g. 0,1")
+    batch.add_argument("--jobs-per-gpu", type=int, default=1)
+    batch.add_argument("--eval-workers", type=int, default=2)
+    batch.add_argument("--eval-threads", type=int, default=1)
+    batch.add_argument("--eval-prefetch", type=int, default=4, help="Ready requests per CPU worker; all other requests remain durably registered")
+    batch.add_argument("--eval-cpu-affinity", help="CPU cores allocated to this batch's evaluation pool")
+    batch.add_argument("--batch-id", required=True)
+    batch.add_argument("--resume", action="store_true", help="Reuse completed training and retry interrupted/failed jobs as new attempts")
+    batch.add_argument("--set", action="append", default=[], dest="overrides", metavar="KEY=VALUE")
+    batch.add_argument("--poll-seconds", type=float, default=1.0)
+    batch.add_argument("--status-interval", type=float, default=30.0)
+    batch.add_argument("--snapshot-interval", type=float, default=300.0, help="Seconds between whole-batch JSON/CSV snapshots")
     select = common("select", "Queue missing evaluations or publish tiers.json", root=True)
     select.add_argument("--task", required=True)
     select.add_argument("--run-id", required=True)
@@ -605,6 +681,9 @@ def main(argv=None):
         check_bank(args)
     elif args.command == "eval-worker":
         eval_worker(args)
+    elif args.command == "batch-train":
+        from tabx_scheduler import batch_train
+        raise SystemExit(batch_train(args))
     elif args.command == "select":
         from tabx_selection import find_run, select_tiers
         run_dir = find_run(args.root, args.rule, args.task, args.run_id)

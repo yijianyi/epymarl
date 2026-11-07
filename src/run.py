@@ -31,8 +31,8 @@ def run(_run, _config, _log):
             raise ValueError("TABX currently requires runner=episode and batch_size_run=1")
         if getattr(args, "tabx_async_eval", False) and not args.save_model:
             raise ValueError("TABX asynchronous evaluation requires save_model=True")
-        if getattr(args, "tabx_async_eval", False) and (args.tabx_screen_episodes < 2 or args.tabx_max_pending_evals < 1):
-            raise ValueError("TABX requires tabx_screen_episodes>=2 and tabx_max_pending_evals>=1")
+        if getattr(args, "tabx_async_eval", False) and args.tabx_screen_episodes < 2:
+            raise ValueError("TABX requires tabx_screen_episodes>=2")
         import logging
         logging.getLogger("jax").setLevel(logging.WARNING)
         logging.getLogger("jaxlib").setLevel(logging.WARNING)
@@ -236,6 +236,7 @@ def run_sequential(args, logger):
             from pathlib import Path
             record = dict(episode_index=runner.env.last_train_episode_index,
                           episode_seed=runner.env.last_episode_seed, t_env=runner.t_env,
+                          epsilon=float(mac.action_selector.epsilon),
                           **runner.last_episode_info)
             with (Path(args.tabx_run_dir) / "training_episodes.jsonl").open("a", encoding="utf-8") as stream:
                 stream.write(json.dumps(record, sort_keys=True, allow_nan=False) + "\n")
@@ -323,6 +324,17 @@ def run_sequential(args, logger):
 def args_sanity_check(config, _log):
     # set CUDA flags
     # config["use_cuda"] = True # Use cuda whenever possible!
+    if config.get("tabx_require_cuda", False):
+        if not config["use_cuda"] or not th.cuda.is_available():
+            raise RuntimeError("TABX requires an available training GPU; "
+                               f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')!r}")
+        if th.cuda.device_count() != 1:
+            raise RuntimeError("TABX batch training requires exactly one visible GPU per process")
+        th.cuda.set_device(0)
+        # Check allocation as well as device discovery; never silently train on CPU.
+        th.empty(1, device="cuda")
+        th.cuda.synchronize()
+        config["tabx_cuda_device_name"] = th.cuda.get_device_name(0)
     if config["use_cuda"] and not th.cuda.is_available():
         config["use_cuda"] = False
         _log.warning(

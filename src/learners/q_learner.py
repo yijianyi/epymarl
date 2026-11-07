@@ -156,23 +156,22 @@ class QLearner:
             self._update_targets_soft(self.args.target_update_interval_or_tau)
 
         if t_env - self.log_stats_t >= self.args.learner_log_interval:
-            self.logger.log_stat("loss", loss.item(), t_env)
-            self.logger.log_stat("grad_norm", grad_norm.item(), t_env)
             mask_elems = mask.sum().item()
-            self.logger.log_stat(
-                "td_error_abs", (masked_td_error.abs().sum().item() / mask_elems), t_env
-            )
-            self.logger.log_stat(
-                "q_taken_mean",
-                (chosen_action_qvals * mask).sum().item()
-                / (mask_elems * self.args.n_agents),
-                t_env,
-            )
-            self.logger.log_stat(
-                "target_mean",
-                (targets * mask).sum().item() / (mask_elems * self.args.n_agents),
-                t_env,
-            )
+            scalars = dict(loss=loss.item(), grad_norm=grad_norm.item(),
+                           td_error_abs=masked_td_error.abs().sum().item() / mask_elems,
+                           q_taken_mean=(chosen_action_qvals * mask).sum().item() / mask_elems,
+                           target_mean=(targets * mask).sum().item() / mask_elems)
+            for name, value in scalars.items():
+                self.logger.log_stat(name, value, t_env)
+            if getattr(self.args, "env", None) == "tabx":
+                from pathlib import Path
+                from tabx_reporting import append_train_metrics
+                append_train_metrics(Path(self.args.tabx_run_dir) / "train_metrics.csv", dict(
+                    t_env=int(t_env), learner_updates=self.training_steps,
+                    loss=scalars["loss"], td_error_abs=scalars["td_error_abs"],
+                    grad_norm_before_clip=scalars["grad_norm"], grad_norm_clip=self.args.grad_norm_clip,
+                    q_taken_mean=scalars["q_taken_mean"], target_mean=scalars["target_mean"],
+                    lr=self.optimiser.param_groups[0]["lr"]))
             self.log_stats_t = t_env
 
     def _update_targets_hard(self):

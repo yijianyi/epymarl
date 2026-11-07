@@ -15,4 +15,8 @@ tabx_output_root: null  # Required; contains models, logs, evaluation and data
 tabx_run_id: null  # Generate a unique ID unless explicitly supplied
 tabx_master_seed: 0
 tabx_screen_episodes: 32
-tabx_max_pending_evals: 16
+tabx_max_pending_evals: 16  # Legacy compatibility; the file queue registers every snapshot
+tabx_require_cuda: false
+tabx_batch_id: null
+tabx_assigned_gpu: null
+tabx_train_log: null

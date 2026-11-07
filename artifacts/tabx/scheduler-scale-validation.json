@@ -1,0 +1,44 @@
+{
+  "code": {
+    "commit": "8452ddb8274c5bae3b41b1322aefe99469620d05",
+    "dirty": true
+  },
+  "generated_at_utc": "2026-11-07T05:25:37Z",
+  "hardware_gpu_test": false,
+  "median_cost_ratio_8000_to_800": 0.9924239732062649,
+  "passed": true,
+  "python": "3.10.12",
+  "results": [
+    {
+      "active_trainers": 24,
+      "completed_status_recomputations": 0,
+      "estimated_cpu_pct_at_1s_poll": 0.03626071200000003,
+      "idle_bytes_per_minute": 0.0,
+      "idle_write_bytes": 0,
+      "logical_jobs": 800,
+      "median_poll_ms": 0.35216048127040267,
+      "p95_poll_ms": 0.41415903251618147,
+      "polls": 100,
+      "scheduler_cpu_ms": 36.26071200000003,
+      "snapshot_seconds": 0.04293166002025828,
+      "snapshot_write_bytes": 1083904
+    },
+    {
+      "active_trainers": 24,
+      "completed_status_recomputations": 0,
+      "estimated_cpu_pct_at_1s_poll": 0.03557839499999993,
+      "idle_bytes_per_minute": 0.0,
+      "idle_write_bytes": 0,
+      "logical_jobs": 8000,
+      "median_poll_ms": 0.34949250402860343,
+      "p95_poll_ms": 0.3869390347972512,
+      "polls": 100,
+      "scheduler_cpu_ms": 35.57839499999993,
+      "snapshot_seconds": 0.41377116699004546,
+      "snapshot_write_bytes": 10942824
+    }
+  ],
+  "schema_version": "tabx-scheduler-scale-1",
+  "source_hash": "447402a9b0957034f76317d1e4597669b2c5b3aa6f65195a5209f9d76f334f15",
+  "tasks_are_logical_jobs": true
+}

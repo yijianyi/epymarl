@@ -8,7 +8,6 @@ import os
 from pathlib import Path
 import platform
 import re
-import sqlite3
 import subprocess
 import tempfile
 import time
@@ -174,6 +173,7 @@ def validate_snapshot(path, task_manifest, rule, *, check_runtime=True):
 
 
 def create_run(config, task_manifest):
+    from tabx_reporting import TRAIN_METRICS_VERSION
     root_value = config.get("tabx_output_root")
     if not root_value:
         raise ValueError("Set tabx_output_root to your server's output directory")
@@ -191,6 +191,7 @@ def create_run(config, task_manifest):
     config["tabx_run_dir"] = str(path)
     config["local_results_path"] = str(path)
     manifest = dict(schema_version="tabx-run-1", run_id=run_id, timeout_rule=rule,
+                    training_metrics_version=TRAIN_METRICS_VERSION,
                     task_id=task_manifest["task_id"], task_hash=task_manifest["task_hash"],
                     bank_hash=task_manifest["bank_hash"], task_manifest=task_manifest,
                     train_seed=int(config["seed"]), master_seed=int(config.get("tabx_master_seed", 0)),
@@ -203,116 +204,29 @@ def create_run(config, task_manifest):
                     restore_semantics="new_attempt_with_fresh_replay_targets_rng_and_update_count",
                     deployment={"torch_device": config["device"], "jax_platforms": os.environ.get("JAX_PLATFORMS"),
                                 "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
-                                "omp_num_threads": os.environ.get("OMP_NUM_THREADS")})
+                                "omp_num_threads": os.environ.get("OMP_NUM_THREADS"), "pid": os.getpid(),
+                                "external_gpu": config.get("tabx_assigned_gpu"),
+                                "gpu_name": config.get("tabx_cuda_device_name")})
+    if config.get("tabx_batch_id"):
+        manifest["batch_id"] = safe_component(config["tabx_batch_id"])
+    if config.get("tabx_train_log"):
+        log = resolve_under(root, config["tabx_train_log"])
+        if not log.is_file():
+            raise ValueError("The scheduler must open the training log before launching a job")
+        (path / "train.log").symlink_to(os.path.relpath(log, path))
     atomic_json(path / "manifest.json", manifest)
     atomic_json(path / "config.json", config)
     return path
 
 
-class EvalQueue:
-    """SQLite queue, intended for one host/local disk (no NFS lock assumptions).
-
-    Expired leases can be reclaimed. An owner token fences late writers; results
-    are committed per episode, so retrying a request replays only missing seeds.
-    """
-    def __init__(self, root):
-        self.root = Path(root).expanduser().resolve()
-        self.root.mkdir(parents=True, exist_ok=True)
-        self.path = self.root / "eval_queue.sqlite3"
-        with self.connect() as db:
-            db.executescript("""
-                CREATE TABLE IF NOT EXISTS requests (
-                    id TEXT PRIMARY KEY, rule TEXT NOT NULL, payload TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'pending', owner TEXT, updated REAL,
-                    attempts INTEGER NOT NULL DEFAULT 0, error TEXT);
-                CREATE TABLE IF NOT EXISTS episodes (
-                    request_id TEXT NOT NULL, seed INTEGER NOT NULL, result TEXT NOT NULL,
-                    PRIMARY KEY(request_id, seed));
-            """)
-
-    @contextmanager
-    def connect(self):
-        db = sqlite3.connect(str(self.path), timeout=60)
-        db.row_factory = sqlite3.Row
-        try:
-            with db:
-                yield db
-        finally:
-            db.close()
-
-    @staticmethod
-    def request_id(payload):
-        return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-
-    def enqueue(self, payload, max_pending=None):
-        key = self.request_id(payload)
-        with self.connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            if db.execute("SELECT id FROM requests WHERE id=?", (key,)).fetchone():
-                return key
-            if max_pending is not None:
-                count = db.execute("SELECT COUNT(*) FROM requests WHERE rule=? AND status IN ('pending','running')",
-                                   (payload["rule"],)).fetchone()[0]
-                if count >= max_pending:
-                    return None
-            db.execute("INSERT INTO requests(id, rule, payload, updated) VALUES(?,?,?,?)",
-                       (key, payload["rule"], json.dumps(payload, sort_keys=True), time.time()))
-        return key
-
-    def claim(self, rule, lease_seconds=3600):
-        with self.connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            row = db.execute("""SELECT * FROM requests WHERE rule=? AND
-                (status='pending' OR (status='running' AND updated<?)) ORDER BY rowid LIMIT 1""",
-                             (rule, time.time() - lease_seconds)).fetchone()
-            if row is None:
-                return None
-            owner = uuid.uuid4().hex
-            db.execute("UPDATE requests SET status='running', owner=?, updated=?, attempts=attempts+1, error=NULL WHERE id=?",
-                       (owner, time.time(), row["id"]))
-            return row["id"], owner, json.loads(row["payload"])
-
-    def heartbeat(self, key, owner):
-        with self.connect() as db:
-            changed = db.execute("UPDATE requests SET updated=? WHERE id=? AND owner=? AND status='running'",
-                                 (time.time(), key, owner)).rowcount
-        if not changed:
-            raise RuntimeError("Evaluation lease lost")
-
-    def record(self, key, owner, result):
-        with self.connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            if not db.execute("SELECT id FROM requests WHERE id=? AND owner=? AND status='running'",
-                              (key, owner)).fetchone():
-                raise RuntimeError("Evaluation lease lost")
-            db.execute("INSERT OR IGNORE INTO episodes VALUES(?,?,?)",
-                       (key, int(result["seed"]), json.dumps(result, allow_nan=False)))
-            db.execute("UPDATE requests SET updated=? WHERE id=?", (time.time(), key))
-
-    def finish(self, key, owner, error=None):
-        with self.connect() as db:
-            db.execute("UPDATE requests SET status=?, error=?, updated=? WHERE id=? AND owner=?",
-                       ("failed" if error else "complete", error, time.time(), key, owner))
-
-    def results(self, key):
-        with self.connect() as db:
-            return [json.loads(row[0]) for row in db.execute("SELECT result FROM episodes WHERE request_id=? ORDER BY seed", (key,))]
-
-    def status(self, key):
-        with self.connect() as db:
-            row = db.execute("SELECT status, error FROM requests WHERE id=?", (key,)).fetchone()
-            return dict(row) if row else None
-
-    def retry_failed(self, rule):
-        with self.connect() as db:
-            return db.execute("UPDATE requests SET status='pending', owner=NULL WHERE rule=? AND status='failed'", (rule,)).rowcount
+from tabx_queue import EvalQueue
 
 
 def evaluation_request(root, run_dir, snapshot, phase, count, *, random_policy=False):
     root, run_dir = Path(root).resolve(), Path(run_dir).resolve()
     run = read_json(run_dir / "manifest.json")
     manifest = read_json(Path(snapshot) / "manifest.json")
-    return dict(schema_version="tabx-eval-1", rule=run["timeout_rule"], task_id=run["task_id"],
+    request = dict(schema_version="tabx-eval-1", rule=run["timeout_rule"], task_id=run["task_id"],
                 task_hash=run["task_hash"], bank_hash=run["bank_hash"], train_seed=run["train_seed"],
                 run_id=run["run_id"], run=str(run_dir.relative_to(root)),
                 snapshot=str(Path(snapshot).resolve().relative_to(root)),
@@ -322,6 +236,9 @@ def evaluation_request(root, run_dir, snapshot, phase, count, *, random_policy=F
                 simulator_contract=SIMULATOR_CONTRACT, layout_version=LAYOUT_VERSION,
                 official_tabx=run.get("provenance", {}).get("tabx", {}), native_shape=run.get("native_shape"),
                 seeds=[stable_seed(run["task_hash"], run["master_seed"], phase, i) for i in range(count)])
+    if run.get("batch_id"):
+        request["batch_id"] = run["batch_id"]
+    return request
 
 
 class SnapshotPublisher:
@@ -339,12 +256,7 @@ class SnapshotPublisher:
     def publish(self, learner, step, *, force_eval=False):
         step = int(step)
         if self.last_step == step:
-            if force_eval:
-                path = self.run_dir / "checkpoints" / str(step)
-                request = evaluation_request(self.root, self.run_dir, path, "screen", self.args.tabx_screen_episodes)
-                key = self.queue.enqueue(request)
-                atomic_json(self.run_dir / "evaluation_requests" / f"{step}.json", dict(status="queued", request_id=key))
-            return
+            return self.run_dir / "checkpoints" / str(step)
         parent = self.run_dir / "checkpoints"
         parent.mkdir(exist_ok=True)
         path = parent / str(step)
@@ -360,6 +272,9 @@ class SnapshotPublisher:
                             provenance=run["provenance"], agent_sha256=file_sha256(tmp / "agent.th"),
                             config_sha256=file_sha256(tmp / "config.json"))
             manifest["train_seed_protocol"] = TRAIN_SEED_PROTOCOL
+            manifest["training_metrics_version"] = run.get("training_metrics_version")
+            if run.get("batch_id"):
+                manifest["batch_id"] = run["batch_id"]
             manifest["training_episodes"] = getattr(self.env, "_episode_index", None)
             manifest.update(simulator_contract=SIMULATOR_CONTRACT, layout_version=LAYOUT_VERSION,
                             native_shape=run.get("native_shape"), official_tabx=run.get("provenance", {}).get("tabx", {}))
@@ -372,9 +287,9 @@ class SnapshotPublisher:
                 import shutil
                 shutil.rmtree(tmp)
         request = evaluation_request(self.root, self.run_dir, path, "screen", self.args.tabx_screen_episodes)
-        key = self.queue.enqueue(request, None if force_eval else int(self.args.tabx_max_pending_evals))
+        key = self.queue.enqueue(request)
         atomic_json(self.run_dir / "evaluation_requests" / f"{step}.json",
-                    dict(status="queued" if key else "skipped_backpressure", request_id=key))
+                    dict(status="queued", request_id=key, checkpoint_step=step))
         self.last_step = step
         self.next_save = (step // self.interval + 1) * self.interval
         return path
