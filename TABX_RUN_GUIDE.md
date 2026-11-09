@@ -124,13 +124,15 @@ JAX_PLATFORMS=cpu python "$EPYMARL_ROOT/src/main.py" \
   t_max=3000 batch_size=2 buffer_size=4 save_model_interval=1000
 ```
 
-无 GPU 的测试机再加 `use_cuda=False`。正式训练去掉冒烟时的 `t_max`、`batch_size`、`buffer_size` 和保存间隔覆盖，默认恢复 500k 步、batch 32、buffer 512、25k 保存间隔、512 步上限。
+无 GPU 的测试机再加 `use_cuda=False`。正式训练去掉冒烟时的 `t_max`、`batch_size`、`buffer_size` 和保存间隔覆盖，默认使用 800k 步、batch 32、CPU replay buffer 256 回合、25k 保存间隔、512 步上限。探索率在前 80k 步从 1.0 降到 0.05，贪心评估 epsilon 为 0；学习率 0.00005、gamma 0.99、梯度裁剪 10，目标网络每 200 次梯度更新同步一次，不标准化奖励和回报。
+
+`qmix_tabx.yaml` 通过 `mixer_init_scale: 0.001`、`mixer_layer_norm: true`、`mixer_layer_norm_eps: 0.000001` 启用 mixer 设置。QMixer 对所有 Linear 权重使用 gain=0.001 的正交初始化、偏置置零；hyper_w_1、hyper_w_final、V 的隐藏层均为 Linear → LayerNorm(eps=1e-6) → ReLU。归一化仅处理状态分支，混合权重仍取绝对值以保留单调性。这些配置随 checkpoint 保存，重建 learner 时使用相同结构。
 
 第一次 rollout 前保存真正的 step 0；周期保存使用完整局结束后的真实 `t_env`；训练正常结束时先发布最终快照，再原子写入 `training_complete.json`，封存所有 checkpoint 的步数及 agent/config/manifest hash。中断或失败的训练没有完成标记。`training_summary.json` 必须显示 `learner_updates>0`，并记录环境步数、episode 数、时间、主存和 GPU 分配峰值。异步模式完全跳过训练进程内的测试 rollout。训练日志中包含歼灭胜率、超时胜率、纯超时率、首杀、双方末帧 HP 和局长。
 
 每次训练 reset 都按 `SHA256(JSON([任务内容hash, train_seed, "train", episode_index]))` 的前 32 位派生该局的环境种子，episode_index 从 0 开始；run_id 和规则均不参与。每局重新初始化 JAX key，前面 episode 的步数不会影响后续局的起始种子。同任务、同 train_seed 的 hp/loss 第十局因此可以配对，动作和轨迹仍允许不同。实际使用的序列写入 `training_episodes.jsonl`；显式评估 seed 不消耗训练 episode_index。
 
-正式初筛按任务 651、657、647，规则 hp/loss，`lr=0.00005/0.0002`，`epsilon_anneal_time=100000/300000` 的 24 种组合运行；先按服务器实测峰值安排训练 GPU 槽位。入围配置再做三个训练 seed 的复核。每次启动产生独立 run；可指定 `tabx_run_id` 方便调度，但不能复用已有 ID。
+首轮按该推荐配置启动新批次，先查看 `train_metrics.csv` 首批更新的 `q_taken_mean`、`target_mean`、`td_error_abs` 和裁剪前梯度，再用后期贪心 CPU 评估的歼灭胜率及平均回报判断训练效果。800k 预算、80k 探索期和 256 回合经验池均是待验证的推荐值；实际收益需要完整学习曲线确认。每次启动产生独立 run；可指定 `tabx_run_id` 方便调度，但不能复用已有 ID。
 
 `checkpoint_path` 接收具体快照目录或含数字步数子目录的父目录。它会加载 agent/mixer/optimizer，登记为**新的训练尝试**，不发布虚假的随机 step 0。replay、目标网络历史、更新计数和随机状态并未完整恢复，训练 episode_index 也从 0 开始，不能作为精确续训。正式评估和采集应使用下面的不可变快照入口。
 
@@ -202,7 +204,7 @@ python "$EPYMARL_ROOT/src/tabx_pipeline.py" report \
 
 ```bash
 cd "$EPYMARL_ROOT"
-python -m pytest -q tests/test_tabx.py tests/test_tabx_official.py tests/test_tabx_scheduler.py
+python -m pytest -q tests/test_qmix_tabx.py tests/test_tabx.py tests/test_tabx_official.py tests/test_tabx_scheduler.py
 # 再执行官方 TABX 物理状态/观测/稠密奖励和同 seed 重放对照：
 TABX_BANK="$TASK_BANK" \
   CUDA_VISIBLE_DEVICES="" JAX_PLATFORMS=cpu OMP_NUM_THREADS=1 \
@@ -262,7 +264,9 @@ python src/tabx_pipeline.py batch-train \
 
 --tasks、--pilot、--task-list 必须且只能提供一个，不会默认遍历全库。正式训练去掉冒烟用的 --set，使用 --pilot artifacts/tabx/pilot-v2.json 和新的 batch ID，继承 qmix_tabx.yaml。--task-list 支持 JSON ID 数组，或以空白、逗号分隔的文本 ID 列表。--seeds 1,2,3 会展开每个任务的三个训练作业。
 
---jobs-per-gpu 是每卡同时训练数，例如两卡各 12 个名额最多训练 24 个模型；--eval-workers 是整个批次的 CPU 进程数。--eval-cpu-affinity 0-7,16-23 可指定评估核心，worker 会分配这些核心；训练线程数沿用启动环境。增大并发前，应以正式 batch_size=32、buffer_size=512 和满编任务测量整卡显存、主机内存、总吞吐与评估积压。
+`bash scripts/run_tabx_pilot32.sh` 会使用运行时指定的 TASK_BANK、RESULT_ROOT、GPUS，顺序运行 HP/LOSS 的 32 任务试点，再采最终模型的配对贪心样本。训练参数继承 qmix_tabx.yaml，默认 batch ID 为 pilot32-800k-s1；可用 BATCH_ID、SEEDS、JOBS_PER_GPU、EVAL_WORKERS 等环境变量调整批次和资源。新版 mixer 增加 LayerNorm 参数，使用新的批次和 run；历史模型的加载和评估使用生成它的代码及配置。
+
+--jobs-per-gpu 是每卡同时训练数，例如两卡各 12 个名额最多训练 24 个模型；--eval-workers 是整个批次的 CPU 进程数。--eval-cpu-affinity 0-7,16-23 可指定评估核心，worker 会分配这些核心；训练线程数沿用启动环境。增大并发前，应以正式 batch_size=32、buffer_size=256 和满编任务测量整卡显存、主机内存、总吞吐与评估积压。
 
 --eval-prefetch 默认 4，限制每个 CPU worker 预留的待领取份数。例如 8 个 worker 时，pending/ 最多 32 份，另有最多 8 份运行中请求。其余请求保留在 run 的持久登记清单中，由轮转队列公平放行；训练进程不等待 CPU，checkpoint 一个也不漏。独立启动的 eval-worker 也支持该参数，并接管该批次的评估放行，后续 select 阶段沿用同样的上限。
 
@@ -349,4 +353,4 @@ python tests/test_tabx_scaling.py --polls 100 \
 
 基准使用相同的 24 个真实 CPU 等待进程，分别测量 800/8,000 逻辑作业的空轮询中位数、P95、CPU、每分钟写盘量及单独的全量快照耗时。结果见 artifacts/tabx/scheduler-scale-validation.json；逻辑任务和快照负载为轻量模拟，不代表真实 QMIX 的显存容量。常规测试还检查单模型事件只更新该 job、重复通知不重复计数、有界预取与恢复、过时整批快照恢复及拒绝接管不改写汇总。
 
-真实服务器仍需用正式 batch_size=32、buffer_size=512 和 10 对 10 任务逐步比较每卡 1、2、4 个模型，再按整卡显存、主机内存、总训练步数/小时和评估积压决定是否升至 12。终端 eval_registered_waiting 持续增长说明 CPU 评估跟不上；增加 GPU 并发不能消除这部分积压。
+真实服务器仍需用正式 batch_size=32、buffer_size=256 和 10 对 10 任务逐步比较每卡 1、2、4 个模型，再按整卡显存、主机内存、总训练步数/小时和评估积压决定是否升至 12。终端 eval_registered_waiting 持续增长说明 CPU 评估跟不上；增加 GPU 并发不能消除这部分积压。

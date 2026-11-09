@@ -5,7 +5,7 @@ cd "$(dirname "$0")/.."
 : "${TASK_BANK:?Set TASK_BANK to the full merged task bank on the server}"
 : "${RESULT_ROOT:?Set RESULT_ROOT to an output directory on the server}"
 : "${GPUS:?Set GPUS to allocated external GPU IDs, e.g. 2,3}"
-batch_id=${BATCH_ID:-pilot32-25k-s1}
+batch_id=${BATCH_ID:-pilot32-800k-s1}
 pilot=artifacts/tabx/pilot-v2.json
 export JAX_PLATFORMS=cpu
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
@@ -24,9 +24,7 @@ for rule in hp loss; do
         --rule "$rule" --batch-id "$batch_id" --seeds "${SEEDS:-1}" \
         --gpus "$GPUS" --jobs-per-gpu "${JOBS_PER_GPU:-1}" \
         --eval-workers "${EVAL_WORKERS:-2}" --eval-threads "${EVAL_THREADS:-1}" \
-        --set t_max=25000 --set save_model_interval=5000 \
-        --set epsilon_anneal_time=20000 --set batch_size=8 --set buffer_size=64 \
-        --set tabx_screen_episodes=8 "${options[@]}"
+        "${options[@]}"
 done
 
 python scripts/tabx_pilot_samples.py --root "$RESULT_ROOT" --bank "$TASK_BANK" \
