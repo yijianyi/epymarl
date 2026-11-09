@@ -54,7 +54,9 @@ def test_two_rule_training_seeds_and_completed_selection(tmp_path):
         records[rule] = rows
         assert [row["episode_index"] for row in rows] == list(range(len(rows)))
         from components.epsilon_schedules import DecayThenFlatSchedule
-        schedule = DecayThenFlatSchedule(1.0, 0.05, 100000, decay="linear")
+        config = read_json(run / "config.json")
+        schedule = DecayThenFlatSchedule(config["epsilon_start"], config["epsilon_finish"],
+                                        config["epsilon_anneal_time"], decay="linear")
         assert [row["epsilon"] for row in rows] == [schedule.eval(row["t_env"] - row["length"]) for row in rows]
         metrics = read_csv(run / "train_metrics.csv")
         assert [int(row["t_env"]) for row in metrics] == [16, 32, 48, 64, 80]
