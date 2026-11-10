@@ -99,7 +99,10 @@ def test_missing_or_wrong_submodule_is_explicit(monkeypatch, tmp_path):
 def test_json_parameters_and_output_root_are_part_of_the_contract(tmp_path):
     identity = simulator_identity()
     assert identity["submodule_commit"]
-    assert len(identity["parameter_json_sha256"]) == 2
+    assert set(identity["parameter_json_sha256"]) == {
+        "src/tabx/physics/parameters/default.json",
+        "src/tabx/heuristic_policy/parameters/advanced.json",
+    }
     for path, digest in identity["parameter_json_sha256"].items():
         assert file_sha256(official_tabx_root() / path) == digest
     old = tmp_path / "old"

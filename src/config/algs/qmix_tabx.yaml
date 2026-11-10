@@ -34,4 +34,4 @@ buffer_cpu_only: true
 target_update_interval_or_tau: 200
 save_model: true
 save_model_interval: 25000
-t_max: 800000
+t_max: 1500000
