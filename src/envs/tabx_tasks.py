@@ -228,5 +228,5 @@ def build_task_params(task, tabx_root=None):
     return {
         "scenario": scenario, "zone_scenario": zones,
         "physics_params": build_batched_physics_params("default"),
-        "heuristic_params": build_batched_heuristic_params("expert"),
+        "heuristic_params": build_batched_heuristic_params("advanced"),
     }, TABXConfig(max_n_ally=n_ally, max_n_enemy=n_enemy, max_n_zone=n_zone)

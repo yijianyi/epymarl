@@ -5,7 +5,7 @@ cd "$(dirname "$0")/.."
 : "${TASK_BANK:?Set TASK_BANK to the full merged task bank on the server}"
 : "${RESULT_ROOT:?Set RESULT_ROOT to an output directory on the server}"
 : "${GPUS:?Set GPUS to allocated external GPU IDs, e.g. 2,3}"
-batch_id=${BATCH_ID:-pilot32-800k-s1}
+batch_id=${BATCH_ID:-pilot32-1500k-s1}
 pilot=artifacts/tabx/pilot-v2.json
 export JAX_PLATFORMS=cpu
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}

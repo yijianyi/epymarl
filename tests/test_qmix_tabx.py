@@ -17,7 +17,7 @@ def mixer_args(**overrides):
 
 def test_recommended_configuration_reaches_batch_training():
     args = mixer_args()
-    expected = dict(t_max=800000, lr=0.00005, gamma=0.99, grad_norm_clip=10,
+    expected = dict(t_max=1500000, lr=0.00005, gamma=0.99, grad_norm_clip=10,
                     batch_size_run=1, batch_size=32, buffer_size=256, buffer_cpu_only=True,
                     use_rnn=True, hidden_dim=128, mixing_embed_dim=64, hypernet_layers=2,
                     hypernet_embed=128, double_q=True, target_update_interval_or_tau=200,

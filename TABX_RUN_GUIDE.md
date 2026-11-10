@@ -71,7 +71,7 @@ RESULT_ROOT/
   _batches/<rule>/<batch_id>/eval_queue/ # 批次文件队列
 ```
 
-本次迁移必须选择新的输出目录；已有旧模型/队列的目录会被拒绝。`tabx_semantics.json` 将官方仓库 URL、子模块 commit、实际使用的 `physics/parameters/default.json`、`heuristic_policy/parameters/expert.json` 的 SHA-256、观测布局版本及终局定义绑定到输出根目录。这些字段也写入 run、checkpoint、CPU 评估和 HDF5；加载快照前校验 JSON，即使只修改参数 JSON 而没有修改 Python 源码，也不能悄悄改变模拟器。
+当前使用官方 `advanced` 启发式对手。切换对手后使用新的输出目录；已有不同参数的目录会被拒绝。`tabx_semantics.json` 将官方仓库 URL、子模块 commit、实际使用的 `physics/parameters/default.json`、`heuristic_policy/parameters/advanced.json` 的 SHA-256、观测布局版本及终局定义绑定到输出根目录。这些字段也写入 run、checkpoint、CPU 评估和 HDF5；加载快照前校验 JSON，即使只修改参数 JSON 而没有修改 Python 源码，也不能悄悄改变模拟器。
 
 快照和 tiers 内的模型引用相对于 `RESULT_ROOT`。整体迁移后使用新的 `--root` 和 `--bank`，项目内仍初始化同一子模块。运行清单中的原始绝对路径只用于溯源。权重、配置、源代码内容及 JAX/jaxlib/PyTorch 版本在加载前校验；CPU/CUDA wheel 的本地版本后缀可以不同。
 
@@ -124,7 +124,7 @@ JAX_PLATFORMS=cpu python "$EPYMARL_ROOT/src/main.py" \
   t_max=3000 batch_size=2 buffer_size=4 save_model_interval=1000
 ```
 
-无 GPU 的测试机再加 `use_cuda=False`。正式训练去掉冒烟时的 `t_max`、`batch_size`、`buffer_size` 和保存间隔覆盖，默认使用 800k 步、batch 32、CPU replay buffer 256 回合、25k 保存间隔、512 步上限。探索率在前 80k 步从 1.0 降到 0.05，贪心评估 epsilon 为 0；学习率 0.00005、gamma 0.99、梯度裁剪 10，目标网络每 200 次梯度更新同步一次，不标准化奖励和回报。
+无 GPU 的测试机再加 `use_cuda=False`。正式训练去掉冒烟时的 `t_max`、`batch_size`、`buffer_size` 和保存间隔覆盖，默认使用 1500k（150 万）步、batch 32、CPU replay buffer 256 回合、25k 保存间隔、512 步上限。探索率在前 80k 步从 1.0 降到 0.05，贪心评估 epsilon 为 0；学习率 0.00005、gamma 0.99、梯度裁剪 10，目标网络每 200 次梯度更新同步一次，不标准化奖励和回报。
 
 `qmix_tabx.yaml` 通过 `mixer_init_scale: 0.001`、`mixer_layer_norm: true`、`mixer_layer_norm_eps: 0.000001` 启用 mixer 设置。QMixer 对所有 Linear 权重使用 gain=0.001 的正交初始化、偏置置零；hyper_w_1、hyper_w_final、V 的隐藏层均为 Linear → LayerNorm(eps=1e-6) → ReLU。归一化仅处理状态分支，混合权重仍取绝对值以保留单调性。这些配置随 checkpoint 保存，重建 learner 时使用相同结构。
 
@@ -132,7 +132,7 @@ JAX_PLATFORMS=cpu python "$EPYMARL_ROOT/src/main.py" \
 
 每次训练 reset 都按 `SHA256(JSON([任务内容hash, train_seed, "train", episode_index]))` 的前 32 位派生该局的环境种子，episode_index 从 0 开始；run_id 和规则均不参与。每局重新初始化 JAX key，前面 episode 的步数不会影响后续局的起始种子。同任务、同 train_seed 的 hp/loss 第十局因此可以配对，动作和轨迹仍允许不同。实际使用的序列写入 `training_episodes.jsonl`；显式评估 seed 不消耗训练 episode_index。
 
-首轮按该推荐配置启动新批次，先查看 `train_metrics.csv` 首批更新的 `q_taken_mean`、`target_mean`、`td_error_abs` 和裁剪前梯度，再用后期贪心 CPU 评估的歼灭胜率及平均回报判断训练效果。800k 预算、80k 探索期和 256 回合经验池均是待验证的推荐值；实际收益需要完整学习曲线确认。每次启动产生独立 run；可指定 `tabx_run_id` 方便调度，但不能复用已有 ID。
+首轮按该推荐配置启动新批次，先查看 `train_metrics.csv` 首批更新的 `q_taken_mean`、`target_mean`、`td_error_abs` 和裁剪前梯度，再用后期贪心 CPU 评估的歼灭胜率及平均回报判断训练效果。1500k 预算、80k 探索期和 256 回合经验池均是待验证的推荐值；实际收益需要完整学习曲线确认。每次启动产生独立 run；可指定 `tabx_run_id` 方便调度，但不能复用已有 ID。
 
 `checkpoint_path` 接收具体快照目录或含数字步数子目录的父目录。它会加载 agent/mixer/optimizer，登记为**新的训练尝试**，不发布虚假的随机 step 0。replay、目标网络历史、更新计数和随机状态并未完整恢复，训练 episode_index 也从 0 开始，不能作为精确续训。正式评估和采集应使用下面的不可变快照入口。
 
@@ -264,7 +264,7 @@ python src/tabx_pipeline.py batch-train \
 
 --tasks、--pilot、--task-list 必须且只能提供一个，不会默认遍历全库。正式训练去掉冒烟用的 --set，使用 --pilot artifacts/tabx/pilot-v2.json 和新的 batch ID，继承 qmix_tabx.yaml。--task-list 支持 JSON ID 数组，或以空白、逗号分隔的文本 ID 列表。--seeds 1,2,3 会展开每个任务的三个训练作业。
 
-`bash scripts/run_tabx_pilot32.sh` 会使用运行时指定的 TASK_BANK、RESULT_ROOT、GPUS，顺序运行 HP/LOSS 的 32 任务试点，再采最终模型的配对贪心样本。训练参数继承 qmix_tabx.yaml，默认 batch ID 为 pilot32-800k-s1；可用 BATCH_ID、SEEDS、JOBS_PER_GPU、EVAL_WORKERS 等环境变量调整批次和资源。新版 mixer 增加 LayerNorm 参数，使用新的批次和 run；历史模型的加载和评估使用生成它的代码及配置。
+`bash scripts/run_tabx_pilot32.sh` 会使用运行时指定的 TASK_BANK、RESULT_ROOT、GPUS，顺序运行 HP/LOSS 的 32 任务试点，再采最终模型的配对贪心样本。训练参数继承 qmix_tabx.yaml，默认 batch ID 为 pilot32-1500k-s1；可用 BATCH_ID、SEEDS、JOBS_PER_GPU、EVAL_WORKERS 等环境变量调整批次和资源。新版 mixer 增加 LayerNorm 参数，使用新的批次和 run；历史模型的加载和评估使用生成它的代码及配置。
 
 --jobs-per-gpu 是每卡同时训练数，例如两卡各 12 个名额最多训练 24 个模型；--eval-workers 是整个批次的 CPU 进程数。--eval-cpu-affinity 0-7,16-23 可指定评估核心，worker 会分配这些核心；训练线程数沿用启动环境。增大并发前，应以正式 batch_size=32、buffer_size=256 和满编任务测量整卡显存、主机内存、总吞吐与评估积压。
 
