@@ -91,7 +91,7 @@ def runtime_versions():
 
 def simulator_identity():
     root = official_tabx_root().resolve()
-    files = ("src/tabx/physics/parameters/default.json", "src/tabx/heuristic_policy/parameters/advanced.json")
+    files = ("src/tabx/physics/parameters/default.json", "src/tabx/heuristic_policy/parameters/medium.json")
     if not all((root / name).is_file() for name in files):
         raise ImportError("Official TABX submodule missing; run git submodule update --init --recursive")
     return dict(simulator_contract=SIMULATOR_CONTRACT, layout_version=LAYOUT_VERSION,

@@ -71,7 +71,7 @@ RESULT_ROOT/
   _batches/<rule>/<batch_id>/eval_queue/ # 批次文件队列
 ```
 
-当前使用官方 `advanced` 启发式对手。切换对手后使用新的输出目录；已有不同参数的目录会被拒绝。`tabx_semantics.json` 将官方仓库 URL、子模块 commit、实际使用的 `physics/parameters/default.json`、`heuristic_policy/parameters/advanced.json` 的 SHA-256、观测布局版本及终局定义绑定到输出根目录。这些字段也写入 run、checkpoint、CPU 评估和 HDF5；加载快照前校验 JSON，即使只修改参数 JSON 而没有修改 Python 源码，也不能悄悄改变模拟器。
+当前使用官方 `medium` 启发式对手。切换对手后使用新的输出目录；已有不同参数的目录会被拒绝。`tabx_semantics.json` 将官方仓库 URL、子模块 commit、实际使用的 `physics/parameters/default.json`、`heuristic_policy/parameters/medium.json` 的 SHA-256、观测布局版本及终局定义绑定到输出根目录。这些字段也写入 run、checkpoint、CPU 评估和 HDF5；加载快照前校验 JSON，即使只修改参数 JSON 而没有修改 Python 源码，也不能悄悄改变模拟器。
 
 快照和 tiers 内的模型引用相对于 `RESULT_ROOT`。整体迁移后使用新的 `--root` 和 `--bank`，项目内仍初始化同一子模块。运行清单中的原始绝对路径只用于溯源。权重、配置、源代码内容及 JAX/jaxlib/PyTorch 版本在加载前校验；CPU/CUDA wheel 的本地版本后缀可以不同。
 
