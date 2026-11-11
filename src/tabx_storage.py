@@ -91,7 +91,9 @@ def runtime_versions():
 
 def simulator_identity():
     root = official_tabx_root().resolve()
-    files = ("src/tabx/physics/parameters/default.json", "src/tabx/heuristic_policy/parameters/medium.json")
+    files = ("src/tabx/physics/parameters/default.json",
+             "src/tabx/heuristic_policy/parameters/medium.json",
+             "src/tabx/heuristic_policy/parameters/advanced.json")
     if not all((root / name).is_file() for name in files):
         raise ImportError("Official TABX submodule missing; run git submodule update --init --recursive")
     return dict(simulator_contract=SIMULATOR_CONTRACT, layout_version=LAYOUT_VERSION,
@@ -157,6 +159,11 @@ def validate_snapshot(path, task_manifest, rule, *, check_runtime=True):
         raise ValueError("Snapshot agent SHA-256 mismatch")
     if file_sha256(path / "config.json") != manifest["config_sha256"]:
         raise ValueError("Snapshot config SHA-256 mismatch")
+    for filename, digest in manifest.get("model_sha256", {}).items():
+        if filename not in ("agent.th", "mixer.th", "opt.th") or file_sha256(path / filename) != digest:
+            raise ValueError(f"Snapshot model checksum mismatch: {path / filename}")
+    from tabx_difficulty import checkpoint_difficulty
+    checkpoint_difficulty(path, manifest=manifest)
     if check_runtime:
         current = provenance()
         for library in ("epymarl", "tabx"):
@@ -172,6 +179,45 @@ def validate_snapshot(path, task_manifest, rule, *, check_runtime=True):
     return manifest
 
 
+def prepare_tabx_run(config, task_manifest):
+    """Resolve the selected snapshot and effective opponent before any run/env."""
+    from tabx_difficulty import DIFFICULTIES, checkpoint_difficulty, requested_difficulty, select_checkpoint
+    requested = config["env_args"].get("opponent_difficulty")
+    if requested is not None and requested not in DIFFICULTIES:
+        raise ValueError("opponent_difficulty must be medium or advanced")
+    parent = config.get("tabx_parent_checkpoint")
+    if isinstance(parent, str):
+        parent = json.loads(parent)
+        config["tabx_parent_checkpoint"] = parent
+    checkpoint = config.get("checkpoint_path")
+    if checkpoint:
+        snapshot = select_checkpoint(checkpoint, config.get("load_step", 0))
+        config["checkpoint_path"] = str(snapshot)
+        if parent:
+            identified = checkpoint_difficulty(snapshot)
+            if (identified["difficulty"] != "medium" or requested != "advanced"
+                    or config.get("evaluate") or config.get("save_replay")):
+                raise ValueError(f"checkpoint={snapshot}: curriculum requires medium -> advanced training; "
+                                 f"source={identified['difficulty']}, requested={requested}")
+            validate_parent_checkpoint(config["tabx_output_root"], parent, task_manifest,
+                                       int(config["seed"]), config["env_args"]["timeout_rule"])
+            if snapshot != resolve_under(config["tabx_output_root"], parent["snapshot"]):
+                raise ValueError(f"checkpoint={snapshot}: curriculum parent path mismatch")
+            resolution = dict(difficulty="advanced", source="curriculum_medium_to_advanced",
+                              checkpoint_difficulty="medium", evidence=identified["evidence"])
+        else:
+            resolution = requested_difficulty(snapshot, requested)
+        resolution["checkpoint"] = str(snapshot)
+    else:
+        if parent:
+            raise ValueError("Curriculum continuation requires checkpoint_path")
+        resolution = dict(difficulty=requested or "medium",
+                          source="launch_argument" if requested is not None else "new_run_default", evidence={})
+    config["env_args"]["opponent_difficulty"] = resolution["difficulty"]
+    config["tabx_difficulty_resolution"] = resolution
+    return config
+
+
 def create_run(config, task_manifest):
     from tabx_reporting import TRAIN_METRICS_VERSION
     root_value = config.get("tabx_output_root")
@@ -182,6 +228,21 @@ def create_run(config, task_manifest):
     rule = config["env_args"]["timeout_rule"]
     if rule not in ("hp", "loss"):
         raise ValueError("Invalid timeout rule")
+    difficulty = config["env_args"].get("opponent_difficulty", "medium")
+    if difficulty not in ("medium", "advanced"):
+        raise ValueError("opponent_difficulty must be medium or advanced")
+    parent = config.get("tabx_parent_checkpoint")
+    # Sacred rejects new nested dictionary keys on its CLI; transport the exact
+    # identity as JSON, then persist it as structured metadata in the run.
+    if isinstance(parent, str):
+        parent = json.loads(parent)
+        config["tabx_parent_checkpoint"] = parent
+    if parent:
+        validate_parent_checkpoint(root, parent, task_manifest, int(config["seed"]), rule)
+        if difficulty != "advanced" or Path(config["checkpoint_path"]).resolve() != resolve_under(root, parent["snapshot"]):
+            raise ValueError("Advanced continuation must load its recorded parent checkpoint")
+        if config["t_max"] <= parent["t_env"]:
+            raise ValueError("Advanced t_max must exceed the handoff step")
     run_id = config.get("tabx_run_id") or (datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8])
     relative = Path(rule) / safe_component(task_manifest["task_id"]) / str(int(config["seed"])) / safe_component(run_id)
     path = root / relative
@@ -191,6 +252,9 @@ def create_run(config, task_manifest):
     config["tabx_run_dir"] = str(path)
     config["local_results_path"] = str(path)
     manifest = dict(schema_version="tabx-run-1", run_id=run_id, timeout_rule=rule,
+                    opponent_difficulty=difficulty, parent_checkpoint=parent,
+                    difficulty_resolution=config.get("tabx_difficulty_resolution"),
+                    handoff_t_env=parent["t_env"] if parent else None,
                     training_metrics_version=TRAIN_METRICS_VERSION,
                     task_id=task_manifest["task_id"], task_hash=task_manifest["task_hash"],
                     bank_hash=task_manifest["bank_hash"], task_manifest=task_manifest,
@@ -201,7 +265,7 @@ def create_run(config, task_manifest):
                     native_shape=task_manifest["native_shape"],
                     layout={key: task_manifest[key] for key in ("native_shape", "n_ally", "n_enemy", "n_zone", "unit_slots", "native_obs_size", "native_state_size")},
                     restored_from=config.get("checkpoint_path") or None,
-                    restore_semantics="new_attempt_with_fresh_replay_targets_rng_and_update_count",
+                    restore_semantics="agent_mixer_optimizer_and_t_env; synced_targets; fresh_replay_rng_update_count",
                     deployment={"torch_device": config["device"], "jax_platforms": os.environ.get("JAX_PLATFORMS"),
                                 "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
                                 "omp_num_threads": os.environ.get("OMP_NUM_THREADS"), "pid": os.getpid(),
@@ -236,6 +300,8 @@ def evaluation_request(root, run_dir, snapshot, phase, count, *, random_policy=F
                 simulator_contract=SIMULATOR_CONTRACT, layout_version=LAYOUT_VERSION,
                 official_tabx=run.get("provenance", {}).get("tabx", {}), native_shape=run.get("native_shape"),
                 seeds=[stable_seed(run["task_hash"], run["master_seed"], phase, i) for i in range(count)])
+    if "opponent_difficulty" in manifest:
+        request["opponent_difficulty"] = manifest["opponent_difficulty"]
     if run.get("batch_id"):
         request["batch_id"] = run["batch_id"]
     return request
@@ -271,6 +337,11 @@ class SnapshotPublisher:
                             timeout_rule=run["timeout_rule"], train_seed=run["train_seed"],
                             provenance=run["provenance"], agent_sha256=file_sha256(tmp / "agent.th"),
                             config_sha256=file_sha256(tmp / "config.json"))
+            manifest["model_sha256"] = {name: file_sha256(tmp / name)
+                                         for name in ("agent.th", "mixer.th", "opt.th") if (tmp / name).is_file()}
+            if "opponent_difficulty" in run:
+                manifest["opponent_difficulty"] = run["opponent_difficulty"]
+            manifest["parent_checkpoint"] = run.get("parent_checkpoint")
             manifest["train_seed_protocol"] = TRAIN_SEED_PROTOCOL
             manifest["training_metrics_version"] = run.get("training_metrics_version")
             if run.get("batch_id"):
@@ -317,6 +388,8 @@ class SnapshotPublisher:
         run = read_json(self.run_dir / "manifest.json")
         atomic_json(self.run_dir / "training_summary.json", summary)
         complete = {key: run[key] for key in ("task_id", "task_hash", "bank_hash", "timeout_rule", "run_id", "train_seed")}
+        complete["opponent_difficulty"] = run.get("opponent_difficulty", "medium")
+        complete["parent_checkpoint"] = run.get("parent_checkpoint")
         complete.update(schema_version="tabx-training-complete-1", status="complete", final_t_env=int(step),
                         checkpoints=checkpoints, learner_updates=int(learner.training_steps),
                         train_seed_protocol=TRAIN_SEED_PROTOCOL,
@@ -340,6 +413,10 @@ def completed_checkpoints(run_dir):
             raise ValueError(f"Training completion identity mismatch: {key}")
     if file_sha256(run_dir / "training_summary.json") != complete["summary_sha256"]:
         raise ValueError("Training summary checksum differs from the completion inventory")
+    if complete.get("opponent_difficulty", "medium") != run.get("opponent_difficulty", "medium"):
+        raise ValueError("Completion opponent difficulty mismatch")
+    if complete.get("parent_checkpoint") != run.get("parent_checkpoint"):
+        raise ValueError("Completion parent identity mismatch")
     entries = complete["checkpoints"]
     steps = [entry["t_env"] for entry in entries]
     if not steps or steps != sorted(set(steps)) or steps[-1] != complete["final_t_env"]:
@@ -358,8 +435,46 @@ def completed_checkpoints(run_dir):
                 raise ValueError(f"Completed checkpoint identity mismatch: {key}")
         if manifest["t_env"] != entry["t_env"] or manifest["agent_sha256"] != entry["agent_sha256"] or manifest["config_sha256"] != entry["config_sha256"]:
             raise ValueError("Checkpoint metadata differs from the completion inventory")
+        for filename, digest in manifest.get("model_sha256", {}).items():
+            if filename not in ("agent.th", "mixer.th", "opt.th") or file_sha256(snapshot / filename) != digest:
+                raise ValueError(f"Completed checkpoint model checksum mismatch: {snapshot / filename}")
+        if manifest.get("opponent_difficulty", "medium") != run.get("opponent_difficulty", "medium"):
+            raise ValueError("Completed checkpoint opponent difficulty mismatch")
+        if manifest.get("parent_checkpoint") != run.get("parent_checkpoint"):
+            raise ValueError("Completed checkpoint parent identity mismatch")
         snapshots.append(snapshot)
     actual = {p for p in (run_dir / "checkpoints").iterdir() if p.name.isdigit() and p.is_dir()}
     if actual != set(snapshots):
         raise ValueError("Published checkpoint set differs from the completion inventory")
     return complete, file_sha256(path), snapshots
+
+
+def final_checkpoint_identity(root, run_dir, inventory=None):
+    """Identify a completed run's final snapshot, never directory recency or quality."""
+    root, run_dir = Path(root).resolve(), Path(run_dir).resolve()
+    inventory = inventory if inventory is not None else completed_checkpoints(run_dir)
+    if inventory is None:
+        raise ValueError(f"Missing training completion: {run_dir / 'training_complete.json'}")
+    complete, completion_hash, snapshots = inventory
+    snapshot = snapshots[-1]
+    run = read_json(run_dir / "manifest.json")
+    manifest = validate_snapshot(snapshot, run, run["timeout_rule"], check_runtime=False)
+    # A continuation needs the whole QMIX state, not only evaluation weights.
+    for name in ("agent.th", "mixer.th", "opt.th"):
+        digest = manifest.get("model_sha256", {}).get(name)
+        if not digest or file_sha256(snapshot / name) != digest:
+            raise ValueError(f"Incomplete continuation checkpoint: {snapshot / name}")
+    return dict(run=str(run_dir.relative_to(root)), snapshot=str(snapshot.relative_to(root)),
+                training_complete_sha256=completion_hash,
+                manifest_sha256=file_sha256(snapshot / "manifest.json"), t_env=complete["final_t_env"],
+                **{key: manifest[key] for key in ("run_id", "task_id", "task_hash", "bank_hash", "train_seed", "timeout_rule",
+                                                  "agent_sha256", "config_sha256", "opponent_difficulty", "model_sha256")})
+
+
+def validate_parent_checkpoint(root, parent, task_manifest, seed, rule, *, check_runtime=True):
+    run = resolve_under(root, parent["run"])
+    if final_checkpoint_identity(root, run) != parent:
+        raise ValueError(f"Parent final checkpoint identity changed: {run}")
+    if parent["train_seed"] != seed or parent["opponent_difficulty"] != "medium":
+        raise ValueError("Parent checkpoint must belong to this seed and medium stage")
+    return validate_snapshot(resolve_under(root, parent["snapshot"]), task_manifest, rule, check_runtime=check_runtime)

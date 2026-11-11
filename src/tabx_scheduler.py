@@ -15,7 +15,7 @@ import uuid
 
 from tabx_reporting import eval_line, train_line, write_csv
 from tabx_storage import (EvalQueue, atomic_json, code_hash, completed_checkpoints, ensure_output_contract,
-                          evaluation_request, git_version, read_json, resolve_under, runtime_versions, safe_component)
+                          evaluation_request, final_checkpoint_identity, git_version, read_json, resolve_under, runtime_versions, safe_component)
 
 
 REPOSITORY = Path(__file__).resolve().parents[1]
@@ -23,12 +23,14 @@ BATCH_FIELDS = ("snapshot_time_utc", "task_id", "train_seed", "gpu", "status", "
                 "eval_pending", "eval_running", "eval_failed", "eval_remaining", "run_id", "attempt", "pid", "exit_code", "t_env",
                 "learner_updates", "elapsed_seconds", "peak_cuda_bytes", "latest_eval_step", "latest_eval_phase",
                 "latest_eval_episodes", "latest_eval_wins", "latest_eval_win_rate_pct", "latest_eval_mean_return",
-                "latest_eval_return_std", "log_path", "error")
+                "latest_eval_return_std", "log_path", "error", "stage", "handoff_t_env", "parent_run_id",
+                "parent_checkpoint", "medium_train_status", "medium_eval_status", "medium_eval_done", "medium_eval_expected",
+                "advanced_train_status", "advanced_eval_status", "advanced_eval_done", "advanced_eval_expected", "handoff_error")
 PROTECTED = {"env", "runner", "batch_size_run", "learner", "mixer", "mac", "agent", "use_rnn", "use_cuda",
              "device", "seed", "tabx_require_cuda", "tabx_batch_id", "tabx_assigned_gpu", "tabx_train_log",
              "tabx_run_id", "tabx_run_dir", "tabx_output_root", "local_results_path", "checkpoint_path",
              "evaluate", "save_replay", "env_args.key", "env_args.seed", "env_args.task_bank",
-             "env_args.timeout_rule", "env_args.expected_bank_hash", "env_args.tabx_root"}
+             "tabx_parent_checkpoint", "env_args.opponent_difficulty", "env_args.timeout_rule", "env_args.expected_bank_hash", "env_args.tabx_root"}
 
 
 def _merge(target, source):
@@ -256,6 +258,35 @@ def derive_job_status(attempt):
                 eval_remaining=None if expected is None else max(0, expected - done), status=status)
 
 
+def stage_attempts(job):
+    return {stage: next((attempt for attempt in reversed(job["attempts"])
+                         if attempt.get("stage") == stage), {}) for stage in ("medium", "advanced")}
+
+
+def derive_task_status(job):
+    if not job.get("curriculum"):
+        return derive_job_status(job["attempts"][-1] if job["attempts"] else {})
+    stages = {stage: derive_job_status(attempt) for stage, attempt in stage_attempts(job).items()}
+    job["stages"] = stages
+    medium, advanced = stages["medium"], stages["advanced"]
+    active = advanced if job.get("stage") == "advanced" else medium
+    train = active["train_status"]
+    if medium["train_status"] == "complete" and train == "complete" and job.get("stage") != "advanced":
+        train = "pending"
+    evaluation = ("complete" if all(item["eval_status"] == "complete" for item in stages.values()) else
+                  next((status for status in ("failed", "interrupted", "running")
+                        if any(item["eval_status"] == status for item in stages.values())), "pending"))
+    expected = None if any(item["eval_expected"] is None for item in stages.values()) else sum(item["eval_expected"] for item in stages.values())
+    done = sum(item["eval_done"] for item in stages.values())
+    status = train if train != "complete" else ("complete" if evaluation == "complete" else
+             f"evaluation_{evaluation}" if evaluation in ("failed", "interrupted") else "evaluating")
+    if job.get("handoff_error"):
+        train, status = "failed", "handoff_failed"
+    return dict(train_status=train, eval_status=evaluation, eval_expected=expected, eval_done=done,
+                **{key: sum(item[key] for item in stages.values()) for key in ("eval_pending", "eval_running", "eval_failed")},
+                eval_remaining=None if expected is None else max(0, expected - done), status=status)
+
+
 class BatchScheduler:
     def __init__(self, args, directory, manifest, state):
         self.args, self.directory, self.manifest, self.state = args, directory, manifest, state
@@ -298,6 +329,7 @@ class BatchScheduler:
         self.state["updated_at"] = time.time()
         if job is not None:
             self.mark_job(job, event)
+            atomic_json(self.directory / "jobs" / f"{job['job_id']}.json", job)
         elif event:
             self._append_event(dict(time=time.time(), event=event, worker=self.state.get("worker", {})))
         self._write_runtime()
@@ -318,9 +350,47 @@ class BatchScheduler:
         expected = dict(task_id=job["task_id"], train_seed=job["train_seed"], timeout_rule=self.args.rule,
                         batch_id=self.args.batch_id, bank_hash=self.manifest["bank_hash"],
                         task_hash=self.manifest["task_hashes"][job["task_id"]])
+        expected["run_id"] = run.name
+        if job.get("curriculum"):
+            attempt = next(item for item in job["attempts"] if item["run_id"] == run.name)
+            expected["opponent_difficulty"] = attempt["stage"]
+            expected["parent_checkpoint"] = job.get("parent_checkpoint") if attempt["stage"] == "advanced" else None
         for key, value in expected.items():
             if saved.get(key) != value:
                 raise ValueError(f"Batch run identity differs: {key} in {run}")
+
+    def plan_next_stage(self, job, *, enqueue=False):
+        """Only a verified successful medium inventory can authorize continuation."""
+        if not job.get("curriculum"):
+            return
+        stages = stage_attempts(job)
+        medium = stages["medium"]
+        if medium.get("train_status") != "complete" or not medium.get("inventory_verified"):
+            return
+        run = resolve_under(self.root, medium["run"])
+        try:
+            self._check_run(job, run)
+            parent = final_checkpoint_identity(self.root, run, self.inventories[medium["run_id"]])
+            if parent["opponent_difficulty"] != "medium":
+                raise ValueError("Handoff source difficulty is not medium")
+            if job.get("parent_checkpoint") is not None and job["parent_checkpoint"] != parent:
+                raise ValueError("Recorded handoff points to a different final checkpoint")
+            job.update(parent_checkpoint=parent, stage="advanced")
+            job.pop("handoff_error", None)
+            advanced = stages["advanced"]
+            job["needs_training"] = not advanced or advanced.get("train_status") != "complete"
+            self.save("handoff_ready", job)
+            if enqueue and not advanced:
+                self.pending_train.appendleft(job["job_id"])
+            self.emit(f"[HANDOFF] task={job['task_id']} seed={job['train_seed']} "
+                      f"step={parent['t_env']} checkpoint={self.root / parent['snapshot']}")
+        except (OSError, ValueError, KeyError) as error:
+            self.fail_handoff(job, run, error)
+
+    def fail_handoff(self, job, run, error):
+        job.update(handoff_error=f"{run / 'training_complete.json'}: {error}", needs_training=False)
+        self.save("handoff_failed", job)
+        self.emit(f"[HANDOFF-FAILED] task={job['task_id']} seed={job['train_seed']} {job['handoff_error']}")
 
     def _adopt(self, request, status, report=None, error=None):
         from tabx_reporting import evaluation_summary
@@ -340,8 +410,8 @@ class BatchScheduler:
         if request["phase"] == "screen" and not attempt["inventory_verified"]:
             attempt["screen_requests"][str(step)] = key
         if report is not None:
+            row = evaluation_summary(key, report, step, run_dir=resolve_under(self.root, attempt["run"]))
             record["valid"] = True
-            row = evaluation_summary(key, report, step)
             record["summary"] = row
             view = self.views[run_id]
             latest = view.get("latest_evaluation", {})
@@ -418,6 +488,8 @@ class BatchScheduler:
             self.queue.retry_failed(self.args.rule, self.args.batch_id, defer_summary=True)
         for job in self.jobs:
             job["needs_training"] = not job["attempts"]
+            job.pop("handoff_error", None)
+            latest_stages = stage_attempts(job) if job.get("curriculum") else {}
             for attempt in job["attempts"]:
                 rows_by_request_id = {}
                 # Disk is authoritative. Stored counters may precede a final JSON.
@@ -426,15 +498,22 @@ class BatchScheduler:
                                eval_interrupted=False)
                 self._track_attempt(job, attempt)
                 run = resolve_under(self.root, attempt["run"])
-                current = attempt is job["attempts"][-1]
+                current = (attempt is latest_stages.get(attempt.get("stage")) if job.get("curriculum")
+                           else attempt is job["attempts"][-1])
                 inventory = None
                 if current:
                     try:
                         inventory = completed_checkpoints(run)
+                        if inventory is not None:
+                            self._check_run(job, run)
+                        elif job.get("curriculum") and attempt.get("stage") == "medium" and attempt.get("exit_code") == 0:
+                            self.fail_handoff(job, run, "Successful training has no training_complete.json")
                     except (ValueError, KeyError, OSError) as error:
+                        inventory = None
                         attempt.update(train_status="failed", error=f"Invalid training completion: {error}")
+                        if job.get("curriculum") and attempt.get("stage") == "medium":
+                            self.fail_handoff(job, run, error)
                 if inventory is not None:
-                    self._check_run(job, run)
                     rows_by_request_id.update(self.reconcile_run(
                         job, attempt, inventory, retry_failed=self.args.resume, defer_summary=True))
                     job["needs_training"] = False
@@ -476,6 +555,10 @@ class BatchScheduler:
                 from tabx_reporting import reconcile_eval_summary
                 reconcile_eval_summary(run, rows_by_request_id)
                 del rows_by_request_id
+            if job.get("curriculum"):
+                latest = stage_attempts(job)[job.get("stage", "medium")]
+                job["needs_training"] = not job.get("handoff_error") and latest.get("train_status") != "complete"
+                self.plan_next_stage(job)
             if job["attempts"]:
                 self.mark_job(job, "recovered")
         self.state.update(status="running", worker={})
@@ -508,6 +591,16 @@ class BatchScheduler:
                        "seed": job["train_seed"], "tabx_output_root": str(self.root), "tabx_run_id": attempt["run_id"],
                        "tabx_batch_id": self.args.batch_id, "tabx_assigned_gpu": attempt["gpu"],
                        "tabx_train_log": attempt["log"], "tabx_require_cuda": True, "use_cuda": True})
+        if job.get("curriculum"):
+            stage = attempt["stage"]
+            values["env_args.opponent_difficulty"] = stage
+            if stage == "medium":
+                values["t_max"] = self.manifest["identity"]["medium_steps"]
+            else:
+                parent = job["parent_checkpoint"]
+                values.update(checkpoint_path=str(resolve_under(self.root, parent["snapshot"])),
+                              tabx_parent_checkpoint=json.dumps(parent, sort_keys=True),
+                              t_max=parent["t_env"] + self.manifest["identity"]["advanced_steps"])
         return [sys.executable, str(REPOSITORY / "src/main.py"), "--config=qmix_tabx", "--env-config=tabx", "with",
                 *[f"{key}={_sacred(value)}" for key, value in sorted(values.items())]]
 
@@ -520,6 +613,10 @@ class BatchScheduler:
         attempt = dict(run_id=run_id, run=str(run.relative_to(self.root)), log=str(log.relative_to(self.root)),
                        gpu=gpu, status="running", train_status="running", started_at=time.time(), pid=None,
                        process_start=None, exit_code=None, error=None, eval_interrupted=bool(self.worker_error))
+        if job.get("curriculum"):
+            attempt["stage"] = job["stage"]
+            if job["stage"] == "advanced":
+                attempt["parent_checkpoint"] = job["parent_checkpoint"]
         job["attempts"].append(attempt)
         job["needs_training"] = False
         self._track_attempt(job, attempt)
@@ -568,10 +665,13 @@ class BatchScheduler:
                     raise ValueError("Missing training_complete.json; process exit is insufficient")
                 self._check_run(job, run)
                 self.reconcile_run(job, attempt, inventory)
+                self.plan_next_stage(job, enqueue=True)
                 self.emit(f"[DONE] rule={self.args.rule} task={job['task_id']} seed={job['train_seed']} "
                           f"gpu={attempt['gpu']} step={inventory[0]['final_t_env']} run_id={run_id} train_status=complete")
             except (OSError, ValueError, KeyError, RuntimeError) as error:
                 attempt.update(train_status="failed", error=str(error))
+                if job.get("curriculum") and attempt.get("stage") == "medium" and code == 0:
+                    self.fail_handoff(job, resolve_under(self.root, attempt["run"]), error)
                 self.emit(f"[FAILED] rule={self.args.rule} task={job['task_id']} seed={job['train_seed']} "
                           f"error={error} log={self.root / attempt['log']}")
             self.dirty_runs.add(run_id)
@@ -764,10 +864,13 @@ class BatchScheduler:
                         attempt = job["attempts"][-1]
                         self.gpu_in_use[attempt["gpu"]] -= 1
                         attempt.update(train_status="interrupted", exit_code=process.returncode, ended_at=time.time())
-                        inventory = completed_checkpoints(resolve_under(self.root, attempt["run"]))
-                        if inventory is not None:
-                            self._check_run(job, resolve_under(self.root, attempt["run"]))
-                            self.reconcile_run(job, attempt, inventory)
+                        try:
+                            inventory = completed_checkpoints(resolve_under(self.root, attempt["run"]))
+                            if inventory is not None:
+                                self._check_run(job, resolve_under(self.root, attempt["run"]))
+                                self.reconcile_run(job, attempt, inventory)
+                        except (OSError, ValueError, KeyError) as error:
+                            attempt.update(train_status="failed", error=str(error))
                         self.dirty_runs.add(attempt["run_id"])
                         self.mark_job(job, "training_interrupted")
                     self.running.clear()
@@ -809,7 +912,7 @@ class BatchScheduler:
         atomic_json(self.directory / "runtime.json", dict(
             status=self.state["status"], worker=self.state.get("worker", {}), scheduler_pid=os.getpid(),
             updated_at=time.time(), active_trainers=[dict(job_id=job["job_id"], **{
-                key: job["attempts"][-1].get(key) for key in ("run_id", "run", "log", "gpu", "pid", "process_start", "started_at")})
+                key: job["attempts"][-1].get(key) for key in ("run_id", "run", "log", "gpu", "pid", "process_start", "started_at", "stage", "parent_checkpoint")})
                 for _, _, job in self.running.values()]))
 
     def _append_event(self, event):
@@ -827,9 +930,9 @@ class BatchScheduler:
         self.pending_train.clear()
         for job in self.jobs:
             attempt = job["attempts"][-1] if job["attempts"] else {}
-            derived = derive_job_status(attempt)
+            derived = derive_task_status(job)
             if attempt:
-                attempt.update(derived)
+                attempt.update(derive_job_status(attempt) if job.get("curriculum") else derived)
             job.update(derived)
             self.train_counts[derived["train_status"]] += 1
             self.model_counts[derived["status"]] += 1
@@ -861,13 +964,18 @@ class BatchScheduler:
             latest_eval_episodes=latest.get("episodes"), latest_eval_wins=latest.get("wins"),
             latest_eval_win_rate_pct=latest.get("win_rate_pct"), latest_eval_mean_return=latest.get("mean_return"),
             latest_eval_return_std=latest.get("return_std"),
-            log_path=str(self.root / attempt["log"]) if attempt else None, error=attempt.get("error"))
+            log_path=str(self.root / attempt["log"]) if attempt else None, error=attempt.get("error"),
+            stage=job.get("stage"), handoff_t_env=job.get("parent_checkpoint", {}).get("t_env"),
+            parent_run_id=job.get("parent_checkpoint", {}).get("run_id"),
+            parent_checkpoint=job.get("parent_checkpoint", {}).get("snapshot"), handoff_error=job.get("handoff_error"),
+            **{f"{stage}_{key}": value for stage, status in job.get("stages", {}).items()
+               for key, value in status.items() if key in ("train_status", "eval_status", "eval_done", "eval_expected")})
 
     def _flush_job(self, job_id):
         job = self.jobs_by_id[job_id]
         attempt = job["attempts"][-1] if job["attempts"] else {}
         if job_id in self.dirty_jobs:
-            derived = derive_job_status(attempt)
+            derived = derive_task_status(job)
             previous_train, previous_model = self.status_cache[job_id]
             if previous_train != derived["train_status"]:
                 self.train_counts[previous_train] -= 1
@@ -883,7 +991,7 @@ class BatchScheduler:
                           f"eval_expected={derived['eval_expected']} eval_remaining={derived['eval_remaining']}")
             self.model_states[job_id] = signature
             if attempt:
-                attempt.update(derived)
+                attempt.update(derive_job_status(attempt) if job.get("curriculum") else derived)
             job.update(derived)
         self.summary_rows[job_id] = self._summary_row(job)
         atomic_json(self.directory / "jobs" / f"{job_id}.json", job)
@@ -913,7 +1021,7 @@ class BatchScheduler:
         # Final verification is allowed to be O(batch size), unlike the hot path.
         trains, models, evaluations = Counter(), Counter(), Counter()
         for job in self.jobs:
-            derived = derive_job_status(job["attempts"][-1] if job["attempts"] else {})
+            derived = derive_task_status(job)
             if any(job.get(key) != value for key, value in derived.items()):
                 raise RuntimeError("Job cache differs from its exact checkpoint completion status")
             trains[derived["train_status"]] += 1
@@ -941,9 +1049,17 @@ def batch_train(args):
         from envs.tabx_tasks import official_tabx_root
         if Path(args.tabx_root).expanduser().resolve() != official_tabx_root().resolve():
             raise ValueError("Only the pinned official submodule may be used")
+    medium_steps, advanced_steps = getattr(args, "medium_steps", None), getattr(args, "advanced_steps", None)
+    curriculum = medium_steps is not None or advanced_steps is not None
+    if curriculum and (medium_steps is None or advanced_steps is None or medium_steps <= 0 or advanced_steps <= 0):
+        raise ValueError("Supply both --medium-steps and --advanced-steps as positive integers")
+    if curriculum and any(setting.partition("=")[0] == "t_max" for setting in args.overrides):
+        raise ValueError("Use stage budgets instead of --set t_max for two-stage training")
     config, overrides = training_config(args.overrides)
     identity = dict(rule=args.rule, tasks=tasks, seeds=seeds, bank_hash=bank_hash, task_hashes=hashes,
                     training_config=config, source_hash=code_hash(REPOSITORY))
+    if curriculum:
+        identity.update(medium_steps=medium_steps, advanced_steps=advanced_steps)
     root = Path(args.root).expanduser().resolve()
     # This MUST precede EvalQueue and worker startup in a new output root.
     ensure_output_contract(root)
@@ -992,6 +1108,10 @@ def batch_train(args):
                             code=git_version(REPOSITORY), source_hash=identity["source_hash"], versions=runtime_versions())
             state = dict(status="new", jobs=[dict(task_id=task, train_seed=seed, status="pending", attempts=[])
                                              for task in tasks for seed in seeds])
+            if curriculum:
+                manifest.update(medium_steps=medium_steps, advanced_steps=advanced_steps)
+                for job in state["jobs"]:
+                    job.update(curriculum=True, stage="medium")
             atomic_json(path, manifest)
             atomic_json(directory / "state.json", state)
         scheduler = BatchScheduler(args, directory, manifest, state)

@@ -198,6 +198,8 @@ class EvalQueue:
         request = info["request"]
         if report.get("request") != request:
             raise ValueError("Evaluation result/request identity mismatch")
+        from tabx_difficulty import evaluation_difficulty
+        evaluation_difficulty(report, request_id=info.get("request_id"))
         rows = report.get("episodes", [])
         seeds = [row["seed"] for row in rows]
         if (len(seeds) != len(request["seeds"]) or len(set(seeds)) != len(seeds)
@@ -257,7 +259,7 @@ class EvalQueue:
             record = record or self._new_record(info)
             try:
                 report = self.completed_result(key)
-            except (ValueError, KeyError, json.JSONDecodeError) as error:
+            except (ValueError, KeyError, OSError) as error:
                 if retry_failed:
                     bad = self.result_path(key)
                     preserved = bad.parent / "invalid" / f"{key}-{uuid.uuid4().hex}.json"

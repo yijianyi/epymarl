@@ -12,7 +12,7 @@ TRAIN_METRICS_VERSION = "tabx-train-metrics-v2-mask-mean"
 
 TRAIN_FIELDS = ("t_env", "learner_updates", "loss", "td_error_abs", "grad_norm_before_clip",
                 "grad_norm_clip", "q_taken_mean", "target_mean", "lr")
-EVAL_FIELDS = ("request_id", "checkpoint_step", "phase", "action_selection", "episodes", "wins",
+EVAL_FIELDS = ("request_id", "checkpoint_step", "phase", "opponent_difficulty", "action_selection", "episodes", "wins",
                "win_rate_pct", "mean_return", "return_std", "elimination_wins", "timeout_wins", "pure_timeouts")
 
 
@@ -142,7 +142,13 @@ def summary_lock(run_dir):
         yield
 
 
-def evaluation_summary(request_id, report, checkpoint_step):
+def evaluation_summary(request_id, report, checkpoint_step, *, run_dir=None):
+    from tabx_difficulty import evaluation_difficulty
+    snapshot = None
+    if run_dir is not None and report["request"].get("snapshot"):
+        from tabx_storage import resolve_under
+        snapshot = resolve_under(Path(run_dir).resolve().parents[3], report["request"]["snapshot"])
+    difficulty = evaluation_difficulty(report, snapshot=snapshot, checkpoint_step=checkpoint_step, request_id=request_id)
     rows = report["episodes"]
     if not rows or len(rows) != len(report["request"]["seeds"]):
         raise ValueError("Evaluation summary requires every requested episode")
@@ -150,7 +156,8 @@ def evaluation_summary(request_id, report, checkpoint_step):
         raise ValueError("Evaluation summary seeds do not match the request")
     returns = [float(row["return_value"]) for row in rows]
     wins = sum(bool(row["is_win"]) for row in rows)
-    return dict(request_id=request_id, checkpoint_step=int(checkpoint_step), phase=report["request"]["phase"],
+    return dict(opponent_difficulty=difficulty["difficulty"],
+                request_id=request_id, checkpoint_step=int(checkpoint_step), phase=report["request"]["phase"],
                 action_selection=report["request"]["action_selection"], episodes=len(rows), wins=wins,
                 win_rate_pct=100.0 * wins / len(rows), mean_return=statistics.mean(returns),
                 return_std=statistics.stdev(returns) if len(rows) > 1 else 0.0,
@@ -168,10 +175,10 @@ def refresh_eval_summary(run_dir):
         for path in sorted((run_dir / "evaluations").glob("*.json")):
             report = read_json(path)
             snapshot = resolve_under(run_dir.parents[3], report["request"]["snapshot"])
-            manifest = read_json(snapshot / "manifest.json")
-            if manifest["run_id"] != report["request"]["run_id"] or manifest["agent_sha256"] != report["request"]["checkpoint_hash"]:
-                raise ValueError("Evaluation summary checkpoint identity mismatch")
-            rows.append(evaluation_summary(path.stem, report, manifest["t_env"]))
+            step = report["request"].get("checkpoint_step", report.get("checkpoint_step"))
+            if step is None:
+                step = int(snapshot.name) if snapshot.name.isdigit() else read_json(snapshot / "manifest.json")["t_env"]
+            rows.append(evaluation_summary(path.stem, report, step, run_dir=run_dir))
         rows.sort(key=lambda row: (row["checkpoint_step"], row["phase"], row["request_id"]))
         write_csv(run_dir / "eval_summary.csv", EVAL_FIELDS, rows)
         return rows
@@ -180,7 +187,7 @@ def refresh_eval_summary(run_dir):
 def update_eval_summary(run_dir, request_id, report, checkpoint_step):
     """Update one result; never reopen other checkpoints or evaluation JSON files."""
     run_dir = Path(run_dir)
-    row = evaluation_summary(request_id, report, checkpoint_step)
+    row = evaluation_summary(request_id, report, checkpoint_step, run_dir=run_dir)
     with summary_lock(run_dir):
         rows = {item["request_id"]: item for item in read_csv(run_dir / "eval_summary.csv")}
         rows[request_id] = row

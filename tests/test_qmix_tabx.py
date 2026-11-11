@@ -88,3 +88,37 @@ def test_configured_mixer_checkpoint_roundtrip(tmp_path, hypernet_layers, tabx_s
         for branch in (restored.hyper_w_1, restored.hyper_w_final, restored.V):
             if isinstance(branch, nn.Sequential):
                 assert [type(layer) for layer in branch] == [nn.Linear, nn.ReLU, nn.Linear]
+
+
+def test_qlearner_restore_syncs_both_targets_and_optimizer(tmp_path):
+    from learners.q_learner import QLearner
+    class MAC:
+        def __init__(self):
+            self.agent = nn.Linear(3, 10)
+        def parameters(self):
+            return self.agent.parameters()
+        def save_models(self, path):
+            torch.save(self.agent.state_dict(), Path(path) / 'agent.th')
+        def load_models(self, path):
+            self.agent.load_state_dict(torch.load(Path(path) / 'agent.th', weights_only=True))
+        def load_state(self, other):
+            self.agent.load_state_dict(other.agent.state_dict())
+    from pathlib import Path
+    args = mixer_args(use_cuda=False)
+    original = QLearner(MAC(), {}, None, args)
+    # Populate Adam's moment and step tensors, then make targets deliberately stale.
+    sum(parameter.sum() for parameter in original.params).backward()
+    original.optimiser.step()
+    original.save_models(tmp_path)
+    restored = QLearner(MAC(), {}, None, args)
+    restored.load_models(tmp_path)
+    for online, target in ((restored.mac.agent, restored.target_mac.agent), (restored.mixer, restored.target_mixer)):
+        for key, value in online.state_dict().items():
+            torch.testing.assert_close(target.state_dict()[key], value, rtol=0, atol=0)
+    for expected, actual in zip(original.params, restored.params):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    old, new = original.optimiser.state_dict(), restored.optimiser.state_dict()
+    assert old['param_groups'] == new['param_groups']
+    for param, state in old['state'].items():
+        for key, value in state.items():
+            torch.testing.assert_close(new['state'][param][key], value, rtol=0, atol=0)

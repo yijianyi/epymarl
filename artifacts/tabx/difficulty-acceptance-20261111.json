@@ -1,0 +1,116 @@
+{
+  "branch": "codex/tabx-medium-advanced",
+  "conflict_before_run_creation": "passed",
+  "date": "2026-11-11",
+  "historical_summary": {
+    "original_json_preserved": true,
+    "paths": [
+      "single_result",
+      "batch_resume",
+      "full_rebuild"
+    ],
+    "rows": [
+      {
+        "action_selection": "greedy",
+        "checkpoint_step": "10",
+        "elimination_wins": "1",
+        "episodes": "2",
+        "mean_return": "0.5",
+        "opponent_difficulty": "medium",
+        "phase": "screen",
+        "pure_timeouts": "1",
+        "request_id": "row-10",
+        "return_std": "3.5355339059327378",
+        "timeout_wins": "0",
+        "win_rate_pct": "50.0",
+        "wins": "1"
+      },
+      {
+        "action_selection": "greedy",
+        "checkpoint_step": "20",
+        "elimination_wins": "1",
+        "episodes": "2",
+        "mean_return": "0.5",
+        "opponent_difficulty": "advanced",
+        "phase": "screen",
+        "pure_timeouts": "1",
+        "request_id": "row-20",
+        "return_std": "3.5355339059327378",
+        "timeout_wins": "0",
+        "win_rate_pct": "50.0",
+        "wins": "1"
+      },
+      {
+        "action_selection": "greedy",
+        "checkpoint_step": "30",
+        "elimination_wins": "1",
+        "episodes": "2",
+        "mean_return": "0.5",
+        "opponent_difficulty": "advanced",
+        "phase": "screen",
+        "pure_timeouts": "1",
+        "request_id": "row-30",
+        "return_std": "3.5355339059327378",
+        "timeout_wins": "0",
+        "win_rate_pct": "50.0",
+        "wins": "1"
+      },
+      {
+        "action_selection": "greedy",
+        "checkpoint_step": "40",
+        "elimination_wins": "1",
+        "episodes": "2",
+        "mean_return": "0.5",
+        "opponent_difficulty": "unknown",
+        "phase": "screen",
+        "pure_timeouts": "1",
+        "request_id": "row-40",
+        "return_std": "3.5355339059327378",
+        "timeout_wins": "0",
+        "win_rate_pct": "50.0",
+        "wins": "1"
+      }
+    ]
+  },
+  "ordinary_checkpoint": "/tmp/epymarl-difficulty-restore-smoke/test_real_two_tasks_final_chec0/output/hp/23/1/curriculum-smoke-t23-s1-a2-9bf794bc/checkpoints/32",
+  "ordinary_modes": [
+    "train",
+    "evaluate",
+    "save_replay"
+  ],
+  "ordinary_restore_environment_difficulties": [
+    "advanced",
+    "advanced",
+    "advanced"
+  ],
+  "output_root": "/tmp/epymarl-difficulty-restore-smoke/test_real_two_tasks_final_chec0/output",
+  "regression": {
+    "passed": 143,
+    "skipped": 4
+  },
+  "schema_version": "tabx-difficulty-acceptance-1",
+  "scope": "Official TABX environment and real QMIX curriculum on two synthetic short tasks; CPU-only acceptance",
+  "source_hash": "745aec0cb4426f867a0092ba98afbbcf339f666042bac82f64e5891fe7bb2032",
+  "status": "passed",
+  "tasks": [
+    {
+      "advanced_run_id": "curriculum-smoke-t23-s1-a2-9bf794bc",
+      "advanced_t_max": 25,
+      "delayed_medium_evaluation": "passed",
+      "medium_final_step": 16,
+      "medium_run_id": "curriculum-smoke-t23-s1-a1-a2a3eae6",
+      "parent_checkpoint": "hp/23/1/curriculum-smoke-t23-s1-a1-a2a3eae6/checkpoints/16",
+      "task_id": "23"
+    },
+    {
+      "advanced_run_id": "curriculum-smoke-t647-s1-a2-9e046baa",
+      "advanced_t_max": 21,
+      "delayed_medium_evaluation": "passed",
+      "medium_final_step": 12,
+      "medium_run_id": "curriculum-smoke-t647-s1-a1-f1eafcf3",
+      "parent_checkpoint": "hp/647/1/curriculum-smoke-t647-s1-a1-f1eafcf3/checkpoints/12",
+      "task_id": "647"
+    }
+  ],
+  "unknown_requires_explicit_launch": "passed"
+}

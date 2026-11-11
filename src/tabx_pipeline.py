@@ -35,7 +35,7 @@ def configure_cpu(threads=1, affinity=None):
         os.sched_setaffinity(0, cores)
 
 
-def build_rollout(snapshot, bank, rule, tabx_root=None, random_policy=False):
+def build_rollout(snapshot, bank, rule, tabx_root=None, random_policy=False, opponent_difficulty=None):
     import numpy as np
     import torch
     from components.batch_schema import build_batch_schema
@@ -55,7 +55,11 @@ def build_rollout(snapshot, bank, rule, tabx_root=None, random_policy=False):
     import_tabx(tabx_root)
     task, task_manifest = load_task(bank, config["env_args"]["key"])
     task_manifest.update(TABXLayout(*validate_task_structure(task)).metadata())
-    validate_snapshot(snapshot, task_manifest, rule)
+    manifest = validate_snapshot(snapshot, task_manifest, rule)
+    # Read difficulty from this immutable snapshot, even for a delayed medium request.
+    from tabx_difficulty import requested_difficulty
+    resolution = requested_difficulty(snapshot, opponent_difficulty)
+    config["env_args"]["opponent_difficulty"] = resolution["difficulty"]
     config.update(device="cpu", use_cuda=False, batch_size_run=1, render=False,
                   evaluation_epsilon=0.0, test_greedy=True, test_nepisode=10**9)
     config["env_args"].update(task_bank=str(bank), tabx_root=tabx_root,
@@ -106,6 +110,7 @@ def process_request(queue, claim, bank, tabx_root=None):
     import torch
     from tabx_storage import atomic_json, read_json, resolve_under, provenance
     key, owner, request = claim
+    started_at = time.time()
     runner = None
     try:
         if os.environ.get("CUDA_VISIBLE_DEVICES") != "" or jax.default_backend() != "cpu":
@@ -117,7 +122,12 @@ def process_request(queue, claim, bank, tabx_root=None):
                                       ("run_id", "run_id"), ("rule", "timeout_rule")):
             if request[field] != manifest[snapshot_field]:
                 raise ValueError(f"Request/snapshot mismatch: {field}")
-        runner = build_rollout(snapshot, bank, request["rule"], tabx_root, request["random_policy"])
+        from tabx_difficulty import requested_difficulty
+        difficulty = requested_difficulty(snapshot, request.get("opponent_difficulty"))["difficulty"]
+        runner = build_rollout(snapshot, bank, request["rule"], tabx_root, request["random_policy"],
+                               opponent_difficulty=difficulty)
+        if runner.env.opponent_difficulty != difficulty:
+            raise ValueError("Actual evaluation opponent difficulty mismatch")
         finished = {row["seed"] for row in queue.results(key)}
         for seed in request["seeds"]:
             queue.heartbeat(key, owner)
@@ -125,7 +135,9 @@ def process_request(queue, claim, bank, tabx_root=None):
                 queue.record(key, owner, rollout(runner, seed))
         rows = queue.results(key)
         total_seconds = sum(row["elapsed_seconds"] for row in rows)
-        report = dict(request=request, episodes=rows, provenance=provenance(), layout=runner.get_env_info(),
+        report = dict(request=request, episodes=rows, opponent_difficulty=runner.env.opponent_difficulty,
+                      started_at=started_at, finished_at=time.time(),
+                      provenance=provenance(), layout=runner.get_env_info(),
                       native_layout=runner.env.get_layout_info(), worker=dict(
             jax_backend=jax.default_backend(), cuda_visible_devices=os.environ["CUDA_VISIBLE_DEVICES"],
             torch_device="cpu", torch_threads=torch.get_num_threads(),
@@ -620,6 +632,8 @@ def parser():
     source.add_argument("--tasks", help="Comma-separated task IDs; never defaults to the whole bank")
     source.add_argument("--pilot", help="Frozen pilot JSON with task-bank hash")
     source.add_argument("--task-list", help="JSON list or text file with comma/whitespace-separated task IDs")
+    batch.add_argument("--medium-steps", type=int, help="Medium stage environment-step budget; supply with --advanced-steps")
+    batch.add_argument("--advanced-steps", type=int, help="Additional steps after the actual medium final step")
     batch.add_argument("--seeds", default="1", help="Comma-separated training seeds")
     batch.add_argument("--gpus", required=True, help="External GPU IDs from the current allocation, e.g. 0,1")
     batch.add_argument("--jobs-per-gpu", type=int, default=1)

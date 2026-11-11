@@ -207,8 +207,6 @@ class QLearner:
 
     def load_models(self, path):
         self.mac.load_models(path)
-        # Not quite right but I don't want to save target networks
-        self.target_mac.load_models(path)
         if self.mixer is not None:
             self.mixer.load_state_dict(
                 th.load(
@@ -216,6 +214,8 @@ class QLearner:
                     map_location=lambda storage, loc: storage,
                 )
             )
+        # Targets must match the restored online agent AND mixer.
+        self._update_targets_hard()
         self.optimiser.load_state_dict(
             th.load("{}/opt.th".format(path), map_location=lambda storage, loc: storage)
         )

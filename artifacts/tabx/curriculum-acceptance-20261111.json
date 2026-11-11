@@ -1,0 +1,86 @@
+{
+  "bank": "/home/xqyang/AIRS/serverData/task_file/1106_tasks_merged_multiagent.json",
+  "bank_sha256": "775cee683a650a726f056f05a20b1dc67d9b09104ceff9fb26ca0d11b4ac6887",
+  "batch_summary": "/tmp/epymarl-curriculum-real-bank/test_real_two_tasks_final_chec0/output/_batches/hp/curriculum-smoke/batch_summary.csv",
+  "branch": "codex/tabx-medium-advanced",
+  "date": "2026-11-11",
+  "output_root": "/tmp/epymarl-curriculum-real-bank/test_real_two_tasks_final_chec0/output",
+  "regression": {
+    "passed": 132,
+    "skipped": 4
+  },
+  "rule": "hp",
+  "runtime": {
+    "chex": "0.1.90",
+    "flax": "0.10.6",
+    "h5py": "3.12.1",
+    "jax": "0.6.2",
+    "jaxlib": "0.6.2",
+    "numpy": "2.2.6",
+    "python": "3.10.22",
+    "torch": "2.6.0+cpu"
+  },
+  "schema_version": "tabx-curriculum-acceptance-1",
+  "short_test_settings": {
+    "advanced_steps": 9,
+    "batch_size": 2,
+    "episode_limits": {
+      "23": 8,
+      "647": 6
+    },
+    "eval_episodes_per_checkpoint": 2,
+    "medium_steps": 9,
+    "save_model_interval": 8
+  },
+  "source_hash": "8d4f435657329be231d07f94387a426548187fa4568736aef5f9103d2f7e2942",
+  "status": "passed",
+  "tasks": [
+    {
+      "advanced_final_step": 32,
+      "advanced_run_id": "curriculum-smoke-t23-s1-a2-d6025da5",
+      "advanced_t_max": 25,
+      "all_medium_evals_started_after_advanced": true,
+      "completed_run_attempts_after_resume": 2,
+      "delayed_medium_evaluation": "passed",
+      "eval_done": 5,
+      "eval_expected": 5,
+      "medium_final_step": 16,
+      "medium_final_win_rate_pct": "0.0",
+      "medium_run_id": "curriculum-smoke-t23-s1-a1-67d40c5c",
+      "native_shape": [
+        2,
+        3,
+        0
+      ],
+      "parent_checkpoint": "hp/23/1/curriculum-smoke-t23-s1-a1-67d40c5c/checkpoints/16",
+      "parent_manifest_sha256": "1c926c50baa44a635846216830f024bb27ed60352105cbf6f08c146e73ad1882",
+      "status": "complete",
+      "task_id": "23",
+      "train_seed": 1
+    },
+    {
+      "advanced_final_step": 24,
+      "advanced_run_id": "curriculum-smoke-t647-s1-a2-6f7ead57",
+      "advanced_t_max": 21,
+      "all_medium_evals_started_after_advanced": true,
+      "completed_run_attempts_after_resume": 2,
+      "delayed_medium_evaluation": "passed",
+      "eval_done": 4,
+      "eval_expected": 4,
+      "medium_final_step": 12,
+      "medium_final_win_rate_pct": "0.0",
+      "medium_run_id": "curriculum-smoke-t647-s1-a1-5c684208",
+      "native_shape": [
+        10,
+        10,
+        2
+      ],
+      "parent_checkpoint": "hp/647/1/curriculum-smoke-t647-s1-a1-5c684208/checkpoints/12",
+      "parent_manifest_sha256": "0e566b721d7f41aa0c21533cdcd408a6482738a50c163c0e286e4430115a01ea",
+      "status": "complete",
+      "task_id": "647",
+      "train_seed": 1
+    }
+  ],
+  "verification": "Official TABX, real QMIX training and CPU evaluation; GPU allocation mocked only in test"
+}

@@ -354,3 +354,43 @@ python tests/test_tabx_scaling.py --polls 100 \
 基准使用相同的 24 个真实 CPU 等待进程，分别测量 800/8,000 逻辑作业的空轮询中位数、P95、CPU、每分钟写盘量及单独的全量快照耗时。结果见 artifacts/tabx/scheduler-scale-validation.json；逻辑任务和快照负载为轻量模拟，不代表真实 QMIX 的显存容量。常规测试还检查单模型事件只更新该 job、重复通知不重复计数、有界预取与恢复、过时整批快照恢复及拒绝接管不改写汇总。
 
 真实服务器仍需用正式 batch_size=32、buffer_size=256 和 10 对 10 任务逐步比较每卡 1、2、4 个模型，再按整卡显存、主机内存、总训练步数/小时和评估积压决定是否升至 12。终端 eval_registered_waiting 持续增长说明 CPU 评估跟不上；增加 GPU 并发不能消除这部分积压。
+
+## medium → advanced 自动续训（timeout-hp）
+
+新分支 `codex/tabx-medium-advanced` 基于 `codex/tabx-timeout-hp`，沿用其 HP 胜负规则：行动后的歼灭判定优先，纯超时比较未四舍五入的存活血量比例，严格大于才胜，平局负。
+
+提交时统一填写两个阶段的环境步数预算，例如：
+
+```bash
+python src/tabx_pipeline.py batch-train \
+  --bank "$TASK_BANK" --root "$RESULT_ROOT" --rule hp \
+  --tasks 647,651 --seeds 1 --gpus "$GPUS" --batch-id medium-advanced-400k-1100k \
+  --medium-steps 400000 --advanced-steps 1100000 \
+  --eval-workers 2 --eval-threads 1
+```
+
+也可使用 `scripts/run_tabx_curriculum.sh`，设置 `TASK_BANK`、`RESULT_ROOT`、`GPUS`、`TASKS`、`MEDIUM_STEPS`、`ADVANCED_STEPS`；脚本固定 `hp`，已有同名批次时自动传 `--resume`。CLI 不传两个阶段预算时保留旧的单阶段模式；两阶段模式必须同时传入正整数预算，不能再用 `--set t_max=...`。默认仍每 25,000 环境步保存、每份 checkpoint 做 32 局 greedy 评估。短测试可显式缩小保存间隔与评估局数。
+
+每个任务和 seed 独立从随机初始化训练 medium，整回合达到预算后强制发布最终 checkpoint。如果最终步数已定期保存，复用该份且不重复提交评估。调度器只从该 run 的 `training_complete.json` 取最终实际步数和路径，检查任务、seed、规则、run、模型/config/清单校验和；agent、mixer、优化器三个文件都必须完整。胜率与 reward 不参与选择，0% 胜率仍交接。各任务随自身进度进入 advanced，无需等其他任务或 medium 评估。
+
+例如 medium 实际结束于 `400173`，advanced 预算 `1100000`，其累计 `t_max` 自动设为 `1500173`。advanced 用独立 run，恢复 agent、mixer、Adam 状态和全局步数，两个目标网络同步到在线网络；探索率按父全局步数计算，回放池从空池收集 advanced 回合。训练回合 seed 索引接续父模型记录；更新计数从新阶段重新计数。
+
+run、checkpoint、完成清单记录 `opponent_difficulty`；advanced 还记录 `parent_checkpoint`（父 run、最终 snapshot、实际步数及校验和）。输出根目录的语义标记同时绑定 medium 和 advanced 参数 JSON 的 SHA-256，因此请使用新的输出根目录。异步 worker 从被评估的 checkpoint 读取难度，结果及 `eval_summary.csv` 记录实际 `opponent_difficulty`；排队的 medium checkpoint 在交接后依旧对 medium 评估。
+
+`_batches/hp/<batch-id>/jobs/<job-id>.json` 在启动训练和登记交接时原子写入。重启沿用相同预算、任务、seed、代码和超参数并加 `--resume`：已完成的 medium 不重跑；已登记父模型且尚未启动的 advanced 只启动一次；中断或失败的 advanced 作为新 attempt 重试，保留同一父 checkpoint。`state.json` 和 `batch_summary.csv` 同时报告总训练/评估进度、两个阶段的状态和评估数量、交接步数、父 run 和父 checkpoint。两阶段训练与预期评估全部完成才标记任务完成。
+
+进程失败沿用现有 `--resume` 重试策略；成功进程若最终清单缺失或校验失败，记录该任务的 `handoff_failed`、清单路径与具体原因，其他任务继续。修复文件后可恢复同一批次；交接不会改选中途模型。没有成功完成清单的中断训练只能重试本阶段。
+
+短流程验收：
+
+```bash
+python -m pytest -q tests/test_tabx_curriculum.py tests/test_qmix_tabx.py
+TABX_RUN_CURRICULUM_SMOKE=1 TABX_BANK="$TASK_BANK" \
+  python -m pytest -q tests/test_tabx_curriculum_smoke.py
+```
+
+第一组用真实调度器和轻量子进程，覆盖不同实际交接步数、0% 胜率、延迟 medium 评估、交接后的重启及 advanced 重试。第二组使用官方 TABX、真实 QMIX 与 CPU 评估；设置 `TABX_BANK` 时使用实际任务库中的 23 和 647，未设置时使用两个最小测试任务。验收缩短回合、步数和评估局数，只验证流程；仅将测试中的 GPU 分配替换为 CPU，生产调度仍要求 GPU。
+
+普通 `checkpoint_path` 恢复（续训、`evaluate`、`save_replay`）会先一次性选定具体 checkpoint，再确定难度，然后创建 run 和环境。配置中的初始 `env_args.opponent_difficulty` 为 `null`：新训练有效默认仍是 medium；恢复时省略则继承源模型的已知难度，显式值冲突会在创建 run 前报错。来源无法识别时必须显式填写 medium 或 advanced，run 的 `difficulty_resolution` 会登记 `launch_argument` 与源模型 `unknown`。只有通过父 checkpoint 完整校验的课程训练允许 medium → advanced 切换。
+
+训练入口、CPU worker 与历史报表共用 `src/tabx_difficulty.py` 的证据规则。历史报表优先使用报告/请求中的实际难度，并核对两者一致；旧记录缺字段时检查关联 checkpoint 的身份及 manifest/config。只有已审计的固定难度版本（31e85b1、9dae7c6），且模拟器源码和唯一对手预设校验和吻合时，才从旧 provenance 还原难度；同时登记两套预设不能据此选其一。证据不足的报表写 `unknown`，保留步数、胜率和 reward；明确来源冲突则报错并给出 request ID、checkpoint 和冲突值。单条写入、批次恢复汇总与全量 CSV 重建使用同一规则，不改写历史评估 JSON。

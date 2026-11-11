@@ -118,7 +118,8 @@ args=NS(tabx_output_root=job['root'],tabx_run_dir=str(run),save_model_interval=8
 class Learner:
     training_steps=0
     def save_models(self,path):
-        (Path(path)/'agent.th').write_bytes(str(self.training_steps).encode())
+        for name in ('agent.th','mixer.th','opt.th'):
+            (Path(path)/name).write_bytes(str(self.training_steps).encode())
 learner=Learner(); publisher=SnapshotPublisher(args,None)
 publisher.publish(learner,0,force_eval=True)
 for step in (8,16):
@@ -151,8 +152,14 @@ while True:
             with (queue.root/'executions.jsonl').open('a') as stream:
                 stream.write(json.dumps([key,seed])+'\n')
     run=resolve_under(queue.root,request['run'])
-    queue.publish_result(key,owner,dict(request=request,episodes=queue.results(key)))
-    queue.finish(key,owner)
+    try:
+        queue.publish_result(key,owner,dict(request=request,episodes=queue.results(key),opponent_difficulty=request.get("opponent_difficulty","medium"),evaluated_at=time.time()))
+        queue.finish(key,owner)
+    except RuntimeError:
+        # Match the real worker: reconciliation may adopt the final JSON before
+        # this worker publishes its completion notification and release its lease.
+        if queue.completed_result(key) is None:
+            raise
 '''
 
 
@@ -186,13 +193,14 @@ def batch_fixture(monkeypatch, tmp_path):
     def start_workers(self):
         # Test a real child process without initializing CUDA/JAX.
         assert (self.root / "tabx_semantics.json").is_file()
+        self.worker_log = (self.directory / "eval-workers.log").open("a", encoding="utf-8")
         self.worker = subprocess.Popen([sys.executable, "-c", FAKE_WORKER, str(scheduler.REPOSITORY / "src"),
             str(self.root), self.args.rule, self.args.batch_id], start_new_session=True,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            stdout=self.worker_log, stderr=subprocess.STDOUT)
         self.state["worker"] = dict(pid=self.worker.pid, process_start=scheduler.process_identity(self.worker.pid))
     monkeypatch.setattr(scheduler.BatchScheduler, "training_command", command)
     monkeypatch.setattr(scheduler.BatchScheduler, "start_workers", start_workers)
-    return NS(root=root, bank=bank, argv=arguments, failures=failures,
+    return NS(root=root, bank=bank, argv=arguments, failures=failures, production_command=original_command,
               directory=root / "_batches/loss/test", monkeypatch=monkeypatch)
 
 
@@ -528,7 +536,7 @@ while len(completed)<4:
             if claim is None: continue
             key,owner,request=claim
             for seed in request['seeds']: record(key,owner,seed)
-            queue.publish_result(key,owner,dict(request=request,episodes=queue.results(key)))
+            queue.publish_result(key,owner,dict(request=request,episodes=queue.results(key),opponent_difficulty=request.get("opponent_difficulty","medium"),evaluated_at=time.time()))
             queue.finish(key,owner); completed.add(key)
     time.sleep(.02)
 while True:
@@ -787,3 +795,11 @@ def test_failed_run_validation_does_not_publish_partial_csv(batch_fixture, monke
     with pytest.raises(RuntimeError, match="injected run validation failure"):
         scheduler.batch_train(parser().parse_args(f.argv + ["--resume"]))
     assert writes == [] and target.read_bytes() == contents and target.stat().st_mtime_ns == stamp
+
+
+def test_lightweight_worker_survives_reconciliation_before_notification(batch_fixture, monkeypatch):
+    # Force the result-published-before-finish window instead of relying on timing.
+    monkeypatch.setitem(globals(), 'FAKE_WORKER', FAKE_WORKER.replace(
+        '        queue.finish(key,owner)',
+        '        queue.recover(request)\n        queue.finish(key,owner)'))
+    assert scheduler.batch_train(parser().parse_args(batch_fixture.argv)) == 0

@@ -28,7 +28,7 @@ class TABXWrapper(MultiAgentEnv):
     def __init__(self, key, task_bank=None, timeout_rule="hp", max_episode_steps=512,
                  world_state_type="global", seed=0, common_reward=True,
                  reward_scalarisation="sum", tabx_root=None, expected_task_hash=None,
-                 expected_bank_hash=None, jit=True):
+                 expected_bank_hash=None, jit=True, opponent_difficulty="medium"):
         if not common_reward or reward_scalarisation != "sum":
             raise ValueError("TABX uses one common team reward with scalarisation=sum")
         if timeout_rule not in ("hp", "loss"):
@@ -36,7 +36,8 @@ class TABXWrapper(MultiAgentEnv):
         if world_state_type != "global" or not 1 <= int(max_episode_steps) <= 512:
             raise ValueError("TABX requires global state and a limit in [1,512]")
         self.task, self.manifest = load_task(task_bank, key, expected_task_hash, expected_bank_hash)
-        self.params, cfg = build_task_params(self.task, tabx_root)
+        self.opponent_difficulty = opponent_difficulty
+        self.params, cfg = build_task_params(self.task, tabx_root, opponent_difficulty)
         self.layout = TABXLayout(cfg.max_n_ally, cfg.max_n_enemy, cfg.max_n_zone)
         self.manifest.update(self.layout.metadata())
         import jax

@@ -38,11 +38,12 @@ def run(_run, _config, _log):
         logging.getLogger("jaxlib").setLevel(logging.WARNING)
         from envs.tabx_tasks import import_tabx, load_task, validate_task_structure
         from envs.tabx_layout import TABXLayout
-        from tabx_storage import create_run
+        from tabx_storage import create_run, prepare_tabx_run
         import_tabx(args.env_args.get("tabx_root"))
         task, task_manifest = load_task(args.env_args.get("task_bank"), args.env_args["key"],
                                        args.env_args.get("expected_task_hash"), args.env_args.get("expected_bank_hash"))
         task_manifest.update(TABXLayout(*validate_task_structure(task)).metadata())
+        prepare_tabx_run(_config, task_manifest)
         _config["device"] = args.device
         run_dir = create_run(_config, task_manifest)
         import jax
@@ -158,47 +159,32 @@ def run_sequential(args, logger):
         raise ValueError("tabx_async_eval requires TABX, episode runner, batch_size_run=1 and save_model=True")
 
     if args.checkpoint_path != "":
-        timesteps = []
-        timestep_to_load = 0
-
-        if not os.path.isdir(args.checkpoint_path):
-            logger.console_logger.info(
-                "Checkpoint directiory {} doesn't exist".format(args.checkpoint_path)
-            )
-            return
-
-        # Accept either a concrete snapshot or an existing numbered parent.
-        if os.path.isfile(os.path.join(args.checkpoint_path, "agent.th")):
+        if args.env == "tabx":
+            # Already selected and resolved before create_run and runner creation.
             model_path = args.checkpoint_path
-            from pathlib import Path
-            timestep_to_load = int(Path(model_path).name) if Path(model_path).name.isdigit() else 0
         else:
-            model_path = None
-        # Go through all files in args.checkpoint_path
-        for name in os.listdir(args.checkpoint_path):
-            full_name = os.path.join(args.checkpoint_path, name)
-            # Check if they are dirs the names of which are numbers
-            if os.path.isdir(full_name) and name.isdigit():
-                timesteps.append(int(name))
-
-        if model_path is None and not timesteps:
-            raise ValueError(f"No checkpoints found in {args.checkpoint_path}")
-        if model_path is None and args.load_step == 0:
-            # choose the max timestep
-            timestep_to_load = max(timesteps)
-        elif model_path is None:
-            # choose the timestep closest to load_step
-            timestep_to_load = min(timesteps, key=lambda x: abs(x - args.load_step))
-
-        model_path = model_path or os.path.join(args.checkpoint_path, str(timestep_to_load))
+            from tabx_difficulty import select_checkpoint
+            model_path = str(select_checkpoint(args.checkpoint_path, args.load_step))
+        from pathlib import Path
+        timestep_to_load = int(Path(model_path).name) if Path(model_path).name.isdigit() else 0
 
         if args.env == "tabx":
             from tabx_storage import validate_snapshot
-            validate_snapshot(model_path, runner.env.manifest, runner.env.rule)
+            restored = validate_snapshot(model_path, runner.env.manifest, runner.env.rule)
+            timestep_to_load = int(restored["t_env"])
+            parent = getattr(args, "tabx_parent_checkpoint", None)
+            if parent:
+                from tabx_storage import validate_parent_checkpoint
+                validate_parent_checkpoint(args.tabx_output_root, parent, runner.env.manifest, int(args.seed), runner.env.rule)
+                # Continue the episode seed stream; the replay buffer remains empty.
+                runner.env._episode_index = int(restored.get("training_episodes") or 0)
 
         logger.console_logger.info("Loading model from {}".format(model_path))
         learner.load_models(model_path)
         runner.t_env = timestep_to_load
+        if args.env == "tabx":
+            runner.log_train_stats_t = runner.t_env
+            mac.action_selector.epsilon = mac.action_selector.schedule.eval(runner.t_env)
 
         if args.evaluate or args.save_replay:
             runner.log_train_stats_t = runner.t_env

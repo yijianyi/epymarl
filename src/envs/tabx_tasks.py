@@ -202,7 +202,9 @@ def validate_task_structure(task):
     return n_ally, n_enemy, n_zone
 
 
-def build_task_params(task, tabx_root=None):
+def build_task_params(task, tabx_root=None, opponent_difficulty="medium"):
+    if opponent_difficulty not in ("medium", "advanced"):
+        raise ValueError("opponent_difficulty must be medium or advanced")
     sizes = validate_task_structure(task)
     import_tabx(tabx_root)
     import jax.numpy as jnp
@@ -228,5 +230,5 @@ def build_task_params(task, tabx_root=None):
     return {
         "scenario": scenario, "zone_scenario": zones,
         "physics_params": build_batched_physics_params("default"),
-        "heuristic_params": build_batched_heuristic_params("medium"),
+        "heuristic_params": build_batched_heuristic_params(opponent_difficulty),
     }, TABXConfig(max_n_ally=n_ally, max_n_enemy=n_enemy, max_n_zone=n_zone)
