@@ -271,6 +271,9 @@ class SnapshotPublisher:
                             timeout_rule=run["timeout_rule"], train_seed=run["train_seed"],
                             provenance=run["provenance"], agent_sha256=file_sha256(tmp / "agent.th"),
                             config_sha256=file_sha256(tmp / "config.json"))
+            if getattr(self.args, "tabx_bc", False):
+                manifest["policy_stage"] = "after_bc_before_online" if step == 0 else "online_qmix"
+                manifest["bc_updates"] = self.args.tabx_bc_steps
             manifest["train_seed_protocol"] = TRAIN_SEED_PROTOCOL
             manifest["training_metrics_version"] = run.get("training_metrics_version")
             if run.get("batch_id"):

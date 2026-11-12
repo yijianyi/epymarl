@@ -48,7 +48,7 @@ class QLearner:
             rew_shape = (1,) if self.args.common_reward else (self.n_agents,)
             self.rew_ms = RunningMeanStd(shape=rew_shape, device=device)
 
-    def train(self, batch: EpisodeBatch, t_env: int, episode_num: int):
+    def train(self, batch: EpisodeBatch, t_env: int, episode_num: int, *, demo_batch=None, bc_weight=0.0):
         # Get the relevant quantities
         rewards = batch["reward"][:, :-1]
         actions = batch["actions"][:, :-1]
@@ -135,11 +135,22 @@ class QLearner:
         masked_td_error = td_error * mask
 
         # Normal L2 loss, take mean over actual data
-        loss = (masked_td_error**2).sum() / mask.sum()
+        td_loss = (masked_td_error**2).sum() / mask.sum()
+        total_loss = td_loss
+        bc_loss = None
+        effective_bc_weight = 0.0
+        if demo_batch is not None and bc_weight > 0:
+            from tabx_imitation import behavior_cloning_loss
+            bc_loss, bc_metrics = behavior_cloning_loss(
+                mac_out[:demo_batch.batch_size, :demo_batch.max_seq_length], demo_batch)
+            effective_bc_weight = float(bc_weight)
+            total_loss = td_loss + effective_bc_weight * bc_loss
+            self.logger.log_stat("online_bc_loss", bc_metrics["loss"], t_env)
+            self.logger.log_stat("online_bc_accuracy", bc_metrics["accuracy"], t_env)
 
         # Optimise
         self.optimiser.zero_grad()
-        loss.backward()
+        total_loss.backward()
         grad_norm = th.nn.utils.clip_grad_norm_(self.params, self.args.grad_norm_clip)
         self.optimiser.step()
 
@@ -157,10 +168,13 @@ class QLearner:
 
         if t_env - self.log_stats_t >= self.args.learner_log_interval:
             mask_elems = mask.sum().item()
-            scalars = dict(loss=loss.item(), grad_norm=grad_norm.item(),
+            scalars = dict(loss=td_loss.item(), total_loss=total_loss.item(), bc_weight=effective_bc_weight,
+                           grad_norm=grad_norm.item(),
                            td_error_abs=masked_td_error.abs().sum().item() / mask_elems,
                            q_taken_mean=(chosen_action_qvals * mask).sum().item() / mask_elems,
                            target_mean=(targets * mask).sum().item() / mask_elems)
+            if bc_loss is not None:
+                scalars["bc_loss"] = bc_loss.item()
             for name, value in scalars.items():
                 self.logger.log_stat(name, value, t_env)
             if getattr(self.args, "env", None) == "tabx":
@@ -169,6 +183,7 @@ class QLearner:
                 append_train_metrics(Path(self.args.tabx_run_dir) / "train_metrics.csv", dict(
                     t_env=int(t_env), learner_updates=self.training_steps,
                     loss=scalars["loss"], td_error_abs=scalars["td_error_abs"],
+                    bc_loss=scalars.get("bc_loss"), bc_weight=effective_bc_weight, total_loss=scalars["total_loss"],
                     grad_norm_before_clip=scalars["grad_norm"], grad_norm_clip=self.args.grad_norm_clip,
                     q_taken_mean=scalars["q_taken_mean"], target_mean=scalars["target_mean"],
                     lr=self.optimiser.param_groups[0]["lr"]))

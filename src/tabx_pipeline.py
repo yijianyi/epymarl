@@ -645,6 +645,14 @@ def parser():
     collect_command.add_argument("--tiers", required=True)
     collect_command.add_argument("--episodes-per-tier", type=int, default=500)
     collect_command.add_argument("--shard-episodes", type=int, default=10)
+    expert = common("collect-expert", "Validate an official ally teacher and collect executed actions", bank=True, root=True)
+    expert.add_argument("--task", required=True)
+    expert.add_argument("--teacher", choices=("advanced", "expert"), default="advanced")
+    expert.add_argument("--epsilon", type=float, help="Override the official teacher epsilon; default uses its JSON")
+    expert.add_argument("--seed", type=int, default=0, help="Master seed for the independent collection stream")
+    expert.add_argument("--episodes", type=int, default=128)
+    expert.add_argument("--episode-limit", type=int, default=512)
+    expert.add_argument("--shard-episodes", type=int, default=8)
     verify_command = common("verify", "Validate shards and EpisodeBatch readback", root=True)
     verify_command.add_argument("--tiers", required=True)
     verify_command.add_argument("--task", required=True)
@@ -661,6 +669,11 @@ def parser():
     report_command.add_argument("--pilot")
     report_command.add_argument("--rules", default="hp,loss")
     report_command.add_argument("--output")
+    learning = common("learning-report", "Compare baseline and BC runs at the same online budget", root=True)
+    learning.add_argument("--tasks", default="647,403,657")
+    learning.add_argument("--seeds", default="1,2,3")
+    learning.add_argument("--online-budget", type=int, default=1500000)
+    learning.add_argument("--output", required=True, help="Output stem for CSV and JSON")
     return result
 
 
@@ -672,7 +685,7 @@ def main(argv=None):
         from envs.tabx_tasks import task_bank_path, file_sha256
         if file_sha256(task_bank_path(args.bank)) != args.bank_sha256:
             raise ValueError("Task bank SHA-256 mismatch")
-    for name in ("threads", "workers", "steps", "episodes_per_tier", "shard_episodes", "poll_seconds", "lease_seconds"):
+    for name in ("threads", "workers", "steps", "episodes", "episodes_per_tier", "shard_episodes", "poll_seconds", "lease_seconds", "online_budget"):
         if hasattr(args, name) and getattr(args, name) <= 0:
             raise ValueError(f"{name} must be positive")
     if args.command == "check-env":
@@ -692,6 +705,9 @@ def main(argv=None):
                                      args.selection_round), indent=2))
     elif args.command == "collect":
         collect(args)
+    elif args.command == "collect-expert":
+        from tabx_expert import collect_expert
+        collect_expert(args)
     elif args.command == "verify":
         verify(args)
     elif args.command == "pilot":
@@ -707,6 +723,9 @@ def main(argv=None):
             print(f"{group} | {counts['train']} | {counts['pilot']}")
     elif args.command == "report":
         report(args)
+    elif args.command == "learning-report":
+        from tabx_imitation_reporting import learning_report
+        learning_report(args)
 
 
 if __name__ == "__main__":

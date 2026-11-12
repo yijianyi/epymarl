@@ -208,9 +208,6 @@ def read_episode_batch(path, indices=None, device="cpu"):
     `filled` includes the terminal FRAME, as in EpisodeRunner. The additional
     transition_mask makes it impossible to mistake its unexecuted action for data.
     """
-    import torch as th
-    from components.episode_buffer import EpisodeBatch
-    from components.batch_schema import build_batch_schema
     with h5py.File(path, "r") as data:
         if data.attrs["schema_version"] != SCHEMA_VERSION:
             raise ValueError("Legacy TABX HDF5 requires its original layout reader")
@@ -218,18 +215,28 @@ def read_episode_batch(path, indices=None, device="cpu"):
         count = len(data["episodes/length"])
     indices = list(range(count)) if indices is None else list(indices)
     episodes = [read_episode(path, index) for index in indices]
+    return episodes_to_batch(episodes, device)
+
+
+def episodes_to_batch(episodes, device="cpu"):
+    """Build a recurrent batch from episodes, including executed-action masks."""
+    import torch as th
+    from components.episode_buffer import EpisodeBatch
+    from components.batch_schema import build_batch_schema
     if not episodes:
         raise ValueError("No episodes selected")
     lengths = np.array([ep["episode"]["length"] for ep in episodes], dtype=np.int64)
     env_info = dict(n_agents=10, n_actions=8, obs_shape=378, state_shape=340)
     scheme, groups, preprocess = build_batch_schema(env_info)
     scheme["transition_mask"] = {"vshape": (1,), "dtype": th.uint8}
+    for name in ("present", "alive"):
+        scheme[name] = {"vshape": (1,), "group": "agents", "dtype": th.uint8}
     batch = EpisodeBatch(scheme, groups, len(episodes), int(max(lengths)) + 1, preprocess=preprocess, device=device)
     for index, ep in enumerate(episodes):
         length = int(lengths[index])
         batch.update({name: th.as_tensor(ep["frames"][name][None], device=device,
                                          dtype=batch.scheme[name].get("dtype", th.float32))
-                      for name in ("obs", "state", "avail_actions")},
+                      for name in FRAME_FIELDS},
                      bs=slice(index, index + 1), ts=slice(0, length + 1))
         values = {name: ep["transitions"][name][None] for name in STEP_FIELDS}
         values["transition_mask"] = np.ones((1, length, 1), dtype=np.uint8)

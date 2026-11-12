@@ -8,10 +8,10 @@ from pathlib import Path
 import statistics
 import tempfile
 
-TRAIN_METRICS_VERSION = "tabx-train-metrics-v2-mask-mean"
+TRAIN_METRICS_VERSION = "tabx-train-metrics-v3-td-bc-total"
 
 TRAIN_FIELDS = ("t_env", "learner_updates", "loss", "td_error_abs", "grad_norm_before_clip",
-                "grad_norm_clip", "q_taken_mean", "target_mean", "lr")
+                "grad_norm_clip", "q_taken_mean", "target_mean", "lr", "bc_loss", "bc_weight", "total_loss")
 EVAL_FIELDS = ("request_id", "checkpoint_step", "phase", "action_selection", "episodes", "wins",
                "win_rate_pct", "mean_return", "return_std", "elimination_wins", "timeout_wins", "pure_timeouts")
 
@@ -19,6 +19,15 @@ EVAL_FIELDS = ("request_id", "checkpoint_step", "phase", "action_selection", "ep
 def append_train_metrics(path, row):
     """Only the owning trainer writes this file; each row uses the update's t_env."""
     path = Path(path)
+    # Never append the new meaning/columns to a historical metrics file.
+    if path.exists() and path.stat().st_size:
+        with path.open(newline="", encoding="utf-8") as stream:
+            if next(csv.reader(stream)) != list(TRAIN_FIELDS):
+                raise ValueError("Training metrics schema differs; start a new run and preserve the historical CSV")
+    row = dict(row)
+    row.setdefault("bc_loss", None)
+    row.setdefault("bc_weight", 0.0)
+    row.setdefault("total_loss", row["loss"])
     with path.open("a", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(stream, fieldnames=TRAIN_FIELDS)
         if stream.tell() == 0:
@@ -259,8 +268,13 @@ def summarize_run(run_dir):
 
 
 def train_line(rule, task, seed, gpu, row):
+    losses = f"loss={float(row['loss']):.6g} "
+    if row.get("total_loss") not in (None, ""):
+        bc_loss = "" if row.get("bc_loss") in (None, "") else f"{float(row['bc_loss']):.6g}"
+        losses += f"bc_loss={bc_loss} bc_weight={float(row['bc_weight']):.6g} total_loss={float(row['total_loss']):.6g} "
+    # Old rows keep their original loss label and meaning, including mixed BC.
     return (f"[TRAIN] rule={rule} task={task} seed={seed} gpu={gpu} step={row['t_env']} "
-            f"updates={row['learner_updates']} loss={float(row['loss']):.6g} "
+            f"updates={row['learner_updates']} {losses}"
             f"td_abs={float(row['td_error_abs']):.6g} grad_norm_preclip={float(row['grad_norm_before_clip']):.6g} "
             f"grad_clip={float(row['grad_norm_clip']):g}")
 

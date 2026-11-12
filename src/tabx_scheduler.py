@@ -14,6 +14,7 @@ import time
 import uuid
 
 from tabx_reporting import eval_line, train_line, write_csv
+from tabx_config import configure_bc
 from tabx_storage import (EvalQueue, atomic_json, code_hash, completed_checkpoints, ensure_output_contract,
                           evaluation_request, git_version, read_json, resolve_under, runtime_versions, safe_component)
 
@@ -77,6 +78,7 @@ def training_config(overrides):
                     raise ValueError(f"{key} requires a positive integer")
         target[parts[-1]] = value
         canonical[key] = value
+    configure_bc(config)
     if not config["save_model"] or not config["tabx_async_eval"]:
         raise ValueError("Batch training requires save_model=True and tabx_async_eval=True")
     if config["tabx_screen_episodes"] < 2:

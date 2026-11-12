@@ -20,3 +20,18 @@ tabx_require_cuda: false
 tabx_batch_id: null
 tabx_assigned_gpu: null
 tabx_train_log: null
+# Optional advanced demonstrations -> BC -> online QMIX. Baseline is unchanged.
+tabx_bc: false
+tabx_demo_root: null  # collect-expert root: <root>/<rule>/<task>/<teacher>
+tabx_bc_teacher: advanced
+tabx_bc_require_wins: true
+tabx_bc_steps: 1000
+tabx_bc_batch_size: 32
+tabx_bc_lr: 0.0005
+tabx_bc_win_fraction: 0.5
+tabx_bc_eval_episodes: 128
+tabx_bc_epsilon_start: 0.1
+tabx_bc_epsilon_finish: 0.05
+tabx_demo_fraction: 0.25
+tabx_demo_bc_weight: 1.0
+tabx_demo_decay_steps: 100000

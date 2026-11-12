@@ -302,16 +302,16 @@ RESULT_ROOT/<rule>/<task>/<seed>/<run_id>/
   evaluation_requests/registered/    # 已登记但尚未放行的请求
 ~~~
 
-train_metrics.csv 的列为 t_env、learner_updates、loss、td_error_abs、grad_norm_before_clip、grad_norm_clip、q_taken_mean、target_mean、lr。由 learner 复用同一组计算值，按 learner_log_interval 采样，默认每 2,000 环境步最多一行；首次更新也会采样。梯度范数是裁剪前的值，阈值单列。逐局 JSON 保留原始回报、局长、末帧血量、终局原因和种子，增加本局动作选择实际使用的探索率。
+train_metrics.csv 的列为 t_env、learner_updates、loss、td_error_abs、grad_norm_before_clip、grad_norm_clip、q_taken_mean、target_mean、lr、bc_loss、bc_weight、total_loss。`loss` 始终表示纯 TD loss，`total_loss = loss + bc_weight × bc_loss` 用于反传；没有示范时 bc_loss 留空、bc_weight=0、total_loss=loss。混合阶段的 TD 公式与基线一致，但样本来自“示范＋在线”，采样分布不同。由 learner 复用同一组计算值，按 learner_log_interval 采样，默认每 2,000 环境步最多一行；首次更新也会采样。梯度范数是裁剪前的值，阈值单列。逐局 JSON 保留原始回报、局长、末帧血量、终局原因和种子，增加本局动作选择实际使用的探索率。
 
-新 run 的 manifest 记录 training_metrics_version=tabx-train-metrics-v2-mask-mean。q_taken_mean 和 target_mean 现在直接除以展开后 mask 的有效元素数，不再重复除以 n_agents；有效 Q=5、目标=7 时日志就是 5、7。此改动只修正统计，不改变 loss、梯度或参数更新。旧 CSV 保留原值，比较旧 TABX 日志时应注意其 Q 均值曾缩小 10 倍。
+新 run 的 manifest 记录 training_metrics_version=tabx-train-metrics-v3-td-bc-total。拆分日志不改变反传总损失、梯度或参数更新。旧版 BC 混合阶段 CSV 的 loss 仍表示当时的总损失，读取时不重命名、不补成 TD loss，也不允许向旧表头追加新版指标。v2 的 q_taken_mean/target_mean 已按有效 mask 元素数计算；更早版本的 Q 均值曾缩小 10 倍，历史 CSV 均保留原值。
 
 eval_summary.csv 记录 request_id、checkpoint_step、phase、action_selection、episodes、wins、win_rate_pct、mean_return、return_std、elimination_wins、timeout_wins、pure_timeouts。胜率是 0–100 的百分数，回报为原始团队奖励之和的均值，return_std 为样本标准差（单局记 0）。评估晚返回也始终使用快照 manifest 的实际训练步数。每个 worker 只用本次新结果和既有 CSV 更新所属 run，不重读历史评估 JSON；run 写锁避免并发写坏和重复计数。批次汇总只由持有批次锁的调度器写入。
 
 终端与 batch.log 按模型指标采样/评估返回输出关键行，并默认每 30 秒刷新批次概况：
 
 ~~~text
-[TRAIN] rule=hp task=651 seed=1 gpu=0 step=25048 updates=142 loss=3.821 td_abs=1.247 grad_norm_preclip=18.4 grad_clip=10
+[TRAIN] rule=hp task=651 seed=1 gpu=0 step=25048 updates=142 loss=3.821 bc_loss= bc_weight=0 total_loss=3.821 td_abs=1.247 grad_norm_preclip=18.4 grad_clip=10
 [EVAL] rule=hp task=651 seed=1 checkpoint_step=25048 phase=screen episodes=32 wins=8 win_rate=25.0% mean_return=-0.42 return_std=0.316 elimination_wins=6 timeout_wins=2
 [BATCH] rule=hp gpu_slots=0:4/4,1:4/4 train_running=8 train_done=6 train_pending=18 train_failed=0 eval_registered_waiting=120 eval_ready=16 eval_running=4 eval_done=31 eval_failed=0
 [MODEL] task=23 seed=1 train_status=complete eval_status=interrupted status=evaluation_interrupted eval_done=1 eval_expected=3 eval_remaining=2
@@ -354,3 +354,76 @@ python tests/test_tabx_scaling.py --polls 100 \
 基准使用相同的 24 个真实 CPU 等待进程，分别测量 800/8,000 逻辑作业的空轮询中位数、P95、CPU、每分钟写盘量及单独的全量快照耗时。结果见 artifacts/tabx/scheduler-scale-validation.json；逻辑任务和快照负载为轻量模拟，不代表真实 QMIX 的显存容量。常规测试还检查单模型事件只更新该 job、重复通知不重复计数、有界预取与恢复、过时整批快照恢复及拒绝接管不改写汇总。
 
 真实服务器仍需用正式 batch_size=32、buffer_size=256 和 10 对 10 任务逐步比较每卡 1、2、4 个模型，再按整卡显存、主机内存、总训练步数/小时和评估积压决定是否升至 12。终端 eval_registered_waiting 持续增长说明 CPU 评估跟不上；增加 GPU 并发不能消除这部分积压。
+
+## 10. advanced 示范 → BC → online QMIX（可选）
+
+原版 `qmix_tabx` 默认保持 `tabx_bc=False`。打开后，先对现有共享 RNN 的 Q 输出做合法动作掩码交叉熵预训练，再同步 target agent/mixer，从第一个在线回合起完全由模型选动作。老师只在采集和独立评估中控制我方，敌方始终沿用训练环境的 `medium`。
+
+先验证 647 的老师，再采集 403、657；每任务默认 128 局、512 步、`hp`。`collect-expert` 和原 `collect` 独立，后者的 medium/high 仍指已训练 checkpoint 档位。
+
+```bash
+export DEMO_ROOT="$EPYMARL_ROOT/results/tabx-expert-demos"
+python src/tabx_pipeline.py collect-expert \
+  --bank "$TASK_BANK" --bank-sha256 "$TASK_SHA256" \
+  --root "$DEMO_ROOT" --rule hp --task 647 --teacher advanced
+# 复用相同命令可续采；增加 --episodes 可扩充，不覆盖已有 HDF5。
+# 只识别 10 位数字加 .h5 的正式分片；.shard-*.h5 等临时文件会被忽略。
+# 确认 647 老师有效后：
+for task in 403 657; do
+  python src/tabx_pipeline.py collect-expert --bank "$TASK_BANK" \
+    --root "$DEMO_ROOT" --rule hp --task "$task" --teacher advanced
+done
+```
+
+查看 `DEMO_ROOT/hp/647/advanced/teacher_summary.json` 的 `wins`、`elimination_wins`、`timeout_wins`。逐局 HDF5 保存真实执行动作、奖励、终局、present/alive；manifest 记录任务/库 hash、官方实现与参数、老师实际 ε 和参数 JSON hash。advanced 官方默认 ε=0.1，expert=0.01；可用 `--epsilon 0.05` 显式覆盖。更换 ε、主 seed、步数上限或任务库时使用新的 `DEMO_ROOT`。已经发布但未写入 manifest 的有效分片会在续采时校验并补登记，不重复采集；正式分片损坏会报错。老师零胜时仍完整保存轨迹并标为 `review_teacher_before_bc`，训练默认拒绝零胜示范；可先用 `--teacher expert` 单独收集，再设置 `tabx_bc_teacher=expert`。
+
+先只做 BC 和独立评估，拿到 647 的两个数（不进行 online 训练）：
+
+```bash
+JAX_PLATFORMS=cpu python src/main.py --config=qmix_tabx --env-config=tabx with \
+  env_args.key=647 env_args.task_bank="$TASK_BANK" env_args.timeout_rule=hp \
+  tabx_output_root="$RESULT_ROOT" tabx_bc=True tabx_demo_root="$DEMO_ROOT" \
+  seed=1 t_max=0
+```
+
+`bc_evaluations/after_bc_online_step_0.json` 在任何 online 动作/TD 更新之前生成。模型全程 greedy，老师保留采集时的 ε，两者使用同一组 128 个 `bc_holdout` seeds；与 `expert_collect` 采集种子分离，并显式检查无重叠。评估不增加在线环境步数、不推进训练 episode index，并恢复 PyTorch/NumPy 的探索 RNG。`checkpoints/0` 是 BC 后模型，manifest 标记 `policy_stage=after_bc_before_online`，不再是随机初始化模型。
+
+第一轮 3 个任务 × 3 个训练 seed 的对照：
+
+```bash
+# 原版 QMIX
+python src/tabx_pipeline.py batch-train --bank "$TASK_BANK" --root "$RESULT_ROOT" \
+  --rule hp --tasks 647,403,657 --seeds 1,2,3 --gpus 0 \
+  --eval-workers 2 --batch-id baseline-3tasks-3seeds
+# BC + online QMIX
+python src/tabx_pipeline.py batch-train --bank "$TASK_BANK" --root "$RESULT_ROOT" \
+  --rule hp --tasks 647,403,657 --seeds 1,2,3 --gpus 0 \
+  --eval-workers 2 --batch-id bc-3tasks-3seeds \
+  --set tabx_bc=True --set tabx_demo_root="$DEMO_ROOT"
+```
+
+两组在线预算默认均为 150 万步。BC 默认 1000 次更新、每批 32 个完整回合、Adam lr=0.0005，胜局目标抽样比例至少 0.5（不降低原数据中更高的胜局比例），负轨迹保留。`bc_metrics.csv` 的 loss/accuracy 只统计真实、存活单位实际执行的动作，排除终局帧和 padding；这两个指标用于诊断，胜率以独立交互评估为准。
+
+BC 模式在线 ε 从 0.1 线性降至 0.05，持续 10 万在线步。32 回合更新初始配比为 8 示范 + 24 在线，示范数按在线步数线性递减并取最近整数，模仿权重从 1.0 线性降至 0；10 万步后只从在线 replay 采样并使用原 TD 损失。示范池独立存于 HDF5，不占用 256 局在线 replay。BC 优化器独立，BC 更新数不计入在线 learner_updates。所有参数都在 `src/config/envs/tabx.yaml`，可用 `--set` 调整。调度器与训练器共用标准库配置函数 `tabx_config.configure_bc`；batch.json 的 training_config/identity 保存实际生效的 ε，overrides 保留用户原始覆写值。默认 BC 为 0.1 → 0.05 / 100000 步，关闭 BC 为 1.0 → 0.05 / 80000 步；自定义时使用 tabx_bc_epsilon_start、tabx_bc_epsilon_finish 和 tabx_demo_decay_steps。切换点和最终 greedy 复评分别在 `bc_evaluations/online_decay_complete.json`、`online_final.json`；10 万步按第一个跨过阈值的完整回合计算，保存实际步数，并发布该模型 checkpoint。
+
+`bc_summary.json` 单列示范采集步数、示范胜局数与数据 manifest 校验和。标准 CPU screen 评估继续按原协议异步执行，便于与基线配对比较。BC 的 0 步/10 万步/最终专项评估在训练进程中同步执行，其交互成本不计在线预算。已有 checkpoint 的纯评估需设置 `tabx_bc=False`；BC 模式要求新训练尝试，暂不支持中途恢复 replay/BC 状态。
+
+等两组 screen 评估完成后导出对比表：
+
+```bash
+python src/tabx_pipeline.py learning-report --root "$RESULT_ROOT" --rule hp \
+  --tasks 647,403,657 --seeds 1,2,3 --online-budget 1500000 \
+  --output "$RESULT_ROOT/bc_comparison"
+```
+
+输出 CSV/JSON 每个 run 各一行，包含老师采集/留出胜率、BC 后胜率、首次训练/greedy 胜利在线步数、前/末 5 次 online screen 胜率均值、10 万步附近的实际评估步数与胜率、示范步数。未观测指标留空；多次尝试不自动择优合并。报告先读取完整的逐回合记录，以首次达到 online_budget 的回合终点作为唯一 cutoff_step，再同时过滤训练记录和 checkpoint 评估。例如预算 100000、终点 99900/100020/100150 时，只统计至 100020；100150 才首次赢则该预算下首次训练胜利留空。budget_reached=true 表示已达到预算，false 时 cutoff_step 是当前最近的回合终点；历史 run 缺少逐回合日志时 cutoff_step=online_budget、budget_reached=null（未知），评估仅统计 step≤budget。待返回的异步评估不补零。检查 cutoff_step、final_eval_step 和评估数量，确认两组预算、训练进度与评估已对齐。
+
+验证：
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 OMP_NUM_THREADS=1 python -m pytest -q tests/test_tabx_imitation.py tests/test_tabx_bc_revisions.py
+TABX_BC_SMOKE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 OMP_NUM_THREADS=1 \
+  python -m pytest -q tests/test_tabx_imitation.py tests/test_tabx_bc_revisions.py -k "official_teacher or real_batch"
+```
+
+官方子模块当前的 dataclass 默认值在 Python 3.11+ 会触发 mutable-default 错误；上述真实模拟器验证使用 Python 3.10。短流程 smoke 只验证功能衔接，不代表 647 等正式任务的效果。
