@@ -11,6 +11,7 @@ from pathlib import Path
 import sys
 
 TRAIN_SEED_PROTOCOL = "sha256-json-v2:uint32(task_content_hash,train_seed,'train',episode_index)"
+ENEMY_HEURISTIC = "advanced"
 
 
 def training_episode_seed(content_hash, train_seed, episode_index):
@@ -228,5 +229,5 @@ def build_task_params(task, tabx_root=None):
     return {
         "scenario": scenario, "zone_scenario": zones,
         "physics_params": build_batched_physics_params("default"),
-        "heuristic_params": build_batched_heuristic_params("medium"),
+        "heuristic_params": build_batched_heuristic_params(ENEMY_HEURISTIC),
     }, TABXConfig(max_n_ally=n_ally, max_n_enemy=n_enemy, max_n_zone=n_zone)

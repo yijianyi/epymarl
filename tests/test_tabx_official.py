@@ -100,6 +100,7 @@ def test_json_parameters_and_output_root_are_part_of_the_contract(tmp_path):
     identity = simulator_identity()
     assert identity["submodule_commit"]
     assert len(identity["parameter_json_sha256"]) == 2
+    assert "src/tabx/heuristic_policy/parameters/advanced.json" in identity["parameter_json_sha256"]
     for path, digest in identity["parameter_json_sha256"].items():
         assert file_sha256(official_tabx_root() / path) == digest
     old = tmp_path / "old"
@@ -113,6 +114,24 @@ def test_json_parameters_and_output_root_are_part_of_the_contract(tmp_path):
     atomic_json(new / "tabx_semantics.json", dict(identity, layout_version="legacy"))
     with pytest.raises(ValueError, match="different TABX"):
         ensure_output_contract(new)
+
+    old_parameters = dict(identity["parameter_json_sha256"])
+    old_parameters.pop("src/tabx/heuristic_policy/parameters/advanced.json")
+    medium_path = "src/tabx/heuristic_policy/parameters/medium.json"
+    old_parameters[medium_path] = file_sha256(official_tabx_root() / medium_path)
+    marker = new / "tabx_semantics.json"
+    atomic_json(marker, dict(identity, parameter_json_sha256=old_parameters))
+    original = marker.read_bytes()
+    with pytest.raises(ValueError, match="different TABX"):
+        ensure_output_contract(new)
+    assert marker.read_bytes() == original
+
+
+def test_native_opponent_uses_official_advanced_parameters():
+    from envs.tabx_tasks import build_task_params
+    params, _ = build_task_params(tiny_task())
+    assert float(np.asarray(params["heuristic_params"].epsilon).item()) == pytest.approx(.1)
+    assert float(np.asarray(params["heuristic_params"].aggressive_threshold).item()) == pytest.approx(.5)
 
 
 def test_parameter_json_drift_rejects_a_snapshot(monkeypatch, tmp_path):

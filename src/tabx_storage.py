@@ -13,7 +13,7 @@ import tempfile
 import time
 import uuid
 
-from envs.tabx_tasks import TRAIN_SEED_PROTOCOL, OFFICIAL_TABX_URL, file_sha256, import_tabx, official_tabx_root
+from envs.tabx_tasks import ENEMY_HEURISTIC, TRAIN_SEED_PROTOCOL, OFFICIAL_TABX_URL, file_sha256, import_tabx, official_tabx_root
 from envs.tabx_layout import LAYOUT_VERSION, SIMULATOR_CONTRACT
 
 SEED_PROTOCOL = "sha256-json-v1:uint32(task_hash,master_seed,phase,index,stream)"
@@ -91,7 +91,7 @@ def runtime_versions():
 
 def simulator_identity():
     root = official_tabx_root().resolve()
-    files = ("src/tabx/physics/parameters/default.json", "src/tabx/heuristic_policy/parameters/medium.json")
+    files = ("src/tabx/physics/parameters/default.json", f"src/tabx/heuristic_policy/parameters/{ENEMY_HEURISTIC}.json")
     if not all((root / name).is_file() for name in files):
         raise ImportError("Official TABX submodule missing; run git submodule update --init --recursive")
     return dict(simulator_contract=SIMULATOR_CONTRACT, layout_version=LAYOUT_VERSION,

@@ -5,6 +5,7 @@ from pathlib import Path
 import time
 
 import numpy as np
+from envs.tabx_tasks import ENEMY_HEURISTIC
 from tabx_expert_shards import published_expert_shards
 
 
@@ -60,7 +61,7 @@ class HeuristicTeacher:
                     teacher_parameter_sha256=file_sha256(official_tabx_root() / "src/tabx/heuristic_policy/parameters" / f"{self.name}.json"),
                     teacher_parameters={key: np.asarray(value).tolist()
                                         for key, value in vars(self.params).items()},
-                    opponent="medium", teacher_seed_protocol="fold_in_episode_seed_0x54454143")
+                    opponent=ENEMY_HEURISTIC, teacher_seed_protocol="fold_in_episode_seed_0x54454143")
 
 
 def teacher_rollout(env, teacher, seed, recorder=None):

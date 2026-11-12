@@ -23,7 +23,7 @@ python -m pip install -r requirements-tabx.txt
 ```bash
 export TASK_BANK="data/tasks/1106_tasks_merged_multiagent.json"
 export TASK_SHA256="775cee683a650a726f056f05a20b1dc67d9b09104ceff9fb26ca0d11b4ac6887"
-export RESULT_ROOT="$EPYMARL_ROOT/results/tabx-official-v1"
+export RESULT_ROOT="$EPYMARL_ROOT/results/tabx-advanced-bc-v1"
 export RULE=hp
 ```
 
@@ -71,7 +71,7 @@ RESULT_ROOT/
   _batches/<rule>/<batch_id>/eval_queue/ # 批次文件队列
 ```
 
-当前使用官方 `medium` 启发式对手。切换对手后使用新的输出目录；已有不同参数的目录会被拒绝。`tabx_semantics.json` 将官方仓库 URL、子模块 commit、实际使用的 `physics/parameters/default.json`、`heuristic_policy/parameters/medium.json` 的 SHA-256、观测布局版本及终局定义绑定到输出根目录。这些字段也写入 run、checkpoint、CPU 评估和 HDF5；加载快照前校验 JSON，即使只修改参数 JSON 而没有修改 Python 源码，也不能悄悄改变模拟器。
+当前训练、评估和示范采集统一使用官方 `advanced` 启发式对手（默认 ε=0.1）。切换对手后使用新的输出目录；已有不同参数的目录会被拒绝。`tabx_semantics.json` 将官方仓库 URL、子模块 commit、实际使用的 `physics/parameters/default.json`、`heuristic_policy/parameters/advanced.json` 的 SHA-256、观测布局版本及终局定义绑定到输出根目录。这些字段也写入 run、checkpoint、CPU 评估和 HDF5；加载快照前校验 JSON，即使只修改参数 JSON 而没有修改 Python 源码，也不能悄悄改变模拟器。
 
 快照和 tiers 内的模型引用相对于 `RESULT_ROOT`。整体迁移后使用新的 `--root` 和 `--bank`，项目内仍初始化同一子模块。运行清单中的原始绝对路径只用于溯源。权重、配置、源代码内容及 JAX/jaxlib/PyTorch 版本在加载前校验；CPU/CUDA wheel 的本地版本后缀可以不同。
 
@@ -357,12 +357,12 @@ python tests/test_tabx_scaling.py --polls 100 \
 
 ## 10. advanced 示范 → BC → online QMIX（可选）
 
-原版 `qmix_tabx` 默认保持 `tabx_bc=False`。打开后，先对现有共享 RNN 的 Q 输出做合法动作掩码交叉熵预训练，再同步 target agent/mixer，从第一个在线回合起完全由模型选动作。老师只在采集和独立评估中控制我方，敌方始终沿用训练环境的 `medium`。
+原版 `qmix_tabx` 默认保持 `tabx_bc=False`。打开后，先对现有共享 RNN 的 Q 输出做合法动作掩码交叉熵预训练，再同步 target agent/mixer，从第一个在线回合起完全由模型选动作。老师只在采集和独立评估中控制我方，敌方始终沿用训练环境的 `advanced`。
 
 先验证 647 的老师，再采集 403、657；每任务默认 128 局、512 步、`hp`。`collect-expert` 和原 `collect` 独立，后者的 medium/high 仍指已训练 checkpoint 档位。
 
 ```bash
-export DEMO_ROOT="$EPYMARL_ROOT/results/tabx-expert-demos"
+export DEMO_ROOT="$EPYMARL_ROOT/results/tabx-expert-demos-vs-advanced"
 python src/tabx_pipeline.py collect-expert \
   --bank "$TASK_BANK" --bank-sha256 "$TASK_SHA256" \
   --root "$DEMO_ROOT" --rule hp --task 647 --teacher advanced
@@ -375,7 +375,7 @@ for task in 403 657; do
 done
 ```
 
-查看 `DEMO_ROOT/hp/647/advanced/teacher_summary.json` 的 `wins`、`elimination_wins`、`timeout_wins`。逐局 HDF5 保存真实执行动作、奖励、终局、present/alive；manifest 记录任务/库 hash、官方实现与参数、老师实际 ε 和参数 JSON hash。advanced 官方默认 ε=0.1，expert=0.01；可用 `--epsilon 0.05` 显式覆盖。更换 ε、主 seed、步数上限或任务库时使用新的 `DEMO_ROOT`。已经发布但未写入 manifest 的有效分片会在续采时校验并补登记，不重复采集；正式分片损坏会报错。老师零胜时仍完整保存轨迹并标为 `review_teacher_before_bc`，训练默认拒绝零胜示范；可先用 `--teacher expert` 单独收集，再设置 `tabx_bc_teacher=expert`。
+查看 `DEMO_ROOT/hp/647/advanced/teacher_summary.json` 的 `wins`、`elimination_wins`、`timeout_wins`。逐局 HDF5 保存真实执行动作、奖励、终局、present/alive；manifest 记录任务/库 hash、官方实现与参数、老师实际 ε 和参数 JSON hash。advanced 官方默认 ε=0.1，expert=0.01；可用 `--epsilon 0.05` 显式覆盖。切换敌方（例如旧 medium → 当前 advanced），或更换 ε、主 seed、步数上限、任务库时使用新的 `DEMO_ROOT`。旧 medium 示范会被校验拒绝，需重新采集。已经发布但未写入 manifest 的有效分片会在续采时校验并补登记，不重复采集；正式分片损坏会报错。老师零胜时仍完整保存轨迹并标为 `review_teacher_before_bc`，训练默认拒绝零胜示范；可先用 `--teacher expert` 单独收集，再设置 `tabx_bc_teacher=expert`。
 
 先只做 BC 和独立评估，拿到 647 的两个数（不进行 online 训练）：
 

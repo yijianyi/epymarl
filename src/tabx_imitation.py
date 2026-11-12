@@ -8,6 +8,7 @@ import torch as th
 from torch.nn import functional as F
 
 from components.episode_buffer import EpisodeBatch
+from envs.tabx_tasks import ENEMY_HEURISTIC
 from tabx_dataset import episodes_to_batch, read_episode, verify_shard
 from tabx_config import configure_bc
 from tabx_expert_shards import published_expert_shards
@@ -40,7 +41,7 @@ class DemonstrationPool:
         self.manifest = read_json(self.directory / "manifest.json")
         self.metadata = self.manifest["metadata"]
         expected = {key: env.manifest[key] for key in ("task_id", "task_hash", "bank_hash")}
-        expected.update(env.get_layout_info(), timeout_rule=env.rule, episode_limit=env.episode_limit, opponent="medium")
+        expected.update(env.get_layout_info(), timeout_rule=env.rule, episode_limit=env.episode_limit, opponent=ENEMY_HEURISTIC)
         for key, value in expected.items():
             if self.metadata.get(key) != value:
                 raise ValueError(f"Demonstration metadata mismatch: {key}")

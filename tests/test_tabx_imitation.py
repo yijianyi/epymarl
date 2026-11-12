@@ -89,7 +89,7 @@ def test_separate_pool_oversamples_wins_validates_identity_and_trains_qmix(tmp_p
     second["episode"].update(is_win=0, winner=1)
     layout = TABXLayout(9, 1, 0).metadata()
     metadata = dict(layout, task_id="fixture", task_hash="a"*64, bank_hash="b"*64, timeout_rule="hp",
-                    opponent="medium", episode_limit=512, collection_phase="expert_collect",
+                    opponent="advanced", episode_limit=512, collection_phase="expert_collect",
                     provenance=provenance(), teacher="advanced", teacher_epsilon=.1)
     shard = write_shard(tmp_path / "0000000011.h5", [first, second], metadata)
     atomic_json(tmp_path / "manifest.json", dict(metadata=metadata, shards=[dict(path=shard.name, sha256=file_sha256(shard))]))
@@ -122,6 +122,12 @@ def test_separate_pool_oversamples_wins_validates_identity_and_trains_qmix(tmp_p
     bad_env.rule = "loss"
     with pytest.raises(ValueError, match="timeout_rule"):
         DemonstrationPool(tmp_path, bad_env, 7)
+    manifest = read_json(tmp_path / "manifest.json")
+    legacy = dict(manifest, metadata=dict(metadata, opponent="medium"))
+    atomic_json(tmp_path / "manifest.json", legacy)
+    with pytest.raises(ValueError, match="opponent"):
+        DemonstrationPool(tmp_path, env, 7)
+    atomic_json(tmp_path / "manifest.json", manifest)
     losing = tmp_path / "losing"
     losing_shard = write_shard(losing / "0000000012.h5", [second], metadata)
     atomic_json(losing / "manifest.json", dict(metadata=metadata, shards=[
@@ -156,7 +162,7 @@ def test_official_teacher_bc_and_online_handoff(tmp_path):
     execute(command, "collect-resume")
     summary = read_json(demos / "hp/tiny/advanced/teacher_summary.json")
     assert summary["episodes"] == 2 and summary["environment_steps"] == 8
-    assert summary["metadata"]["opponent"] == "medium"
+    assert summary["metadata"]["opponent"] == "advanced"
     assert summary["metadata"]["teacher_epsilon"] == pytest.approx(.1)
     execute(["src/main.py", "--config=qmix_tabx", "--env-config=tabx", "with", "env_args.key=tiny",
         f"env_args.task_bank={bank}", f"tabx_output_root={output}", "tabx_run_id=bc-smoke", "seed=7", "use_cuda=False",

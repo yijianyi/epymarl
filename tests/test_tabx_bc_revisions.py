@@ -112,7 +112,7 @@ def expert_collection(tmp_path, monkeypatch):
         def actions(self):
             return self.env.get_avail_actions().argmax(-1)
         def metadata(self):
-            return dict(teacher="advanced", teacher_epsilon=.1, opponent="medium")
+            return dict(teacher="advanced", teacher_epsilon=.1, opponent="advanced")
     monkeypatch.setattr(envs.tabx_wrapper, "TABXWrapper", Env)
     monkeypatch.setattr(tabx_expert, "HeuristicTeacher", Teacher)
     args = parser().parse_args(["collect-expert", "--bank", "unused", "--root", str(tmp_path), "--task", "647",
