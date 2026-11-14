@@ -27,7 +27,9 @@ from test_tabx_official import tiny_task
 
 def config(**overrides):
     values, _ = training_config([])
-    values.update(use_cuda=False, device="cpu", n_agents=10, n_actions=8, state_shape=340, **overrides)
+    values.update(use_cuda=False, device="cpu", n_agents=10, n_actions=8, state_shape=340)
+    values.update(tabx_bc_target="actions", tabx_bc_action_weights=[1]*8, tabx_dagger_rounds=0)
+    values.update(overrides)
     return values
 
 
@@ -166,7 +168,7 @@ def test_official_teacher_bc_and_online_handoff(tmp_path):
     assert summary["metadata"]["teacher_epsilon"] == pytest.approx(.1)
     execute(["src/main.py", "--config=qmix_tabx", "--env-config=tabx", "with", "env_args.key=tiny",
         f"env_args.task_bank={bank}", f"tabx_output_root={output}", "tabx_run_id=bc-smoke", "seed=7", "use_cuda=False",
-        "tabx_bc=True", f"tabx_demo_root={demos}", "tabx_bc_steps=2", "tabx_bc_batch_size=2",
+        "tabx_bc=True", "tabx_dagger_rounds=0", f"tabx_demo_root={demos}", "tabx_bc_steps=2", "tabx_bc_batch_size=2",
         "tabx_bc_eval_episodes=2", "tabx_bc_require_wins=False", "tabx_demo_decay_steps=8", "tabx_demo_fraction=0.5",
         "t_max=12", "batch_size=2", "buffer_size=4", "env_args.max_episode_steps=4",
         "save_model_interval=8", "tabx_screen_episodes=2", "learner_log_interval=4"], "train")

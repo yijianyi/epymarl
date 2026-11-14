@@ -111,6 +111,9 @@ def expert_collection(tmp_path, monkeypatch):
             calls.append(seed)
         def actions(self):
             return self.env.get_avail_actions().argmax(-1)
+        def actions_and_labels(self):
+            actions = self.actions()
+            return actions, actions.copy(), self.env.get_frame()["alive"].reshape(10, 1)
         def metadata(self):
             return dict(teacher="advanced", teacher_epsilon=.1, opponent="advanced")
     monkeypatch.setattr(envs.tabx_wrapper, "TABXWrapper", Env)
@@ -307,7 +310,7 @@ def test_real_batch_run_and_selector_share_effective_config(tmp_path, monkeypatc
                 "save_model_interval=16", "tabx_screen_episodes=2", "learner_log_interval=4"]
     if variant != "baseline":
         settings += ["tabx_bc=True", f"tabx_demo_root={inputs / 'demos'}", "tabx_bc_steps=1",
-                     "tabx_bc_batch_size=2", "tabx_bc_eval_episodes=2", "tabx_bc_require_wins=False"]
+                     "tabx_bc_batch_size=2", "tabx_bc_eval_episodes=2", "tabx_bc_require_wins=False", "tabx_dagger_rounds=0"]
     if variant == "bc-custom":
         settings += ["tabx_bc_epsilon_start=0.2", "tabx_bc_epsilon_finish=0.03", "tabx_demo_decay_steps=54321",
                      "epsilon_start=0.9"]

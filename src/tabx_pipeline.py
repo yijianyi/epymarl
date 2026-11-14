@@ -653,6 +653,10 @@ def parser():
     expert.add_argument("--episodes", type=int, default=128)
     expert.add_argument("--episode-limit", type=int, default=512)
     expert.add_argument("--shard-episodes", type=int, default=8)
+    label = common("label-expert", "Create a new epsilon-zero advanced-label dataset version", bank=True)
+    label.add_argument("--task", required=True)
+    label.add_argument("--source", required=True, help="Existing task/teacher directory with manifest.json")
+    label.add_argument("--output", required=True, help="New task/teacher directory; must not exist")
     verify_command = common("verify", "Validate shards and EpisodeBatch readback", root=True)
     verify_command.add_argument("--tiers", required=True)
     verify_command.add_argument("--task", required=True)
@@ -708,6 +712,9 @@ def main(argv=None):
     elif args.command == "collect-expert":
         from tabx_expert import collect_expert
         collect_expert(args)
+    elif args.command == "label-expert":
+        from tabx_relabel import relabel_expert
+        relabel_expert(args)
     elif args.command == "verify":
         verify(args)
     elif args.command == "pilot":

@@ -1,4 +1,4 @@
-"""TABX HDF5 v1: independent frame/transition offsets and EpisodeBatch readback."""
+"""TABX HDF5 v2/v3: independent frame/transition offsets and EpisodeBatch readback."""
 import hashlib
 import json
 import os
@@ -11,12 +11,23 @@ import numpy as np
 from envs.tabx_outcome import END_REASONS
 from envs.tabx_layout import TABXLayout, LAYOUT_VERSION, SIMULATOR_CONTRACT
 
-SCHEMA_VERSION = "tabx-hdf5-2"
+SCHEMA_VERSION = "tabx-hdf5-3"
+LEGACY_SCHEMA_VERSION = "tabx-hdf5-2"
 FRAME_FIELDS = {"obs": (np.float32, (10, 378)), "state": (np.float32, (340,)),
                 "avail_actions": (np.uint8, (10, 8)), "present": (np.uint8, (10,)),
                 "alive": (np.uint8, (10,))}
 STEP_FIELDS = {"actions": (np.int64, (10, 1)), "reward": (np.float32, (1,)),
                "terminated": (np.uint8, (1,))}
+LABEL_FIELDS = {"teacher_actions": (np.int64, (10, 1)), "teacher_mask": (np.uint8, (10, 1))}
+
+
+def transition_fields(steps):
+    labels = set(LABEL_FIELDS).intersection(steps)
+    if labels and labels != set(LABEL_FIELDS):
+        raise ValueError("teacher_actions and teacher_mask must be provided together")
+    return dict(STEP_FIELDS, **LABEL_FIELDS) if labels else STEP_FIELDS
+
+
 EPISODE_FIELDS = {"seed": np.int64, "length": np.int64, "return": np.float64,
                   "is_win": np.uint8, "winner": np.int8, "end_reason": np.uint8,
                   "hit_time_limit": np.uint8, "ally_hp_ratio": np.float32, "enemy_hp_ratio": np.float32}
@@ -29,9 +40,20 @@ class EpisodeRecorder:
         self.transitions = {name: [] for name in STEP_FIELDS}
         self.episode = None
 
-    def step(self, actions, reward, terminated, next_frame, info):
+    def step(self, actions, reward, terminated, next_frame, info, *, teacher_actions=None, teacher_mask=None):
         if hasattr(actions, "detach"):
             actions = actions.detach().cpu().numpy()
+        if teacher_actions is not None:
+            if "teacher_actions" not in self.transitions:
+                if self.transitions["actions"]:
+                    raise ValueError("Cannot introduce teacher labels halfway through an episode")
+                self.transitions.update(teacher_actions=[], teacher_mask=[])
+            if teacher_mask is None:
+                teacher_mask = self.frames["present"][-1] & self.frames["alive"][-1]
+            self.transitions["teacher_actions"].append(np.asarray(teacher_actions, dtype=np.int64).reshape(10, 1))
+            self.transitions["teacher_mask"].append(np.asarray(teacher_mask, dtype=np.uint8).reshape(10, 1))
+        elif "teacher_actions" in self.transitions or teacher_mask is not None:
+            raise ValueError("Teacher labels are required on every transition of a labeled episode")
         self.transitions["actions"].append(np.asarray(actions, dtype=np.int64).reshape(10, 1))
         self.transitions["reward"].append([reward])
         self.transitions["terminated"].append([terminated])
@@ -43,7 +65,7 @@ class EpisodeRecorder:
         reason = int(info["end_reason"])
         self.episode = {
             "frames": {name: np.asarray(values, dtype=FRAME_FIELDS[name][0]) for name, values in self.frames.items()},
-            "transitions": {name: np.asarray(values, dtype=STEP_FIELDS[name][0]) for name, values in self.transitions.items()},
+            "transitions": {name: np.asarray(values, dtype=transition_fields(self.transitions)[name][0]) for name, values in self.transitions.items()},
             "episode": dict(seed=self.seed, length=length, **{"return": info["return_value"]},
                             is_win=int(info["is_win"]), winner=0 if info["is_win"] else (-1 if reason == 3 else 1),
                             end_reason=reason, hit_time_limit=int(info["hit_time_limit"]),
@@ -57,7 +79,7 @@ def validate_episode(episode, limit=512):
     length = int(stats["length"])
     if not 1 <= length <= limit:
         raise ValueError(f"Invalid episode length {length}")
-    for fields, specification, count in ((frames, FRAME_FIELDS, length + 1), (steps, STEP_FIELDS, length)):
+    for fields, specification, count in ((frames, FRAME_FIELDS, length + 1), (steps, transition_fields(steps), length)):
         for name, (dtype, shape) in specification.items():
             value = fields[name]
             if value.shape != (count, *shape) or value.dtype != np.dtype(dtype):
@@ -80,6 +102,17 @@ def validate_episode(episode, limit=512):
         raise ValueError("Action out of range")
     if not np.take_along_axis(frames["avail_actions"][:-1], actions[..., None], axis=-1).all():
         raise ValueError("Illegal recorded action")
+    if "teacher_actions" in steps:
+        labels, label_mask = steps["teacher_actions"], steps["teacher_mask"]
+        if not np.isin(label_mask, [0, 1]).all():
+            raise ValueError("Nonbinary teacher_mask")
+        valid = label_mask[..., 0].astype(bool)
+        if np.any(valid & ~(frames["present"][:-1].astype(bool) & frames["alive"][:-1].astype(bool))):
+            raise ValueError("Teacher labels on inactive units")
+        if np.any((labels < 0) | (labels >= 8)):
+            raise ValueError("Teacher action out of range")
+        if not np.take_along_axis(frames["avail_actions"][:-1], labels, axis=-1)[..., 0][valid].all():
+            raise ValueError("Illegal teacher action")
     if not np.all(steps["terminated"][:-1] == 0) or steps["terminated"][-1, 0] != 1:
         raise ValueError("Exactly the final transition must be terminal")
     if not np.isclose(steps["reward"].sum(dtype=np.float64), stats["return"], rtol=1e-6, atol=2e-5):
@@ -96,6 +129,9 @@ def trajectory_hash(episode):
     for name in ("obs", "state"):
         digest.update(episode["frames"][name].tobytes())
     digest.update(episode["transitions"]["actions"].tobytes())
+    if "teacher_actions" in episode["transitions"]:
+        for name in LABEL_FIELDS:
+            digest.update(episode["transitions"][name].tobytes())
     return digest.hexdigest()
 
 
@@ -117,6 +153,11 @@ def write_shard(path, episodes, metadata):
     metadata.update(shard_layout(metadata).metadata())
     if not episodes:
         raise ValueError("Cannot publish an empty shard")
+    fields = transition_fields(episodes[0]["transitions"])
+    if any(set(transition_fields(ep["transitions"])) != set(fields) for ep in episodes):
+        raise ValueError("Cannot mix labeled and legacy episodes in one shard")
+    schema = SCHEMA_VERSION if "teacher_actions" in fields else LEGACY_SCHEMA_VERSION
+    metadata.setdefault("label_source", "deterministic_teacher" if schema == SCHEMA_VERSION else "executed_actions")
     lengths = [validate_episode(ep, metadata.get("episode_limit", 512)) for ep in episodes]
     if len({ep["episode"]["seed"] for ep in episodes}) != len(episodes):
         raise ValueError("Duplicate seeds in shard")
@@ -127,9 +168,9 @@ def write_shard(path, episodes, metadata):
     os.close(descriptor)
     try:
         with h5py.File(tmp, "w") as data:
-            data.attrs["schema_version"] = SCHEMA_VERSION
+            data.attrs["schema_version"] = schema
             data.attrs["metadata"] = json.dumps(metadata, sort_keys=True, allow_nan=False)
-            for group, fields in (("frames", FRAME_FIELDS), ("transitions", STEP_FIELDS)):
+            for group, fields in (("frames", FRAME_FIELDS), ("transitions", fields)):
                 for name in fields:
                     values = np.concatenate([ep[group][name] for ep in episodes], axis=0)
                     data.create_dataset(f"{group}/{name}", data=values, chunks=True, compression="gzip", compression_opts=4,
@@ -151,21 +192,33 @@ def write_shard(path, episodes, metadata):
 
 def read_episode(path, index):
     with h5py.File(path, "r") as data:
+        fields = _shard_fields(data)
         fo, so = data["episodes/frame_offsets"], data["episodes/step_offsets"]
         if not 0 <= index < len(fo) - 1:
             raise IndexError(index)
         result = {
             "frames": {name: data[f"frames/{name}"][fo[index]:fo[index + 1]] for name in FRAME_FIELDS},
-            "transitions": {name: data[f"transitions/{name}"][so[index]:so[index + 1]] for name in STEP_FIELDS},
+            "transitions": {name: data[f"transitions/{name}"][so[index]:so[index + 1]] for name in fields},
+            "label_source": json.loads(data.attrs["metadata"]).get("label_source", "executed_actions"),
             "episode": {name: data[f"episodes/{name}"][index].item() for name in EPISODE_FIELDS},
         }
     return result
 
 
+def _shard_fields(data):
+    schema = data.attrs["schema_version"]
+    if schema not in (SCHEMA_VERSION, LEGACY_SCHEMA_VERSION):
+        raise ValueError("Unknown HDF5 schema")
+    fields = dict(STEP_FIELDS, **LABEL_FIELDS) if schema == SCHEMA_VERSION else STEP_FIELDS
+    if schema == LEGACY_SCHEMA_VERSION and any(f"transitions/{key}" in data for key in LABEL_FIELDS):
+        raise ValueError("Legacy schema cannot contain unversioned teacher labels")
+    return fields
+
+
 def verify_shard(path, expected=None):
     with h5py.File(path, "r") as data:
-        if data.attrs["schema_version"] != SCHEMA_VERSION:
-            raise ValueError("Unknown HDF5 schema")
+        fields = _shard_fields(data)
+        schema = data.attrs["schema_version"]
         metadata = json.loads(data.attrs["metadata"])
         layout = shard_layout(metadata)
         if expected:
@@ -178,7 +231,7 @@ def verify_shard(path, expected=None):
                 len(so) != len(fo) or fo[0] != 0 or so[0] != 0 or
                 not np.array_equal(np.diff(fo), lengths + 1) or not np.array_equal(np.diff(so), lengths)):
             raise ValueError("Invalid independent frame/step offsets")
-        for group, fields, count in (("frames", FRAME_FIELDS, fo[-1]), ("transitions", STEP_FIELDS, so[-1])):
+        for group, fields, count in (("frames", FRAME_FIELDS, fo[-1]), ("transitions", fields, so[-1])):
             for name, (dtype, shape) in fields.items():
                 dataset = data[f"{group}/{name}"]
                 if dataset.shape != (count, *shape) or dataset.dtype != np.dtype(dtype):
@@ -199,7 +252,8 @@ def verify_shard(path, expected=None):
         if trajectory_hash(episode) != hashes[index]:
             raise ValueError("Trajectory checksum mismatch")
     return dict(episodes=len(lengths), steps=int(so[-1]), frames=int(fo[-1]), seeds=seeds,
-                trajectory_hashes=hashes, metadata=metadata, bytes=Path(path).stat().st_size)
+                trajectory_hashes=hashes, metadata=metadata, schema_version=schema,
+                label_source=metadata.get("label_source", "executed_actions"), bytes=Path(path).stat().st_size)
 
 
 def read_episode_batch(path, indices=None, device="cpu"):
@@ -209,8 +263,7 @@ def read_episode_batch(path, indices=None, device="cpu"):
     transition_mask makes it impossible to mistake its unexecuted action for data.
     """
     with h5py.File(path, "r") as data:
-        if data.attrs["schema_version"] != SCHEMA_VERSION:
-            raise ValueError("Legacy TABX HDF5 requires its original layout reader")
+        _shard_fields(data)
         shard_layout(json.loads(data.attrs["metadata"]))
         count = len(data["episodes/length"])
     indices = list(range(count)) if indices is None else list(indices)
@@ -229,6 +282,9 @@ def episodes_to_batch(episodes, device="cpu"):
     env_info = dict(n_agents=10, n_actions=8, obs_shape=378, state_shape=340)
     scheme, groups, preprocess = build_batch_schema(env_info)
     scheme["transition_mask"] = {"vshape": (1,), "dtype": th.uint8}
+    for name, (dtype, shape) in LABEL_FIELDS.items():
+        scheme[name] = {"vshape": (1,), "group": "agents", "dtype": th.long if name == "teacher_actions" else th.uint8}
+    scheme["has_teacher_labels"] = {"vshape": (1,), "dtype": th.uint8, "episode_const": True}
     for name in ("present", "alive"):
         scheme[name] = {"vshape": (1,), "group": "agents", "dtype": th.uint8}
     batch = EpisodeBatch(scheme, groups, len(episodes), int(max(lengths)) + 1, preprocess=preprocess, device=device)
@@ -238,7 +294,10 @@ def episodes_to_batch(episodes, device="cpu"):
                                          dtype=batch.scheme[name].get("dtype", th.float32))
                       for name in FRAME_FIELDS},
                      bs=slice(index, index + 1), ts=slice(0, length + 1))
-        values = {name: ep["transitions"][name][None] for name in STEP_FIELDS}
+        labeled = "teacher_actions" in ep["transitions"]
+        batch.update({"has_teacher_labels": th.tensor([[int(labeled)]], device=device, dtype=th.uint8)},
+                     bs=slice(index, index + 1), mark_filled=False)
+        values = {name: ep["transitions"][name][None] for name in transition_fields(ep["transitions"])}
         values["transition_mask"] = np.ones((1, length, 1), dtype=np.uint8)
         values = {name: th.as_tensor(value, device=device, dtype=batch.scheme[name].get("dtype", th.float32))
                   for name, value in values.items()}

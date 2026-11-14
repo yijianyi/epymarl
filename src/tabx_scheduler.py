@@ -74,7 +74,8 @@ def training_config(overrides):
             if isinstance(previous, (int, float)) and not isinstance(previous, bool):
                 if isinstance(value, bool) or not isinstance(value, (int, float)):
                     raise ValueError(f"{key} requires a number")
-                if isinstance(previous, int) and (not isinstance(value, int) or value <= 0):
+                if isinstance(previous, int) and (not isinstance(value, int) or
+                        (value < 0 if key == "tabx_dagger_rounds" else value <= 0)):
                     raise ValueError(f"{key} requires a positive integer")
         target[parts[-1]] = value
         canonical[key] = value

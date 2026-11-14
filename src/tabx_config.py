@@ -27,6 +27,36 @@ def configure_bc(config):
             raise ValueError(f"{key} must be positive")
     if config["evaluation_epsilon"] != 0:
         raise ValueError("BC comparisons require evaluation_epsilon=0")
+    if config["tabx_bc_target"] not in ("actions", "teacher_actions"):
+        raise ValueError("tabx_bc_target must be actions or teacher_actions")
+    weights = config["tabx_bc_action_weights"]
+    if not isinstance(weights, (list, tuple)) or len(weights) != 8 or any(
+            isinstance(w, bool) or not isinstance(w, (int, float)) or not math.isfinite(w) or w <= 0 for w in weights):
+        raise ValueError("tabx_bc_action_weights requires eight finite positive weights")
+    rounds = config["tabx_dagger_rounds"]
+    if isinstance(rounds, bool) or not isinstance(rounds, int) or rounds < 0:
+        raise ValueError("tabx_dagger_rounds must be a nonnegative integer")
+    if rounds:
+        if config["tabx_bc_target"] != "teacher_actions":
+            raise ValueError("DAgger requires teacher_actions targets")
+        episodes = config["tabx_dagger_episodes"]
+        if isinstance(episodes, bool) or not isinstance(episodes, int) or episodes <= 0:
+            raise ValueError("tabx_dagger_episodes must be a positive integer")
+        if not 0 < config["tabx_dagger_initial_fraction"] < 1 or not 0 < config["tabx_dagger_fraction"] < 1:
+            raise ValueError("DAgger fractions must be between zero and one")
+        initial = max(1, int(config["tabx_bc_steps"] * config["tabx_dagger_initial_fraction"]))
+        if config["tabx_bc_steps"] - initial < rounds:
+            raise ValueError("BC budget must provide at least one update per DAgger round")
     config.update(epsilon_start=config["tabx_bc_epsilon_start"], epsilon_finish=config["tabx_bc_epsilon_finish"],
                   epsilon_anneal_time=config["tabx_demo_decay_steps"])
     return config
+
+
+def bc_stage_budgets(config):
+    """Keep the requested total budget, including when users increase BC steps."""
+    total, rounds = config["tabx_bc_steps"], config["tabx_dagger_rounds"]
+    if not rounds:
+        return [total]
+    initial = max(1, int(total * config["tabx_dagger_initial_fraction"]))
+    each, remainder = divmod(total - initial, rounds)
+    return [initial] + [each + int(i < remainder) for i in range(rounds)]

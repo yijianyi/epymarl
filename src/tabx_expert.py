@@ -38,21 +38,35 @@ class HeuristicTeacher:
         self.key = jax.random.fold_in(jax.random.PRNGKey(seed), 0x54454143)
         self.memory = {key: LastVisibleTarget() for key in self.env.base_env.ally_keys}
 
-    def actions(self):
+    def actions_and_labels(self, *, observations=None, alive=None, avail_actions=None):
+        """Compute behavior/epsilon-zero advice from the same pre-step memory."""
         import jax
-        obs = self.env.get_native_observations()
-        alive = self.env.get_frame()["alive"]
+        import jax.numpy as jnp
+        obs = self.env.get_native_observations() if observations is None else observations
+        alive = self.env.get_frame()["alive"] if alive is None else alive
+        avail = self.env.get_avail_actions() if avail_actions is None else avail_actions
         actions = np.full(10, self.env.IDLE, dtype=np.int64)
+        labels = actions.copy()
+        deterministic = self.params.replace(epsilon=jnp.zeros_like(self.params.epsilon))
         for i, key in enumerate(self.env.base_env.ally_keys):
             if not alive[i]:
                 continue
             self.key, subkey = jax.random.split(self.key)
-            action, self.memory[key] = self.policy(subkey, obs[key], self.memory[key], self.params,
-                                                  self.env.params["physics_params"])
-            actions[i] = int(np.asarray(action).item())
-        if not self.env.get_avail_actions()[np.arange(10), actions].all():
-            raise ValueError("Official teacher selected an illegal action")
-        return actions
+            previous = self.memory[key]
+            action, next_memory = self.policy(subkey, obs[key], previous, self.params,
+                                               self.env.params["physics_params"])
+            if self.epsilon == 0:
+                label = action
+            else:
+                label, _ = self.policy(subkey, obs[key], previous, deterministic, self.env.params["physics_params"])
+            self.memory[key] = next_memory
+            actions[i], labels[i] = int(np.asarray(action).item()), int(np.asarray(label).item())
+        if not avail[np.arange(10), actions].all() or not avail[np.arange(10), labels].all():
+            raise ValueError("Official teacher selected an illegal action/label")
+        return actions, labels, np.asarray(alive, dtype=np.uint8).reshape(10, 1)
+
+    def actions(self):
+        return self.actions_and_labels()[0]
 
     def metadata(self):
         from envs.tabx_tasks import official_tabx_root
@@ -61,6 +75,7 @@ class HeuristicTeacher:
                     teacher_parameter_sha256=file_sha256(official_tabx_root() / "src/tabx/heuristic_policy/parameters" / f"{self.name}.json"),
                     teacher_parameters={key: np.asarray(value).tolist()
                                         for key, value in vars(self.params).items()},
+                    label_source="deterministic_teacher", label_teacher=self.name, label_epsilon=0.0,
                     opponent=ENEMY_HEURISTIC, teacher_seed_protocol="fold_in_episode_seed_0x54454143")
 
 
@@ -73,13 +88,14 @@ def teacher_rollout(env, teacher, seed, recorder=None):
         recorder.start(env.get_frame(), seed)
     total, length, ended = 0., 0, False
     while not ended:
-        actions = teacher.actions()
+        actions, labels, label_mask = teacher.actions_and_labels()
         _, reward, terminated, truncated, info = env.step(actions)
         ended = terminated or truncated
         total += reward
         length += 1
         if recorder is not None:
-            recorder.step(actions, reward, ended, env.get_frame(), info)
+            recorder.step(actions, reward, ended, env.get_frame(), info,
+                          teacher_actions=labels, teacher_mask=label_mask)
     result = dict(seed=int(seed), **info, return_value=total, length=length,
                   end_reason_name=END_REASONS[int(info["end_reason"])],
                   elapsed_seconds=time.monotonic() - started)

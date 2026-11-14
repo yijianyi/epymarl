@@ -68,8 +68,10 @@ class EpisodeRunner:
             self.env.reset(seed=episode_seed)
         self.t = 0
 
-    def run(self, test_mode=False, *, episode_seed=None, recorder=None):
+    def run(self, test_mode=False, *, episode_seed=None, recorder=None, label_teacher=None):
         self.reset(episode_seed=episode_seed)
+        if label_teacher is not None:
+            label_teacher.reset(episode_seed)
         if recorder is not None:
             recorder.start(self.env.get_frame(), episode_seed)
 
@@ -95,6 +97,10 @@ class EpisodeRunner:
                 self.batch, t_ep=self.t, t_env=self.t_env, test_mode=test_mode
             )
 
+            labels = {}
+            if label_teacher is not None:
+                _, teacher_actions, teacher_mask = label_teacher.actions_and_labels()
+                labels = dict(teacher_actions=teacher_actions, teacher_mask=teacher_mask)
             _, reward, terminated, truncated, env_info = self.env.step(actions[0])
             terminated = terminated or truncated
             if test_mode and self.args.render:
@@ -113,7 +119,7 @@ class EpisodeRunner:
             self.batch.update(post_transition_data, ts=self.t)
             if recorder is not None:
                 recorder.step(actions[0], reward, post_transition_data["terminated"][0][0],
-                              self.env.get_frame(), env_info)
+                              self.env.get_frame(), env_info, **labels)
 
             self.t += 1
 

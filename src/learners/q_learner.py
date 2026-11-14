@@ -142,11 +142,19 @@ class QLearner:
         if demo_batch is not None and bc_weight > 0:
             from tabx_imitation import behavior_cloning_loss
             bc_loss, bc_metrics = behavior_cloning_loss(
-                mac_out[:demo_batch.batch_size, :demo_batch.max_seq_length], demo_batch)
+                mac_out[:demo_batch.batch_size, :demo_batch.max_seq_length], demo_batch,
+                target=getattr(self.args, "tabx_bc_target", "actions"),
+                action_weights=getattr(self.args, "tabx_bc_action_weights", None))
             effective_bc_weight = float(bc_weight)
             total_loss = td_loss + effective_bc_weight * bc_loss
             self.logger.log_stat("online_bc_loss", bc_metrics["loss"], t_env)
             self.logger.log_stat("online_bc_accuracy", bc_metrics["accuracy"], t_env)
+            self.logger.log_stat("online_bc_unweighted_ce", bc_metrics["unweighted_ce"], t_env)
+            if getattr(self.args, "env", None) == "tabx":
+                import json
+                from pathlib import Path
+                with (Path(self.args.tabx_run_dir) / "online_bc_metrics.jsonl").open("a", encoding="utf-8") as stream:
+                    stream.write(json.dumps(dict(t_env=t_env, **bc_metrics)) + "\n")
 
         # Optimise
         self.optimiser.zero_grad()

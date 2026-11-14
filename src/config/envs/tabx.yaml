@@ -26,6 +26,12 @@ tabx_demo_root: null  # collect-expert root: <root>/<rule>/<task>/<teacher>
 tabx_bc_teacher: advanced
 tabx_bc_require_wins: true
 tabx_bc_steps: 1000
+tabx_bc_target: teacher_actions
+tabx_bc_action_weights: [1, 1, 1, 1, 3, 3, 3, 1]
+tabx_dagger_rounds: 3
+tabx_dagger_episodes: 32
+tabx_dagger_initial_fraction: 0.4
+tabx_dagger_fraction: 0.5
 tabx_bc_batch_size: 32
 tabx_bc_lr: 0.0005
 tabx_bc_win_fraction: 0.5

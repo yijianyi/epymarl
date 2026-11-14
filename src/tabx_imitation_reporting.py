@@ -7,7 +7,8 @@ from tabx_storage import atomic_json, read_json
 
 
 FIELDS = ("task_id", "train_seed", "variant", "run_id", "status", "online_budget", "cutoff_step", "budget_reached", "final_eval_step",
-          "demonstration_steps", "teacher_collection_win_rate", "teacher_holdout_win_rate", "bc_win_rate",
+          "demonstration_steps", "dagger_steps", "bc_updates", "bc_target", "teacher_collection_win_rate", "teacher_holdout_win_rate", "bc_win_rate",
+          "bc_model_teacher_agreement", "bc_attack_recall", "bc_turn_right_recall", "bc_turn_left_recall",
           "first_training_win_step", "first_greedy_win_step", "early_5_eval_win_rate", "at_100k_eval_step",
           "at_100k_eval_win_rate", "last_5_eval_win_rate", "screen_evaluations", "run_directory")
 
@@ -42,7 +43,9 @@ def summarize_run(directory, budget):
         cutoff_step=cutoff_step, budget_reached=budget_reached,
         status="training_complete" if (directory / "training_complete.json").exists() else "training_in_progress",
         final_eval_step=int(online[-1]["checkpoint_step"]) if online else None,
-        demonstration_steps=0, teacher_collection_win_rate=None,
+        demonstration_steps=0, dagger_steps=0, bc_updates=None, bc_target=None, teacher_collection_win_rate=None,
+        bc_model_teacher_agreement=bc.get("model_teacher_agreement", {}).get("accuracy"),
+        bc_attack_recall=None, bc_turn_right_recall=None, bc_turn_left_recall=None,
         teacher_holdout_win_rate=bc.get("teacher", {}).get("win_rate"), bc_win_rate=bc.get("model", {}).get("win_rate"),
         first_training_win_step=next((row["t_env"] for row in training if row["is_win"]), None),
         first_greedy_win_step=next((int(row["checkpoint_step"]) for row in screens if int(row["wins"]) > 0), None),
@@ -54,7 +57,13 @@ def summarize_run(directory, budget):
     if (directory / "bc_summary.json").exists():
         summary = read_json(directory / "bc_summary.json")
         result["demonstration_steps"] = summary["demonstration_environment_steps"]
+        result.update(dagger_steps=summary.get("dagger_environment_steps", 0), bc_updates=summary.get("bc_updates"),
+                      bc_target=summary.get("bc_target", "actions"))
         result["teacher_collection_win_rate"] = summary["demonstration_wins"] / summary["demonstration_episodes"]
+    agreement = bc.get("model_teacher_agreement")
+    if agreement:
+        for name, i in (("attack", 4), ("turn_right", 5), ("turn_left", 6)):
+            result[f"bc_{name}_recall"] = agreement["action_recall"][i]
     return result
 
 

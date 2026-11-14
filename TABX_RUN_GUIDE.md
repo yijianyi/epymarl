@@ -362,7 +362,7 @@ python tests/test_tabx_scaling.py --polls 100 \
 先验证 647 的老师，再采集 403、657；每任务默认 128 局、512 步、`hp`。`collect-expert` 和原 `collect` 独立，后者的 medium/high 仍指已训练 checkpoint 档位。
 
 ```bash
-export DEMO_ROOT="$EPYMARL_ROOT/results/tabx-expert-demos-vs-advanced"
+export DEMO_ROOT="$EPYMARL_ROOT/results/tabx-expert-demos-vs-advanced-v3"
 python src/tabx_pipeline.py collect-expert \
   --bank "$TASK_BANK" --bank-sha256 "$TASK_SHA256" \
   --root "$DEMO_ROOT" --rule hp --task 647 --teacher advanced
@@ -375,7 +375,7 @@ for task in 403 657; do
 done
 ```
 
-查看 `DEMO_ROOT/hp/647/advanced/teacher_summary.json` 的 `wins`、`elimination_wins`、`timeout_wins`。逐局 HDF5 保存真实执行动作、奖励、终局、present/alive；manifest 记录任务/库 hash、官方实现与参数、老师实际 ε 和参数 JSON hash。advanced 官方默认 ε=0.1，expert=0.01；可用 `--epsilon 0.05` 显式覆盖。切换敌方（例如旧 medium → 当前 advanced），或更换 ε、主 seed、步数上限、任务库时使用新的 `DEMO_ROOT`。旧 medium 示范会被校验拒绝，需重新采集。已经发布但未写入 manifest 的有效分片会在续采时校验并补登记，不重复采集；正式分片损坏会报错。老师零胜时仍完整保存轨迹并标为 `review_teacher_before_bc`，训练默认拒绝零胜示范；可先用 `--teacher expert` 单独收集，再设置 `tabx_bc_teacher=expert`。
+查看 `DEMO_ROOT/hp/647/advanced/teacher_summary.json` 的 `wins`、`elimination_wins`、`timeout_wins`。逐局 HDF5 v3 保存真实执行 actions、ε=0 的 teacher_actions/teacher_mask、奖励、终局、present/alive；manifest 记录任务/库 hash、官方实现与参数、老师实际 ε 和参数 JSON hash。advanced 官方默认 ε=0.1，expert=0.01；可用 `--epsilon 0.05` 显式覆盖。切换敌方（例如旧 medium → 当前 advanced），或更换 ε、主 seed、步数上限、任务库时使用新的 `DEMO_ROOT`。旧 medium 示范会被校验拒绝，需重新采集。已经发布但未写入 manifest 的有效分片会在续采时校验并补登记，不重复采集；正式分片损坏会报错。老师零胜时仍完整保存轨迹并标为 `review_teacher_before_bc`，训练默认拒绝零胜示范；可先用 `--teacher expert` 单独收集，再设置 `tabx_bc_teacher=expert`。
 
 先只做 BC 和独立评估，拿到 647 的两个数（不进行 online 训练）：
 
@@ -402,11 +402,11 @@ python src/tabx_pipeline.py batch-train --bank "$TASK_BANK" --root "$RESULT_ROOT
   --set tabx_bc=True --set tabx_demo_root="$DEMO_ROOT"
 ```
 
-两组在线预算默认均为 150 万步。BC 默认 1000 次更新、每批 32 个完整回合、Adam lr=0.0005，胜局目标抽样比例至少 0.5（不降低原数据中更高的胜局比例），负轨迹保留。`bc_metrics.csv` 的 loss/accuracy 只统计真实、存活单位实际执行的动作，排除终局帧和 padding；这两个指标用于诊断，胜率以独立交互评估为准。
+两组在线预算默认均为 150 万步。BC 总预算默认 1000 次更新、每批 32 个完整回合、Adam lr=0.0005、hidden_dim=128。先更新 400 次，再做三轮“模型 greedy 采集 32 局＋聚合池更新 200 次”，总预算仍为 1000 次。原始示范胜局目标抽样比例至少 0.5，失败轨迹保留；从第一轮 DAgger 起每批默认 16 局原始示范＋16 局 DAgger，DAgger 先均匀选轮次再在轮内均匀抽完整回合。BC 目标默认使用确定性老师标签，动作权重为 [1,1,1,1,3,3,3,1]。`bc_metrics.csv` 记录加权 loss、未加权 CE、accuracy，以及各动作 support/precision/recall；有效掩码同时排除死亡、空槽、终局帧、padding 和缺少标签的动作。
 
 BC 模式在线 ε 从 0.1 线性降至 0.05，持续 10 万在线步。32 回合更新初始配比为 8 示范 + 24 在线，示范数按在线步数线性递减并取最近整数，模仿权重从 1.0 线性降至 0；10 万步后只从在线 replay 采样并使用原 TD 损失。示范池独立存于 HDF5，不占用 256 局在线 replay。BC 优化器独立，BC 更新数不计入在线 learner_updates。所有参数都在 `src/config/envs/tabx.yaml`，可用 `--set` 调整。调度器与训练器共用标准库配置函数 `tabx_config.configure_bc`；batch.json 的 training_config/identity 保存实际生效的 ε，overrides 保留用户原始覆写值。默认 BC 为 0.1 → 0.05 / 100000 步，关闭 BC 为 1.0 → 0.05 / 80000 步；自定义时使用 tabx_bc_epsilon_start、tabx_bc_epsilon_finish 和 tabx_demo_decay_steps。切换点和最终 greedy 复评分别在 `bc_evaluations/online_decay_complete.json`、`online_final.json`；10 万步按第一个跨过阈值的完整回合计算，保存实际步数，并发布该模型 checkpoint。
 
-`bc_summary.json` 单列示范采集步数、示范胜局数与数据 manifest 校验和。标准 CPU screen 评估继续按原协议异步执行，便于与基线配对比较。BC 的 0 步/10 万步/最终专项评估在训练进程中同步执行，其交互成本不计在线预算。已有 checkpoint 的纯评估需设置 `tabx_bc=False`；BC 模式要求新训练尝试，暂不支持中途恢复 replay/BC 状态。
+`bc_summary.json` 单列原始示范采集步数、DAgger 采集步数/回合数、各阶段 BC 更新预算、标签来源、动作权重与数据 manifest 校验和。每轮 DAgger 数据和采集模型位于 dagger/round_N，manifest 记录模型哈希、轮次、seeds、分片 SHA-256 和胜负；三轮共用同一个 BC 优化器，其最终状态保存为 bc_optimizer.th。online t_env 从 0 开始，不计入 DAgger 的额外环境交互。标准 CPU screen 评估继续按原协议异步执行，便于与基线配对比较。BC 的 0 步/10 万步/最终专项评估在训练进程中同步执行，其交互成本不计在线预算。已有 checkpoint 的纯评估需设置 `tabx_bc=False`；BC 模式要求新训练尝试，暂不支持中途恢复 replay/BC 状态。
 
 等两组 screen 评估完成后导出对比表：
 
@@ -421,9 +421,38 @@ python src/tabx_pipeline.py learning-report --root "$RESULT_ROOT" --rule hp \
 验证：
 
 ```bash
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 OMP_NUM_THREADS=1 python -m pytest -q tests/test_tabx_imitation.py tests/test_tabx_bc_revisions.py
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 OMP_NUM_THREADS=1 python -m pytest -q tests/test_tabx_imitation.py tests/test_tabx_bc_revisions.py tests/test_tabx_dagger.py
 TABX_BC_SMOKE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 OMP_NUM_THREADS=1 \
-  python -m pytest -q tests/test_tabx_imitation.py tests/test_tabx_bc_revisions.py -k "official_teacher or real_batch"
+  python -m pytest -q tests/test_tabx_imitation.py tests/test_tabx_bc_revisions.py tests/test_tabx_dagger.py -k "official_teacher or real_batch or official_relabel"
 ```
 
 官方子模块当前的 dataclass 默认值在 Python 3.11+ 会触发 mutable-default 错误；上述真实模拟器验证使用 Python 3.10。短流程 smoke 只验证功能衔接，不代表 647 等正式任务的效果。
+
+## 11. 干净标签、动作加权与 DAgger
+
+新采集的专家 HDF5 使用 `tabx-hdf5-3`：`actions` 永远是实际送给环境的动作；`teacher_actions` 是同状态下 advanced 关闭探索的建议；`teacher_mask` 表示实际步、真实存活单位上的有效标签。行为策略仍可使用 ε=0.1，行为和标签从同一份旧老师记忆计算，只提交一次记忆更新。RNN 的上一动作和 QMIX TD 都继续读取实际 actions，标签不替换历史输入。老师建议攻击/右转/左转（编号 4/5/6）时权重为 3，其余为 1；加权 CE 除以有效样本的目标权重总和。
+
+新建示范目录执行第 10 节 `collect-expert` 即可同时采集行为和干净标签。旧 v2 分片仍支持读取，显式选择 `tabx_bc_target=actions` 时才以执行动作作为监督目标，并在 BC 汇总记录来源。默认 teacher_actions 模式会拒绝缺少确定性标签的数据。将已有示范转为新的标注版本，例如：
+
+```bash
+# OLD_DEMO_ROOT 是旧示范根目录；新 DEMO_ROOT 应尚未包含该任务的数据。
+python src/tabx_pipeline.py label-expert --bank "$TASK_BANK" --rule hp --task 647 \
+  --source "$OLD_DEMO_ROOT/hp/647/advanced" \
+  --output "$DEMO_ROOT/hp/647/advanced"
+```
+
+重标注不重新执行轨迹：从存储观测还原原生观测、逐步推进每个单位的老师记忆。原始动作、观测、奖励、终局保持不变，源文件不修改；新数据记录源 manifest/分片校验和、任务、物理参数及老师版本。输入与输出目录必须分开。旧 medium 对手数据不能直接转为当前 advanced 对手训练数据，仍需按当前环境重新采集。
+
+三组效果对照保持相同总计 1000 次 BC 更新、lr=0.0005、hidden_dim=128、BC batch=32。在第 10 节 `batch-train` 命令基础上，分别使用以下设置和不同 batch-id；三组可以复用同一份带干净标签的原始示范：
+
+| 对照组 | 追加设置 |
+|---|---|
+| 原版 BC | `--set tabx_dagger_rounds=0 --set tabx_bc_target=actions --set 'tabx_bc_action_weights=[1,1,1,1,1,1,1,1]'` |
+| 干净标签＋动作加权 | `--set tabx_dagger_rounds=0` |
+| 干净标签＋动作加权＋DAgger | 使用默认配置（三轮，每轮 32 局） |
+
+三组均需 `--set tabx_bc=True --set tabx_demo_root="$DEMO_ROOT"`。仅比较预训练可用 `main.py ... tabx_bc=True ... t_max=0`；注意默认模式在 online step 0 之前仍会进行三轮 DAgger 的环境交互。这些交互单独记账，预算最多为 96×512 环境步。增加 `tabx_bc_steps` 时按初始 40%、剩余在轮次间平分来分配更新次数，保持总和精确等于配置值；关闭 DAgger 后全部更新用于原始示范。
+
+最终 BC 的独立 greedy 评估还保存 `model_teacher_agreement`：在模型自己经历的留出状态上，与 ε=0 advanced 建议比较的动作一致率、各动作支持数/精确率/召回率及混淆矩阵。三组沿用同一套 `bc_holdout` seeds，DAgger 使用单独的 `dagger_collect` seeds，并检查与原始示范和留出评估无重叠。`learning-report` 输出 `bc_target`、`bc_updates`、`dagger_steps`、攻击与转向召回率以及动作一致率；DAgger 的额外交互成本应和独立胜率一起比较。
+
+进入 online QMIX 后，抽到的示范来自聚合池：TD 仍用真实动作与奖励，辅助 BC 使用同一套目标选择和加权函数；`online_bc_metrics.jsonl` 记录未加权 CE、各动作精确率/召回率与支持数。已有 TD/BC/total loss 三列语义保持不变，其中 BC loss 现在按当前显式配置的动作权重计算。所有起始权重和采集量仍需正式 647 对照验证，短流程测试只验证实现。
