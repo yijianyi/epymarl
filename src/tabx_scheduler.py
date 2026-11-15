@@ -79,6 +79,9 @@ def training_config(overrides):
                     raise ValueError(f"{key} requires a positive integer")
         target[parts[-1]] = value
         canonical[key] = value
+    if config.get("tabx_online_source"):
+        from tabx_online_start import configure_online_start
+        configure_online_start(config)
     configure_bc(config)
     if not config["save_model"] or not config["tabx_async_eval"]:
         raise ValueError("Batch training requires save_model=True and tabx_async_eval=True")

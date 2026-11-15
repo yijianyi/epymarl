@@ -35,7 +35,7 @@ def configure_cpu(threads=1, affinity=None):
         os.sched_setaffinity(0, cores)
 
 
-def build_rollout(snapshot, bank, rule, tabx_root=None, random_policy=False):
+def build_rollout(snapshot, bank, rule, tabx_root=None, random_policy=False, compatible_source=False):
     import numpy as np
     import torch
     from components.batch_schema import build_batch_schema
@@ -55,7 +55,11 @@ def build_rollout(snapshot, bank, rule, tabx_root=None, random_policy=False):
     import_tabx(tabx_root)
     task, task_manifest = load_task(bank, config["env_args"]["key"])
     task_manifest.update(TABXLayout(*validate_task_structure(task)).metadata())
-    validate_snapshot(snapshot, task_manifest, rule)
+    if compatible_source:
+        from tabx_online_start import validate_compatible_source
+        validate_compatible_source(snapshot, task_manifest, rule)
+    else:
+        validate_snapshot(snapshot, task_manifest, rule)
     config.update(device="cpu", use_cuda=False, batch_size_run=1, render=False,
                   evaluation_epsilon=0.0, test_greedy=True, test_nepisode=10**9)
     config["env_args"].update(task_bank=str(bank), tabx_root=tabx_root,
@@ -678,6 +682,30 @@ def parser():
     learning.add_argument("--seeds", default="1,2,3")
     learning.add_argument("--online-budget", type=int, default=1500000)
     learning.add_argument("--output", required=True, help="Output stem for CSV and JSON")
+    pair = common("gamma-pair", "Compare gamma=.99/.995 from one BC/DAgger checkpoint", bank=True, root=True, cpu_options=False)
+    pair.add_argument("--source", required=True, help="Concrete BC/DAgger checkpoints/0")
+    pair.add_argument("--demo-root", help="Relocated original demo root; default comes from source config")
+    pair.add_argument("--task", default="647")
+    pair.add_argument("--seed", type=int, default=1)
+    pair.add_argument("--budget", type=int, default=300000)
+    pair.add_argument("--gpus", default="0")
+    pair.add_argument("--jobs-per-gpu", type=int, default=1)
+    pair.add_argument("--eval-workers", type=int, default=2)
+    pair.add_argument("--pair-id", required=True)
+    pair.add_argument("--plan-only", action="store_true")
+    pair.add_argument("--report-only", action="store_true")
+    pair.add_argument("--resume", action="store_true")
+    diagnostic = common("diagnose-value", "Compare model/advanced joint Q and paired continuation returns", bank=True)
+    diagnostic.add_argument("--snapshot", required=True)
+    diagnostic.add_argument("--output", required=True, help="New diagnostic output directory")
+    diagnostic.add_argument("--states", type=int, default=16)
+    diagnostic.add_argument("--episodes", type=int, default=16)
+    diagnostic.add_argument("--repeats", type=int, default=4)
+    diagnostic.add_argument("--spacing", type=int, default=8)
+    diagnostic.add_argument("--seed", type=int, default=1)
+    diagnostic.add_argument("--return-tolerance", type=float, default=1e-6)
+    diagnostic.add_argument("--include-search-turns", action="store_true")
+    diagnostic.add_argument("--trajectories", action="append", default=[], help="Additional HDF5 shard or directory with manifest.json")
     return result
 
 
@@ -689,7 +717,7 @@ def main(argv=None):
         from envs.tabx_tasks import task_bank_path, file_sha256
         if file_sha256(task_bank_path(args.bank)) != args.bank_sha256:
             raise ValueError("Task bank SHA-256 mismatch")
-    for name in ("threads", "workers", "steps", "episodes", "episodes_per_tier", "shard_episodes", "poll_seconds", "lease_seconds", "online_budget"):
+    for name in ("threads", "workers", "steps", "episodes", "episodes_per_tier", "shard_episodes", "poll_seconds", "lease_seconds", "online_budget", "budget", "states", "repeats", "spacing"):
         if hasattr(args, name) and getattr(args, name) <= 0:
             raise ValueError(f"{name} must be positive")
     if args.command == "check-env":
@@ -733,6 +761,12 @@ def main(argv=None):
     elif args.command == "learning-report":
         from tabx_imitation_reporting import learning_report
         learning_report(args)
+    elif args.command == "gamma-pair":
+        from tabx_gamma_experiment import gamma_pair
+        gamma_pair(args)
+    elif args.command == "diagnose-value":
+        from tabx_value_diagnostic import diagnose_value
+        diagnose_value(args)
 
 
 if __name__ == "__main__":

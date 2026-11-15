@@ -328,6 +328,11 @@ def prepare_imitation(args, learner, runner, logger):
             actual = HeuristicTeacher(runner.env, "advanced", 0.).metadata()
             if pool.metadata["label_teacher_metadata"] != actual:
                 raise ValueError("Relabel teacher parameters/version differ from the current advanced teacher")
+    if getattr(args, "tabx_online_source", None):
+        from tabx_online_start import initialize_online
+        pool = initialize_online(learner, runner, pool, args)
+        evaluate_policy(runner, pool, args, stage="after_bc_online_step_0", compare_teacher=True)
+        return pool
     if args.tabx_dagger_rounds:
         pool = AggregatedDemonstrationPool(pool, args.seed, args.tabx_dagger_fraction)
     pretrain(learner, pool, args, logger, runner=runner)

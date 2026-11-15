@@ -456,3 +456,65 @@ python src/tabx_pipeline.py label-expert --bank "$TASK_BANK" --rule hp --task 64
 最终 BC 的独立 greedy 评估还保存 `model_teacher_agreement`：在模型自己经历的留出状态上，与 ε=0 advanced 建议比较的动作一致率、各动作支持数/精确率/召回率及混淆矩阵。三组沿用同一套 `bc_holdout` seeds，DAgger 使用单独的 `dagger_collect` seeds，并检查与原始示范和留出评估无重叠。`learning-report` 输出 `bc_target`、`bc_updates`、`dagger_steps`、攻击与转向召回率以及动作一致率；DAgger 的额外交互成本应和独立胜率一起比较。
 
 进入 online QMIX 后，抽到的示范来自聚合池：TD 仍用真实动作与奖励，辅助 BC 使用同一套目标选择和加权函数；`online_bc_metrics.jsonl` 记录未加权 CE、各动作精确率/召回率与支持数。已有 TD/BC/total loss 三列语义保持不变，其中 BC loss 现在按当前显式配置的动作权重计算。所有起始权重和采集量仍需正式 647 对照验证，短流程测试只验证实现。
+
+## 12. 动作价值诊断与 gamma 单因素对照
+
+这一轮先用现有最终模型检查动作价值排序，再从同一份 BC＋DAgger 的 online 0 步权重比较 gamma=0.99 和 0.995。诊断用配对随机种子下的真实后续收益和独立胜率；回报排序变化本身不代表训练改善。
+
+先设置两份**具体 checkpoint 目录**，例如 `checkpoints/1500123` 和同一 run 的 `checkpoints/0`。任务 JSON 仍由 `TASK_BANK` 指定。请保留完整的源 run（尤其 bc_summary.json 和 dagger/round_N），以及原始示范池；仅复制 checkpoints/0 的权重文件不足以恢复同一聚合池。原始示范根目录迁移后可通过 --demo-root 指定：
+
+```bash
+export FINAL_CHECKPOINT="/your/results/hp/647/1/<run_id>/checkpoints/<final_step>"
+export PRETRAINED_CHECKPOINT="/your/results/hp/647/1/<run_id>/checkpoints/0"
+export GAMMA_ROOT="$EPYMARL_ROOT/results/gamma-pair-647"
+```
+
+对最终模型执行诊断（CPU；输出目录必须是新目录）：
+
+```bash
+python src/tabx_pipeline.py diagnose-value --bank "$TASK_BANK" --rule hp \
+  --snapshot "$FINAL_CHECKPOINT" --output "$GAMMA_ROOT/value-diagnostic" \
+  --states 16 --episodes 16 --repeats 4 --spacing 8 --seed 1 \
+  --trajectories "$DEMO_ROOT/hp/647/advanced"
+```
+
+它从模型 greedy 对局中对接敌、攻击前、转向前的候选状态做有间隔的 reservoir 抽样，最多选 16 个；不足时报告实际数量及 `insufficient_candidate_states`，不虚构样本。若模型从不接敌，可增加 episodes，或显式加 `--include-search-turns` 纳入搜索转向状态。可以重复传 `--trajectories` 加入各个 DAgger round 的数据目录，或单个 HDF5 分片；目录须有 manifest，任务、规则、上限、模拟器和文件校验和都会校验。
+
+每个状态保存原始 episode seed、时刻、实际历史联合动作和 RNN 隐状态哈希。环境分叉包含敌方 LastVisibleTarget、模拟器状态、wrapper 的击杀/终局判定缓存；两分支共享相同的未来随机种子，第一步分别执行模型动作与 ε=0 advanced 动作，之后都由当前模型 greedy 继续。下一步 RNN 使用该分支实际执行的第一步动作，不使用另一分支或老师轨迹的历史。
+
+`value-diagnostic/report.json` 包含：两动作的 QMIX joint Q、逐次奖励、折扣回报、配对收益差均值/标准差、胜负、歼灭胜和超时胜，并对同批完整轨迹在 0.99/0.995 下重算回报排序及排序反转。预测 Q 应主要对照模型训练时的 gamma，另一个 gamma 只改变离线回报目标；当前仅支持未标准化奖励/回报的模型。旧 checkpoint 可用于此诊断和下面的预训练启动：允许 EPyMARL 源代码演进，但仍校验任务/布局、官方模拟器/参数、PyTorch/JAX 版本及模型文件。旧版没有 mixer 校验和时记录本次读取的哈希，新 checkpoint 会封存 mixer SHA-256；不把旧文件当成已有原始 mixer 完整性证明。
+
+**QMIX 的单调约束意味着 greedy 联合动作的预测 Q 本来就最大。** 因此“老师动作实际更好、Q 却没排更高”是价值排序/greedy 决策失配的证据，不能仅凭这个比例区分示范覆盖不足、优化不足还是折扣传播不足。后续回报是“当前模型继续执行”的 Monte Carlo 估计，也不是最优 Q；少量重复仍有噪声。
+
+先冻结 gamma 对照计划，不启动训练：
+
+```bash
+python src/tabx_pipeline.py gamma-pair --bank "$TASK_BANK" --rule hp \
+  --source "$PRETRAINED_CHECKPOINT" --demo-root "$DEMO_ROOT" \
+  --root "$GAMMA_ROOT" --task 647 --seed 1 --gpus 0 --eval-workers 2 \
+  --budget 300000 --pair-id gamma-647-s1-300k --plan-only
+```
+
+查看 `_gamma_pairs/gamma-647-s1-300k/pair.json`：两份有效 training_config 必须只在 gamma 上不同。默认继承源 checkpoint 的学习率、网络、更新频率、replay、探索和示范衰减等配置；共同将评估协议设为固定 128 局，种子使用源 master seed 的 `bc_holdout`，各 checkpoint、两组及 online-0 专项评估一致。原始示范 manifest、DAgger round 清单/分片与采集模型也一并封存哈希，防止两组之间数据或模型变化。
+
+去掉 `--plan-only` 即执行两组训练（当前按顺序调度）：
+
+```bash
+python src/tabx_pipeline.py gamma-pair --bank "$TASK_BANK" --rule hp \
+  --source "$PRETRAINED_CHECKPOINT" --demo-root "$DEMO_ROOT" \
+  --root "$GAMMA_ROOT" --task 647 --seed 1 --gpus 0 --eval-workers 2 \
+  --budget 300000 --pair-id gamma-647-s1-300k
+```
+
+结果在 `_gamma_pairs/<pair-id>/summary.json`，包括原始观测截止点、各 checkpoint 的 128 局胜率、歼灭胜/超时胜和首次获胜步数；未返回评估留空。两个子批次名为 `<pair-id>-g099` 和 `<pair-id>-g0995`。`--resume` 使用现有调度恢复规则：重试中断的训练会新建 attempt，**不声称恢复原 replay/优化器完整状态**。`--report-only` 根据已封存计划刷新汇总。
+
+要直接比较完整预算，开始时把 `--budget` 设为 `1500000` 并使用新的 pair-id，可在运行到约 30 万步时观察曲线；如果先跑完 30 万步，再改成 150 万步，应新建配对实验从相同的 BC-0 起点重跑，不将两个不同预算的 run 冒充连续训练。
+
+底层也支持手动从预训练模型启动在线训练：在 `main.py` 使用 `tabx_bc=True tabx_online_source=<具体checkpoints/0>`，并指向原始示范根目录。它只加载 agent/mixer 和已有聚合池，不重新执行 BC/DAgger；target 硬同步，TD 优化器、在线 replay、训练 episode index 和 t_env 全新。`online_start.json` 记录来源、参数哈希、数据哈希和恢复语义，`bc_summary.json` 明确 `bc_updates_this_run=0`。旧的 `checkpoint_path + tabx_bc=True` 仍会拒绝，避免混淆普通恢复与受控初始化。正式单因素比较优先使用 `gamma-pair`，由它继承并核对源配置。
+
+验证入口：
+
+```bash
+TABX_VALUE_SMOKE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 OMP_NUM_THREADS=1 \
+  python -m pytest -q tests/test_tabx_value_experiment.py
+```

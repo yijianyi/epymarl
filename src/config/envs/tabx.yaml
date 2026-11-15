@@ -22,6 +22,11 @@ tabx_assigned_gpu: null
 tabx_train_log: null
 # Optional advanced demonstrations -> BC -> online QMIX. Baseline is unchanged.
 tabx_bc: false
+tabx_online_source: null  # Concrete BC/DAgger checkpoints/0; skip pretraining, retain its demo pool
+tabx_source_agent_sha256: null
+tabx_source_mixer_sha256: null
+tabx_source_pool_sha256: null
+tabx_eval_seed_phase: null  # Fixed screen seeds for controlled paired experiments
 tabx_demo_root: null  # collect-expert root: <root>/<rule>/<task>/<teacher>
 tabx_bc_teacher: advanced
 tabx_bc_require_wins: true

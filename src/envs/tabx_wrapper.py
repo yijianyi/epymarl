@@ -173,6 +173,31 @@ class TABXWrapper(MultiAgentEnv):
     def get_native_observations(self):
         return {key: value.copy() for key, value in self._native_obs.items()}
 
+    def capture_state(self):
+        """Capture simulator, enemy memory, RNG and wrapper bookkeeping at a decision."""
+        import copy
+        if self.env_state is None:
+            raise RuntimeError("Reset the environment before capturing state")
+        fields = ("env_state", "_episode_key", "t", "ended", "first_kill", "last_info", "_previous_alive",
+                  "_episode_index", "_train_seed", "last_train_episode_index", "last_episode_seed")
+        return dict(task_hash=self.manifest["task_hash"], rule=self.rule, episode_limit=self.episode_limit,
+                    fields=copy.deepcopy({key: getattr(self, key) for key in fields}),
+                    native_observations=self.get_native_observations(),
+                    last_dense_reward=getattr(self, "last_dense_reward", 0.))
+
+    def restore_state(self, snapshot, *, branch_seed=None):
+        """Optionally replace only future randomness; both arms use the same seed."""
+        import copy
+        if (snapshot["task_hash"] != self.manifest["task_hash"] or snapshot["rule"] != self.rule
+                or snapshot["episode_limit"] != self.episode_limit):
+            raise ValueError("Branch snapshot belongs to a different task/rule/limit")
+        for key, value in copy.deepcopy(snapshot["fields"]).items():
+            setattr(self, key, value)
+        self.last_dense_reward = snapshot["last_dense_reward"]
+        self._cache(snapshot["native_observations"])
+        if branch_seed is not None:
+            self._episode_key = self.jax.random.PRNGKey(int(branch_seed))
+
     def get_layout_info(self):
         return self.layout.metadata()
 

@@ -24,6 +24,9 @@ from tabx_config import configure_bc
 def run(_run, _config, _log):
     # check args sanity
     _config = args_sanity_check(_config, _log)
+    if _config.get("tabx_online_source"):
+        from tabx_online_start import configure_online_start
+        configure_online_start(_config)
     configure_bc(_config)
 
     args = SN(**_config)

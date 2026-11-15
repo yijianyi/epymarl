@@ -157,6 +157,8 @@ def validate_snapshot(path, task_manifest, rule, *, check_runtime=True):
         raise ValueError("Snapshot agent SHA-256 mismatch")
     if file_sha256(path / "config.json") != manifest["config_sha256"]:
         raise ValueError("Snapshot config SHA-256 mismatch")
+    if manifest.get("mixer_sha256") and file_sha256(path / "mixer.th") != manifest["mixer_sha256"]:
+        raise ValueError("Snapshot mixer SHA-256 mismatch")
     if check_runtime:
         current = provenance()
         for library in ("epymarl", "tabx"):
@@ -200,13 +202,17 @@ def create_run(config, task_manifest):
                     simulator_contract=SIMULATOR_CONTRACT, layout_version=LAYOUT_VERSION,
                     native_shape=task_manifest["native_shape"],
                     layout={key: task_manifest[key] for key in ("native_shape", "n_ally", "n_enemy", "n_zone", "unit_slots", "native_obs_size", "native_state_size")},
-                    restored_from=config.get("checkpoint_path") or None,
+                    restored_from=config.get("tabx_online_source") or config.get("checkpoint_path") or None,
                     restore_semantics="new_attempt_with_fresh_replay_targets_rng_and_update_count",
                     deployment={"torch_device": config["device"], "jax_platforms": os.environ.get("JAX_PLATFORMS"),
                                 "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
                                 "omp_num_threads": os.environ.get("OMP_NUM_THREADS"), "pid": os.getpid(),
                                 "external_gpu": config.get("tabx_assigned_gpu"),
                                 "gpu_name": config.get("tabx_cuda_device_name")})
+    if config.get("tabx_online_source"):
+        manifest["restore_semantics"] = "pretrained_weights_and_demo_pool_fresh_online_optimizer_replay_targets_rng_counters"
+    if config.get("tabx_eval_seed_phase"):
+        manifest["eval_seed_phase"] = config["tabx_eval_seed_phase"]
     if config.get("tabx_batch_id"):
         manifest["batch_id"] = safe_component(config["tabx_batch_id"])
     if config.get("tabx_train_log"):
@@ -226,6 +232,7 @@ def evaluation_request(root, run_dir, snapshot, phase, count, *, random_policy=F
     root, run_dir = Path(root).resolve(), Path(run_dir).resolve()
     run = read_json(run_dir / "manifest.json")
     manifest = read_json(Path(snapshot) / "manifest.json")
+    seed_phase = run.get("eval_seed_phase", phase) if phase == "screen" else phase
     request = dict(schema_version="tabx-eval-1", rule=run["timeout_rule"], task_id=run["task_id"],
                 task_hash=run["task_hash"], bank_hash=run["bank_hash"], train_seed=run["train_seed"],
                 run_id=run["run_id"], run=str(run_dir.relative_to(root)),
@@ -235,7 +242,9 @@ def evaluation_request(root, run_dir, snapshot, phase, count, *, random_policy=F
                 seed_protocol=SEED_PROTOCOL,
                 simulator_contract=SIMULATOR_CONTRACT, layout_version=LAYOUT_VERSION,
                 official_tabx=run.get("provenance", {}).get("tabx", {}), native_shape=run.get("native_shape"),
-                seeds=[stable_seed(run["task_hash"], run["master_seed"], phase, i) for i in range(count)])
+                seeds=[stable_seed(run["task_hash"], run["master_seed"], seed_phase, i) for i in range(count)])
+    if seed_phase != phase:
+        request["seed_phase"] = seed_phase
     if run.get("batch_id"):
         request["batch_id"] = run["batch_id"]
     return request
@@ -271,6 +280,7 @@ class SnapshotPublisher:
                             timeout_rule=run["timeout_rule"], train_seed=run["train_seed"],
                             provenance=run["provenance"], agent_sha256=file_sha256(tmp / "agent.th"),
                             config_sha256=file_sha256(tmp / "config.json"))
+            manifest["mixer_sha256"] = file_sha256(tmp / "mixer.th") if (tmp / "mixer.th").is_file() else None
             if getattr(self.args, "tabx_bc", False):
                 manifest["policy_stage"] = "after_bc_before_online" if step == 0 else "online_qmix"
                 manifest["bc_updates"] = self.args.tabx_bc_steps
