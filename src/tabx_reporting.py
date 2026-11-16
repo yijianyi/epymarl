@@ -8,10 +8,14 @@ from pathlib import Path
 import statistics
 import tempfile
 
-TRAIN_METRICS_VERSION = "tabx-train-metrics-v3-td-bc-total"
+TRAIN_METRICS_VERSION = "tabx-train-metrics-v4-td-sources"
+
+TD_SOURCE_FIELDS = tuple(f"{source}_{metric}" for source in ("legacy_demo", "success_td", "online")
+                         for metric in ("episodes", "transitions", "loss", "q_taken_mean", "target_mean")) + (
+                             "success_td_episode_fraction", "success_td_transition_fraction", "bc_episodes")
 
 TRAIN_FIELDS = ("t_env", "learner_updates", "loss", "td_error_abs", "grad_norm_before_clip",
-                "grad_norm_clip", "q_taken_mean", "target_mean", "lr", "bc_loss", "bc_weight", "total_loss")
+                "grad_norm_clip", "q_taken_mean", "target_mean", "lr", "bc_loss", "bc_weight", "total_loss") + TD_SOURCE_FIELDS
 EVAL_FIELDS = ("request_id", "checkpoint_step", "phase", "action_selection", "episodes", "wins",
                "win_rate_pct", "mean_return", "return_std", "elimination_wins", "timeout_wins", "pure_timeouts")
 
@@ -272,6 +276,10 @@ def train_line(rule, task, seed, gpu, row):
     if row.get("total_loss") not in (None, ""):
         bc_loss = "" if row.get("bc_loss") in (None, "") else f"{float(row['bc_loss']):.6g}"
         losses += f"bc_loss={bc_loss} bc_weight={float(row['bc_weight']):.6g} total_loss={float(row['total_loss']):.6g} "
+    if row.get("success_td_episodes") not in (None, ""):
+        losses += (f"success_td_episodes={row['success_td_episodes']} online_episodes={row['online_episodes']} "
+                   f"success_td_transition_fraction={float(row['success_td_transition_fraction']):.6g} "
+                   f"bc_episodes={row['bc_episodes']} ")
     # Old rows keep their original loss label and meaning, including mixed BC.
     return (f"[TRAIN] rule={rule} task={task} seed={seed} gpu={gpu} step={row['t_env']} "
             f"updates={row['learner_updates']} {losses}"

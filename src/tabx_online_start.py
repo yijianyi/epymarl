@@ -66,7 +66,7 @@ def configure_online_start(config):
         config[key] = hashes[name]
 
 
-def pool_fingerprint(snapshot, demo_root):
+def pool_inventory(snapshot, demo_root):
     path, manifest, config, _ = source_inventory(snapshot)
     run = path.parent.parent
     summary_path = run / "bc_summary.json"
@@ -85,13 +85,17 @@ def pool_fingerprint(snapshot, demo_root):
             actual = file_sha256(directory / entry["path"])
             if actual != entry["sha256"]:
                 raise ValueError(f"Source pool shard checksum mismatch: {entry['path']}")
-            files.append((entry["path"], actual))
+            files.append([entry["path"], actual])
         if directory != original:
             metadata = data["metadata"]
             if file_sha256(directory / metadata["collector_checkpoint"]) != metadata["collector_checkpoint_sha256"]:
                 raise ValueError("Source DAgger collector changed")
         inventory.append(dict(manifest_sha256=digest, shards=sorted(files)))
-    payload = dict(bc_summary_sha256=file_sha256(summary_path), pools=inventory)
+    return dict(bc_summary_sha256=file_sha256(summary_path), pools=inventory)
+
+
+def pool_fingerprint(snapshot, demo_root):
+    payload = pool_inventory(snapshot, demo_root)
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 

@@ -518,3 +518,42 @@ python src/tabx_pipeline.py gamma-pair --bank "$TASK_BANK" --rule hp \
 TABX_VALUE_SMOKE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 OMP_NUM_THREADS=1 \
   python -m pytest -q tests/test_tabx_value_experiment.py
 ```
+
+## 13. 原示范退出后持续使用成功轨迹做 TD
+
+新增 `tabx_td_success_fraction`，默认 `0.0` 保持原有采样。设为 `0.25` 时，先完整沿用原示范/辅助 BC 调度；只有原调度返回整数 `demo_count == 0` 后，才改用原始老师的胜局参与 TD。batch=32 时为 8 局成功示范＋24 局在线 replay，每个在线回合仍最多更新一次。默认衰减设置约在 93,750 步触发，实际启用步数是满足条件并执行更新的首个回合终点。epsilon 和辅助 BC 衰减不变，整数示范数为零时辅助 BC 不再计算。
+
+成功采样只使用原始老师池的 `wins`，歼灭胜和超时胜都纳入，有放回均匀抽取完整回合；DAgger 仍属于原聚合池。新采样器独立使用任务哈希、训练 seed 和 `td_success_replay` 派生 RNG，不消耗 BC/DAgger 或在线 replay 的 RNG。源池没有胜局时明确报错。比例须有限且位于 `[0,1)`；正比例按回合数四舍五入，再限定为至少 1 局成功示范和至少 1 局在线数据。
+
+两类数据均使用实际 `actions`、奖励和终局做原有一步 TD 更新，RNN 上一动作也来自实际执行动作。成功 TD 数据的 `teacher_actions` 不参与辅助 BC。统一优化目标仍按整个拼接 batch 的有效 transition 平均，不额外加权成功样本。
+
+先封存 647、seed=1 的 30 万步单因素对照计划：
+
+```bash
+export TD_SUCCESS_ROOT="$EPYMARL_ROOT/results/td-success-pair-647"
+python "$EPYMARL_ROOT/src/tabx_pipeline.py" td-success-pair \
+  --bank "$TASK_BANK" --rule hp \
+  --source "$PRETRAINED_CHECKPOINT" --demo-root "$DEMO_ROOT" \
+  --root "$TD_SUCCESS_ROOT" --task 647 --seed 1 --gpus 0 --eval-workers 2 \
+  --budget 300000 --pair-id td-success-647-s1-300k --plan-only
+```
+
+`PRETRAINED_CHECKPOINT` 指完整源 run 的 `checkpoints/0`，保留该 run 的 `bc_summary.json`、全部 DAgger rounds/采集权重和原始示范。`_td_success_pairs/<pair-id>/pair.json` 保存同一份 agent/mixer 文件哈希、原始与 DAgger 清单/分片哈希、两份有效配置和固定 128 个 `bc_holdout` 评估 seeds。两组 gamma 都固定为 0.99，有效配置必须仅 `tabx_td_success_fraction=0/0.25` 不同；学习率、网络、总 batch、探索、示范调度等继承源配置。
+
+查看计划后，使用同一条命令去掉 `--plan-only` 执行。两组按顺序调度，子批次为 `<pair-id>-td0`、`<pair-id>-td025`。加载同一预训练模型并保留同一聚合示范池，跳过新的 BC/DAgger，在线优化器/replay/计数器全新、target 硬同步。`--resume` 沿用批次恢复语义，失败训练的新 attempt 从相同预训练起点重跑，不恢复中断处的 replay、成功采样 RNG 或优化器。已完成的 attempt 不重跑。
+
+检查各 run 的：
+
+- `td_success_pool.json`：实验组成功池大小、原始 manifest SHA-256、独立采样 seed、实际启用步数；尚未启用时步数为 null。
+- `td_source_metrics.jsonl`：每次更新的原示范/成功 TD/在线回合数、有效 transition 数、各组 TD loss、`q_taken_mean`、`target_mean`，以及成功回合/transition 比例、BC 样本数/权重和统一总损失。没有对应样本的组，其 loss/均值为 null。
+- `train_metrics.csv`：按原日志间隔保存上述分组指标，版本为 `tabx-train-metrics-v4-td-sources`；历史文件保持原字段和口径，不追加新 schema。
+- `_td_success_pairs/<pair-id>/summary.json`：相同回合终点预算下的独立胜率、平均回报、歼灭胜/超时胜、首次获胜步数、样本累计次数及启用信息。`--report-only` 可根据已封存计划刷新；未完成的评估不记为零胜。
+
+`0.25` 是回合比例，成功局较短时有效 transition 比例可能更低。分组 TD loss 仅作诊断，最终独立胜率及真实收益仍需正式对照验证。需要复查价值判断时，可对两组最终 checkpoint 分别运行第 12 节的 `diagnose-value`。
+
+验证入口（包含真实小环境的采集、BC/DAgger、两组在线训练和恢复）：
+
+```bash
+TABX_TD_SUCCESS_SMOKE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+  python -m pytest -q tests/test_tabx_td_success.py
+```

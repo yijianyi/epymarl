@@ -314,6 +314,8 @@ def evaluate_policy(runner, pool, args, *, stage, compare_teacher=False):
 def prepare_imitation(args, learner, runner, logger):
     directory = Path(args.tabx_demo_root).expanduser() / runner.env.rule / str(runner.env.manifest["task_id"]) / args.tabx_bc_teacher
     pool = DemonstrationPool(directory, runner.env, args.seed, args.tabx_bc_win_fraction, args.tabx_bc_require_wins, args.tabx_bc_target)
+    if getattr(args, "tabx_td_success_fraction", 0.) > 0 and not pool.wins:
+        raise ValueError("Success TD replay requires winning episodes in the original teacher pool")
     from tabx_expert import HeuristicTeacher
     teacher_metadata = HeuristicTeacher(runner.env, pool.metadata["teacher"], pool.metadata["teacher_epsilon"]).metadata()
     for key, value in teacher_metadata.items():

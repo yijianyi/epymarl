@@ -46,3 +46,4 @@ tabx_bc_epsilon_finish: 0.05
 tabx_demo_fraction: 0.25
 tabx_demo_bc_weight: 1.0
 tabx_demo_decay_steps: 100000
+tabx_td_success_fraction: 0.0  # Original teacher wins for TD only, after legacy demo_count reaches zero

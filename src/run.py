@@ -222,6 +222,12 @@ def run_sequential(args, logger):
             os.makedirs(save_path, exist_ok=True)
             learner.save_models(save_path)
 
+    success_td_pool = None
+    if getattr(args, "tabx_td_success_fraction", 0.) > 0:
+        from tabx_td_success import SuccessTDPool
+        success_td_pool = SuccessTDPool(demo_pool, runner.env.manifest["task_hash"], args.seed)
+        success_td_pool.publish(args.tabx_run_dir)
+
     publisher = None
     if async_tabx:
         from tabx_storage import SnapshotPublisher
@@ -257,17 +263,24 @@ def run_sequential(args, logger):
                 stream.write(json.dumps(record, sort_keys=True, allow_nan=False) + "\n")
         buffer.insert_episode_batch(episode_batch)
 
-        demo_sample = None
+        legacy_demo_batch, success_td_batch = None, None
         demo_count, bc_weight = 0, 0.
         if demo_pool is not None:
             from tabx_imitation import demonstration_schedule, mix_batches
             demo_count, bc_weight = demonstration_schedule(args, runner.t_env)
-        online_count = args.batch_size - demo_count
+            from tabx_td_success import td_batch_counts
+            demo_count, success_count, online_count = td_batch_counts(args, demo_count)
+        else:
+            success_count, online_count = 0, args.batch_size
         if buffer.can_sample(online_count):
             episode_sample = buffer.sample(online_count)
+            if success_count:
+                success_td_pool.activate(runner.t_env)
+                success_td_batch = success_td_pool.sample(success_count, episode_sample.device)
+                episode_sample = mix_batches(success_td_batch, episode_sample)
             if demo_count:
-                demo_sample = demo_pool.sample(demo_count, episode_sample.device)
-                episode_sample = mix_batches(demo_sample, episode_sample)
+                legacy_demo_batch = demo_pool.sample(demo_count, episode_sample.device)
+                episode_sample = mix_batches(legacy_demo_batch, episode_sample)
 
             # Truncate batch to only filled timesteps
             max_ep_t = episode_sample.max_t_filled()
@@ -275,13 +288,14 @@ def run_sequential(args, logger):
 
             if episode_sample.device != args.device:
                 episode_sample.to(args.device)
-            if demo_sample is not None:
-                demo_sample.to(args.device)
+            if legacy_demo_batch is not None:
+                legacy_demo_batch.to(args.device)
 
             if demo_pool is None:
                 learner.train(episode_sample, runner.t_env, episode)
             else:
-                learner.train(episode_sample, runner.t_env, episode, demo_batch=demo_sample, bc_weight=bc_weight)
+                learner.train(episode_sample, runner.t_env, episode, demo_batch=legacy_demo_batch, bc_weight=bc_weight,
+                              td_counts=(demo_count, success_count, online_count))
                 logger.log_stat("demonstration_batch_episodes", demo_count, runner.t_env)
                 logger.log_stat("demonstration_bc_weight", bc_weight if demo_count else 0., runner.t_env)
             if async_tabx:

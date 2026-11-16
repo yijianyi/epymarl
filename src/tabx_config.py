@@ -2,7 +2,23 @@
 import math
 
 
+def success_td_count(config):
+    """Episode allocation, rounded to nearest and bounded to retain online data."""
+    fraction = config.get("tabx_td_success_fraction", 0.0)
+    if isinstance(fraction, bool) or not isinstance(fraction, (int, float)) or not math.isfinite(fraction) or not 0 <= fraction < 1:
+        raise ValueError("tabx_td_success_fraction must be finite and in [0,1)")
+    if not fraction:
+        return 0
+    if not config.get("tabx_bc", False):
+        raise ValueError("Success TD replay requires tabx_bc=True and an original demonstration pool")
+    size = config["batch_size"]
+    if isinstance(size, bool) or not isinstance(size, int) or size < 2:
+        raise ValueError("Success TD replay requires batch_size>=2")
+    return min(size - 1, max(1, int(size * fraction + .5)))
+
+
 def configure_bc(config):
+    success_td_count(config)
     if not config.get("tabx_bc", False):
         return config
     if (config["env"] != "tabx" or config["learner"] != "q_learner" or config["mixer"] != "qmix"

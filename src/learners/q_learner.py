@@ -48,7 +48,7 @@ class QLearner:
             rew_shape = (1,) if self.args.common_reward else (self.n_agents,)
             self.rew_ms = RunningMeanStd(shape=rew_shape, device=device)
 
-    def train(self, batch: EpisodeBatch, t_env: int, episode_num: int, *, demo_batch=None, bc_weight=0.0):
+    def train(self, batch: EpisodeBatch, t_env: int, episode_num: int, *, demo_batch=None, bc_weight=0.0, td_counts=None):
         # Get the relevant quantities
         rewards = batch["reward"][:, :-1]
         actions = batch["actions"][:, :-1]
@@ -156,6 +156,18 @@ class QLearner:
                 with (Path(self.args.tabx_run_dir) / "online_bc_metrics.jsonl").open("a", encoding="utf-8") as stream:
                     stream.write(json.dumps(dict(t_env=t_env, **bc_metrics)) + "\n")
 
+        source_metrics = {}
+        if td_counts is not None:
+            from tabx_td_success import td_source_metrics
+            source_metrics = td_source_metrics(td_error, chosen_action_qvals, targets, mask, td_counts)
+            source_metrics["bc_episodes"] = demo_batch.batch_size if demo_batch is not None and effective_bc_weight > 0 else 0
+            import json
+            from pathlib import Path
+            with (Path(self.args.tabx_run_dir) / "td_source_metrics.jsonl").open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(dict(t_env=int(t_env), learner_updates=self.training_steps + 1,
+                    loss=float(td_loss.detach()), bc_weight=effective_bc_weight,
+                    total_loss=float(total_loss.detach()), **source_metrics), allow_nan=False) + "\n")
+
         # Optimise
         self.optimiser.zero_grad()
         total_loss.backward()
@@ -183,6 +195,7 @@ class QLearner:
                            target_mean=(targets * mask).sum().item() / mask_elems)
             if bc_loss is not None:
                 scalars["bc_loss"] = bc_loss.item()
+            scalars.update({key: value for key, value in source_metrics.items() if value is not None})
             for name, value in scalars.items():
                 self.logger.log_stat(name, value, t_env)
             if getattr(self.args, "env", None) == "tabx":
@@ -194,7 +207,7 @@ class QLearner:
                     bc_loss=scalars.get("bc_loss"), bc_weight=effective_bc_weight, total_loss=scalars["total_loss"],
                     grad_norm_before_clip=scalars["grad_norm"], grad_norm_clip=self.args.grad_norm_clip,
                     q_taken_mean=scalars["q_taken_mean"], target_mean=scalars["target_mean"],
-                    lr=self.optimiser.param_groups[0]["lr"]))
+                    lr=self.optimiser.param_groups[0]["lr"], **source_metrics))
             self.log_stats_t = t_env
 
     def _update_targets_hard(self):

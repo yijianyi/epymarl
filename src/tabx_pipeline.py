@@ -682,19 +682,21 @@ def parser():
     learning.add_argument("--seeds", default="1,2,3")
     learning.add_argument("--online-budget", type=int, default=1500000)
     learning.add_argument("--output", required=True, help="Output stem for CSV and JSON")
-    pair = common("gamma-pair", "Compare gamma=.99/.995 from one BC/DAgger checkpoint", bank=True, root=True, cpu_options=False)
-    pair.add_argument("--source", required=True, help="Concrete BC/DAgger checkpoints/0")
-    pair.add_argument("--demo-root", help="Relocated original demo root; default comes from source config")
-    pair.add_argument("--task", default="647")
-    pair.add_argument("--seed", type=int, default=1)
-    pair.add_argument("--budget", type=int, default=300000)
-    pair.add_argument("--gpus", default="0")
-    pair.add_argument("--jobs-per-gpu", type=int, default=1)
-    pair.add_argument("--eval-workers", type=int, default=2)
-    pair.add_argument("--pair-id", required=True)
-    pair.add_argument("--plan-only", action="store_true")
-    pair.add_argument("--report-only", action="store_true")
-    pair.add_argument("--resume", action="store_true")
+    for command, description in (("gamma-pair", "Compare gamma=.99/.995 from one BC/DAgger checkpoint"),
+                                 ("td-success-pair", "Compare success TD fraction=0/.25 at gamma=.99")):
+        pair = common(command, description, bank=True, root=True, cpu_options=False)
+        pair.add_argument("--source", required=True, help="Concrete BC/DAgger checkpoints/0")
+        pair.add_argument("--demo-root", help="Relocated original demo root; default comes from source config")
+        pair.add_argument("--task", default="647")
+        pair.add_argument("--seed", type=int, default=1)
+        pair.add_argument("--budget", type=int, default=300000)
+        pair.add_argument("--gpus", default="0")
+        pair.add_argument("--jobs-per-gpu", type=int, default=1)
+        pair.add_argument("--eval-workers", type=int, default=2)
+        pair.add_argument("--pair-id", required=True)
+        pair.add_argument("--plan-only", action="store_true")
+        pair.add_argument("--report-only", action="store_true")
+        pair.add_argument("--resume", action="store_true")
     diagnostic = common("diagnose-value", "Compare model/advanced joint Q and paired continuation returns", bank=True)
     diagnostic.add_argument("--snapshot", required=True)
     diagnostic.add_argument("--output", required=True, help="New diagnostic output directory")
@@ -761,7 +763,7 @@ def main(argv=None):
     elif args.command == "learning-report":
         from tabx_imitation_reporting import learning_report
         learning_report(args)
-    elif args.command == "gamma-pair":
+    elif args.command in ("gamma-pair", "td-success-pair"):
         from tabx_gamma_experiment import gamma_pair
         gamma_pair(args)
     elif args.command == "diagnose-value":

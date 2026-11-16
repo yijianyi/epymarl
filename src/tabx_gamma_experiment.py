@@ -1,4 +1,4 @@
-"""Seal and run a gamma-only online QMIX comparison from identical BC/DAgger weights."""
+"""Seal single-factor online QMIX comparisons from identical BC/DAgger weights."""
 from pathlib import Path
 import json
 
@@ -15,7 +15,7 @@ def _flatten(config, prefix=""):
 
 
 def make_pair_plan(args):
-    from tabx_online_start import source_inventory, pool_fingerprint
+    from tabx_online_start import source_inventory, pool_fingerprint, pool_inventory
     from tabx_scheduler import PROTECTED, training_config
     from envs.tabx_tasks import load_task
     path, manifest, saved, hashes = source_inventory(args.source)
@@ -44,9 +44,14 @@ def make_pair_plan(args):
         tabx_source_agent_sha256=hashes["agent.th"], tabx_source_mixer_sha256=hashes["mixer.th"],
         tabx_source_pool_sha256=fingerprint, tabx_screen_episodes=128, tabx_bc_eval_episodes=128,
         tabx_eval_seed_phase="bc_holdout", t_max=args.budget)
+    success_pair = args.command == "td-success-pair"
+    treatment = "tabx_td_success_fraction" if success_pair else "gamma"
+    arms = ((0., "td0"), (.25, "td025")) if success_pair else ((.99, "g099"), (.995, "g0995"))
+    if success_pair:
+        overrides["gamma"] = .99
     configs, commands = [], []
-    for gamma, suffix in ((.99, "g099"), (.995, "g0995")):
-        settings = [f"{key}={value!r}" for key, value in sorted(dict(overrides, gamma=gamma).items())]
+    for value, suffix in arms:
+        settings = [f"{key}={value!r}" for key, value in sorted(dict(overrides, **{treatment: value}).items())]
         config, _ = training_config(settings)
         configs.append(config)
         commands.append(["batch-train", "--bank", str(Path(args.bank).expanduser().resolve()), "--root", str(root),
@@ -54,11 +59,14 @@ def make_pair_plan(args):
             "--jobs-per-gpu", str(args.jobs_per_gpu), "--eval-workers", str(args.eval_workers),
             "--batch-id", f"{args.pair_id}-{suffix}", *sum((["--set", setting] for setting in settings), [])])
     differences = [key for key in configs[0] if configs[0][key] != configs[1][key]]
-    if differences != ["gamma"]:
-        raise RuntimeError(f"Gamma-only treatment violated: {differences}")
-    return dict(schema_version="tabx-gamma-pair-1", pair_id=args.pair_id, task_id=args.task, rule=args.rule,
+    if differences != [treatment]:
+        raise RuntimeError(f"Single-factor treatment violated: {differences}")
+    return dict(schema_version="tabx-td-success-pair-1" if success_pair else "tabx-gamma-pair-1",
+        treatment_key=treatment, arms=[dict(value=value, suffix=suffix) for value, suffix in arms],
+        pair_id=args.pair_id, task_id=args.task, rule=args.rule,
         seed=args.seed, budget=args.budget, source_snapshot=str(path), source_hashes=hashes,
-        source_pool_sha256=fingerprint, evaluation_episodes=128, seed_phase="bc_holdout",
+        source_pool_sha256=fingerprint, source_pool_inventory=pool_inventory(path, demo_root),
+        evaluation_episodes=128, seed_phase="bc_holdout",
         evaluation_seeds=[stable_seed(task["task_hash"], saved.get("tabx_master_seed", 0), "bc_holdout", i) for i in range(128)],
         treatment_differences=differences, training_configs=configs, commands=commands,
         shared_protocol_overrides=dict(t_max=args.budget, screen_episodes=128, bc_eval_episodes=128))
@@ -67,10 +75,13 @@ def make_pair_plan(args):
 def summarize_pair(root, plan):
     from tabx_reporting import read_csv
     results = []
-    for suffix, gamma in (("g099", .99), ("g0995", .995)):
+    treatment = plan.get("treatment_key", "gamma")
+    arms = plan.get("arms", [dict(value=.99, suffix="g099"), dict(value=.995, suffix="g0995")])
+    for arm in arms:
+        suffix, value = arm["suffix"], arm["value"]
         state_path = Path(root) / "_batches" / plan["rule"] / f"{plan['pair_id']}-{suffix}" / "state.json"
         if not state_path.exists():
-            results.append(dict(gamma=gamma, status="not_started"))
+            results.append({treatment: value, "status": "not_started"})
             continue
         state = read_json(state_path)
         job = state["jobs"][0]
@@ -79,18 +90,28 @@ def summarize_pair(root, plan):
         row = summarize_run(run, plan["budget"])
         evaluations = [entry for entry in read_csv(run / "eval_summary.csv") if entry["phase"] == "screen"
                        and int(entry["checkpoint_step"]) <= row["cutoff_step"]]
-        row.update(gamma=gamma, evaluations=[{key: entry[key] for key in
+        row.update({treatment: value}, evaluations=[{key: entry[key] for key in
             ("checkpoint_step", "episodes", "wins", "win_rate_pct", "elimination_wins", "timeout_wins", "mean_return")}
             for entry in sorted(evaluations, key=lambda x: int(x["checkpoint_step"]))])
         if (run / "online_start.json").exists():
             row["online_start"] = read_json(run / "online_start.json")
+        if (run / "td_success_pool.json").exists():
+            row["success_td_pool"] = read_json(run / "td_success_pool.json")
+        metrics_path = run / "td_source_metrics.jsonl"
+        if metrics_path.exists():
+            from tabx_reporting import read_episodes
+            metrics = [m for m in read_episodes(metrics_path) if m["t_env"] <= row["cutoff_step"]]
+            row["td_sampling"] = dict(updates=len(metrics),
+                sampled_episodes={source: sum(m[f"{source}_episodes"] for m in metrics)
+                                  for source in ("legacy_demo", "success_td", "online")},
+                latest=metrics[-1] if metrics else None)
         results.append(row)
     available = [row["online_start"] for row in results if "online_start" in row]
     if len(available) == 2:
         for key in ("agent_parameter_sha256", "mixer_parameter_sha256", "source_pool_sha256"):
             if available[0][key] != available[1][key]:
                 raise RuntimeError(f"Paired initial models/pools differ: {key}")
-    return dict(pair_id=plan["pair_id"], treatment="gamma_only", results=results,
+    return dict(pair_id=plan["pair_id"], treatment=f"{treatment}_only", results=results,
                 notes="Compare identical observed endpoint budgets and completed fixed-seed evaluations; no missing eval is counted as zero.")
 
 
@@ -99,7 +120,8 @@ def gamma_pair(args):
     from tabx_scheduler import batch_train
     from tabx_storage import safe_component
     safe_component(args.pair_id)
-    directory = Path(args.root).expanduser().resolve() / "_gamma_pairs" / args.pair_id
+    namespace = "_td_success_pairs" if args.command == "td-success-pair" else "_gamma_pairs"
+    directory = Path(args.root).expanduser().resolve() / namespace / args.pair_id
     path = directory / "pair.json"
     if args.report_only:
         atomic_json(directory / "summary.json", summarize_pair(args.root, read_json(path)))
@@ -107,7 +129,7 @@ def gamma_pair(args):
     plan = make_pair_plan(args)
     if path.exists():
         if read_json(path) != plan:
-            raise ValueError("Existing gamma pair differs from requested frozen protocol")
+            raise ValueError("Existing pair differs from requested frozen protocol")
     else:
         atomic_json(path, plan)
     if args.plan_only:
