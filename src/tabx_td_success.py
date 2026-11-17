@@ -63,3 +63,67 @@ def td_source_metrics(td_error, q_taken, targets, mask, counts):
     result["success_td_episode_fraction"] = counts[1] / offset
     result["success_td_transition_fraction"] = result["success_td_transitions"] / total_transitions if total_transitions else 0.
     return result
+
+
+DISTANCE_BINS = (("terminal", 1, 1), ("near", 2, 5), ("middle", 6, 20),
+                 ("earlier", 21, 50), ("far", 51, None))
+
+
+def distance_metrics(q_taken, targets, rewards, mask, terminated, gamma, counts, wins):
+    """Complete executed histories only. G is the behavior return, not policy Q*."""
+    def array(value):
+        return value.detach().cpu().double().numpy()
+    valid = array(mask)[:, :, 0] > 0
+    lengths = valid.sum(1)
+    if not np.array_equal(valid, np.arange(valid.shape[1])[None] < lengths[:, None]):
+        raise ValueError("Distance diagnostics require contiguous complete trajectories")
+    ends = array(terminated)[:, :, 0] > 0
+    if any(length < 1 or not ends[i, length-1] for i, length in enumerate(lengths)):
+        raise ValueError("Distance diagnostics require actual terminal transitions")
+    reward = array(rewards).mean(-1)
+    q = array(q_taken).mean(-1)
+    target = array(targets).mean(-1) if targets is not None else None
+    returns = np.zeros_like(reward)
+    for i, length in enumerate(lengths):
+        total = 0.
+        for t in range(int(length)-1, -1, -1):
+            total = reward[i, t] + gamma * total
+            returns[i, t] = total
+    values = dict(q_taken_mean=q, reward_mean=reward, trajectory_return_mean=returns)
+    if target is not None:
+        error = q - target
+        values.update(target_mean=target, td_error_mean=error, td_error_abs_mean=np.abs(error), td_loss=error**2)
+    else:
+        values.update({key: None for key in ("target_mean", "td_error_mean", "td_error_abs_mean", "td_loss")})
+    distance = lengths[:, None] - np.arange(valid.shape[1])[None]
+    groups, offset = {}, 0
+    for name, count in zip(("legacy_demo", "success_td", "online"), counts):
+        selected = np.zeros(len(lengths), dtype=bool)
+        selected[offset:offset+count] = True
+        groups[name] = selected
+        if name == "online":
+            outcomes = array(wins).reshape(-1)
+            if len(outcomes) != len(lengths) or not np.isin(outcomes[selected], [0, 1]).all():
+                raise ValueError("Online diagnostic outcomes must be recorded, not inferred from rewards")
+            groups.update(online_win=selected & (outcomes == 1), online_loss=selected & (outcomes == 0))
+        offset += count
+    if offset != len(lengths):
+        raise ValueError("Distance source counts do not match batch size")
+    result = {}
+    for source, episodes in groups.items():
+        result[source] = {}
+        for name, lo, hi in (("all", 1, None), *DISTANCE_BINS):
+            selection = valid & episodes[:, None] & (distance >= lo)
+            if hi is not None:
+                selection &= distance <= hi
+            steps = int(selection.sum())
+            result[source][name] = dict(valid_steps=steps, trajectories=int(selection.any(1).sum()),
+                **{key: float(value[selection].mean()) if steps and value is not None else None for key, value in values.items()})
+    return result
+
+
+def gradient_norm(parameters):
+    """Read pre-clip gradients without changing them or consuming RNG."""
+    import torch as th
+    terms = [p.grad.detach().double().square().sum() for p in parameters if p.grad is not None]
+    return float(th.stack(terms).sum().sqrt()) if terms else 0.

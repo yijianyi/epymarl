@@ -19,6 +19,16 @@ def success_td_count(config):
 
 def configure_bc(config):
     success_td_count(config)
+    interval = config.get("tabx_td_diagnostic_interval", 50)
+    if isinstance(interval, bool) or not isinstance(interval, int) or interval <= 0:
+        raise ValueError("tabx_td_diagnostic_interval must be a positive integer")
+    if not isinstance(config.get("tabx_td_diagnostics", False), bool):
+        raise ValueError("tabx_td_diagnostics must be a boolean")
+    if config.get("tabx_td_diagnostics", False):
+        if config.get("env") != "tabx" or config.get("learner") != "q_learner" or config.get("mixer") != "qmix":
+            raise ValueError("TD diagnostics require TABX QLearner/QMIX")
+        if config.get("standardise_returns") or config.get("standardise_rewards"):
+            raise ValueError("TD diagnostics require unstandardized rewards/returns")
     if not config.get("tabx_bc", False):
         return config
     if (config["env"] != "tabx" or config["learner"] != "q_learner" or config["mixer"] != "qmix"

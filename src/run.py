@@ -136,6 +136,8 @@ def run_sequential(args, logger):
     args.state_shape = env_info["state_shape"]
 
     scheme, groups, preprocess = build_batch_schema(env_info, args.common_reward)
+    if getattr(args, "tabx_td_diagnostics", False):
+        scheme["episode_win"] = {"vshape": (1,), "dtype": th.uint8, "episode_const": True}
 
     buffer = ReplayBuffer(
         scheme,
@@ -261,6 +263,9 @@ def run_sequential(args, logger):
                           **runner.last_episode_info)
             with (Path(args.tabx_run_dir) / "training_episodes.jsonl").open("a", encoding="utf-8") as stream:
                 stream.write(json.dumps(record, sort_keys=True, allow_nan=False) + "\n")
+        if "episode_win" in episode_batch.scheme:
+            episode_batch.update({"episode_win": th.tensor([[int(runner.last_episode_info["is_win"])]],
+                dtype=th.uint8, device=episode_batch.device)}, mark_filled=False)
         buffer.insert_episode_batch(episode_batch)
 
         legacy_demo_batch, success_td_batch = None, None

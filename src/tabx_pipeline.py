@@ -702,12 +702,35 @@ def parser():
     diagnostic.add_argument("--output", required=True, help="New diagnostic output directory")
     diagnostic.add_argument("--states", type=int, default=16)
     diagnostic.add_argument("--episodes", type=int, default=16)
-    diagnostic.add_argument("--repeats", type=int, default=4)
+    diagnostic.add_argument("--repeats", type=int, default=8)
     diagnostic.add_argument("--spacing", type=int, default=8)
     diagnostic.add_argument("--seed", type=int, default=1)
     diagnostic.add_argument("--return-tolerance", type=float, default=1e-6)
     diagnostic.add_argument("--include-search-turns", action="store_true")
     diagnostic.add_argument("--trajectories", action="append", default=[], help="Additional HDF5 shard or directory with manifest.json")
+    propagation = common("diagnose-propagation", "Replay fixed original winning trajectories at saved checkpoints", bank=True)
+    source = propagation.add_mutually_exclusive_group(required=True)
+    source.add_argument("--snapshots", nargs="+", help="Concrete saved checkpoint directories")
+    source.add_argument("--run", help="Select nearest published checkpoints from this run")
+    propagation.add_argument("--steps", default="0,100000,200000,300000")
+    propagation.add_argument("--demo-dir", required=True, help="Original dataset directory containing manifest.json")
+    propagation.add_argument("--output", required=True, help="New report directory")
+    propagation.add_argument("--panel", help="Create/reuse an immutable trajectory inventory JSON")
+    propagation.add_argument("--batch-size", type=int, default=16)
+    panel = common("value-panel", "Freeze states visited by initial/final models", bank=True)
+    panel.add_argument("--snapshots", nargs=2, required=True, help="Initial and final concrete checkpoints")
+    panel.add_argument("--panel", required=True, help="New immutable JSON panel")
+    panel.add_argument("--states", type=int, default=16, help="States per source checkpoint")
+    panel.add_argument("--episodes", type=int, default=16)
+    panel.add_argument("--spacing", type=int, default=8)
+    panel.add_argument("--seed", type=int, default=1)
+    panel.add_argument("--include-search-turns", action="store_true")
+    comparison = common("diagnose-value-panel", "Evaluate each model on one frozen state panel", bank=True)
+    comparison.add_argument("--panel", required=True)
+    comparison.add_argument("--snapshots", nargs="+", required=True)
+    comparison.add_argument("--output", required=True, help="New report directory")
+    comparison.add_argument("--repeats", type=int, default=8)
+    comparison.add_argument("--bootstrap-samples", type=int, default=1000)
     return result
 
 
@@ -719,8 +742,8 @@ def main(argv=None):
         from envs.tabx_tasks import task_bank_path, file_sha256
         if file_sha256(task_bank_path(args.bank)) != args.bank_sha256:
             raise ValueError("Task bank SHA-256 mismatch")
-    for name in ("threads", "workers", "steps", "episodes", "episodes_per_tier", "shard_episodes", "poll_seconds", "lease_seconds", "online_budget", "budget", "states", "repeats", "spacing"):
-        if hasattr(args, name) and getattr(args, name) <= 0:
+    for name in ("threads", "workers", "steps", "episodes", "episodes_per_tier", "shard_episodes", "poll_seconds", "lease_seconds", "online_budget", "budget", "states", "repeats", "spacing", "batch_size", "bootstrap_samples"):
+        if hasattr(args, name) and isinstance(getattr(args, name), (int, float)) and getattr(args, name) <= 0:
             raise ValueError(f"{name} must be positive")
     if args.command == "check-env":
         check_env(args)
@@ -769,6 +792,15 @@ def main(argv=None):
     elif args.command == "diagnose-value":
         from tabx_value_diagnostic import diagnose_value
         diagnose_value(args)
+    elif args.command == "diagnose-propagation":
+        from tabx_propagation_diagnostic import diagnose_propagation
+        diagnose_propagation(args)
+    elif args.command == "value-panel":
+        from tabx_state_panel import create_value_panel
+        create_value_panel(args)
+    elif args.command == "diagnose-value-panel":
+        from tabx_state_panel import evaluate_value_panel
+        evaluate_value_panel(args)
 
 
 if __name__ == "__main__":

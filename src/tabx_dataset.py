@@ -285,6 +285,7 @@ def episodes_to_batch(episodes, device="cpu"):
     for name, (dtype, shape) in LABEL_FIELDS.items():
         scheme[name] = {"vshape": (1,), "group": "agents", "dtype": th.long if name == "teacher_actions" else th.uint8}
     scheme["has_teacher_labels"] = {"vshape": (1,), "dtype": th.uint8, "episode_const": True}
+    scheme["episode_win"] = {"vshape": (1,), "dtype": th.uint8, "episode_const": True}
     for name in ("present", "alive"):
         scheme[name] = {"vshape": (1,), "group": "agents", "dtype": th.uint8}
     batch = EpisodeBatch(scheme, groups, len(episodes), int(max(lengths)) + 1, preprocess=preprocess, device=device)
@@ -295,7 +296,8 @@ def episodes_to_batch(episodes, device="cpu"):
                       for name in FRAME_FIELDS},
                      bs=slice(index, index + 1), ts=slice(0, length + 1))
         labeled = "teacher_actions" in ep["transitions"]
-        batch.update({"has_teacher_labels": th.tensor([[int(labeled)]], device=device, dtype=th.uint8)},
+        batch.update({"has_teacher_labels": th.tensor([[int(labeled)]], device=device, dtype=th.uint8),
+                      "episode_win": th.tensor([[int(ep["episode"]["is_win"])]], device=device, dtype=th.uint8)},
                      bs=slice(index, index + 1), mark_filled=False)
         values = {name: ep["transitions"][name][None] for name in transition_fields(ep["transitions"])}
         values["transition_mask"] = np.ones((1, length, 1), dtype=np.uint8)

@@ -17,6 +17,28 @@ from envs.tabx_tasks import ENEMY_HEURISTIC, TRAIN_SEED_PROTOCOL, OFFICIAL_TABX_
 from envs.tabx_layout import LAYOUT_VERSION, SIMULATOR_CONTRACT
 
 SEED_PROTOCOL = "sha256-json-v1:uint32(task_hash,master_seed,phase,index,stream)"
+TARGET_FILES = (("target_agent.th", "target_agent_sha256"), ("target_mixer.th", "target_mixer_sha256"),
+                ("target_state.json", "target_state_sha256"))
+
+
+def target_snapshot_info(path, manifest):
+    """Old unsealed/absent target files cannot establish a historical TD target."""
+    path = Path(path)
+    for name, key in TARGET_FILES:
+        if manifest.get(key) and (not (path / name).is_file() or file_sha256(path / name) != manifest[key]):
+            raise ValueError(f"Snapshot target SHA-256 mismatch or missing file: {name}")
+    available = all(manifest.get(key) for _, key in TARGET_FILES)
+    state = read_json(path / "target_state.json") if available else None
+    if available:
+        if state["learner_updates"] != manifest["learner_updates"]:
+            raise ValueError("Target state learner update differs from checkpoint")
+        if not 0 <= state["last_target_sync_update"] <= state["learner_updates"] or state["target_sync_count"] < 0:
+            raise ValueError("Invalid target synchronization counters")
+        for key in ("last_target_sync_update", "target_sync_count"):
+            if key in manifest and manifest[key] != state[key]:
+                raise ValueError(f"Target state metadata mismatch: {key}")
+    return dict(available=available, state=state,
+        limitation=None if available else "Historical TD targets cannot be reconstructed: sealed target networks/state are absent.")
 
 
 def stable_seed(task_hash, master_seed, phase, index, stream=""):
@@ -159,6 +181,7 @@ def validate_snapshot(path, task_manifest, rule, *, check_runtime=True):
         raise ValueError("Snapshot config SHA-256 mismatch")
     if manifest.get("mixer_sha256") and file_sha256(path / "mixer.th") != manifest["mixer_sha256"]:
         raise ValueError("Snapshot mixer SHA-256 mismatch")
+    target_snapshot_info(path, manifest)
     if check_runtime:
         current = provenance()
         for library in ("epymarl", "tabx"):
@@ -281,6 +304,13 @@ class SnapshotPublisher:
                             provenance=run["provenance"], agent_sha256=file_sha256(tmp / "agent.th"),
                             config_sha256=file_sha256(tmp / "config.json"))
             manifest["mixer_sha256"] = file_sha256(tmp / "mixer.th") if (tmp / "mixer.th").is_file() else None
+            for name, key in TARGET_FILES:
+                if (tmp / name).is_file():
+                    manifest[key] = file_sha256(tmp / name)
+            if (tmp / "target_state.json").is_file():
+                target_state = read_json(tmp / "target_state.json")
+                manifest.update({key: target_state[key] for key in ("last_target_sync_update", "target_sync_count")})
+                manifest["snapshot_timing"] = target_state["snapshot_timing"]
             if getattr(self.args, "tabx_bc", False):
                 manifest["policy_stage"] = "after_bc_before_online" if step == 0 else "online_qmix"
                 manifest["bc_updates"] = self.args.tabx_bc_steps
@@ -322,8 +352,10 @@ class SnapshotPublisher:
             for filename, key in (("agent.th", "agent_sha256"), ("config.json", "config_sha256")):
                 if file_sha256(path / filename) != manifest[key]:
                     raise ValueError(f"Checkpoint checksum mismatch: {path / filename}")
+            target_snapshot_info(path, manifest)
             checkpoints.append(dict(t_env=manifest["t_env"], path=str(path.relative_to(self.run_dir)),
                                     agent_sha256=manifest["agent_sha256"], config_sha256=manifest["config_sha256"],
+                                    **{key: manifest[key] for _, key in TARGET_FILES if key in manifest},
                                     manifest_sha256=file_sha256(path / "manifest.json")))
         if not checkpoints or checkpoints[-1]["t_env"] != int(step):
             raise ValueError("Final checkpoint is missing from the completion inventory")

@@ -39,6 +39,8 @@ class QLearner:
 
         self.training_steps = 0
         self.last_target_update_step = 0
+        self.last_target_sync_update = 0
+        self.target_sync_count = 0
         self.log_stats_t = -self.args.learner_log_interval - 1
 
         device = "cuda" if args.use_cuda else "cpu"
@@ -49,6 +51,8 @@ class QLearner:
             self.rew_ms = RunningMeanStd(shape=rew_shape, device=device)
 
     def train(self, batch: EpisodeBatch, t_env: int, episode_num: int, *, demo_batch=None, bc_weight=0.0, td_counts=None):
+        diagnose = (getattr(self.args, "tabx_td_diagnostics", False) and
+                    (self.training_steps + 1) % getattr(self.args, "tabx_td_diagnostic_interval", 50) == 0)
         # Get the relevant quantities
         rewards = batch["reward"][:, :-1]
         actions = batch["actions"][:, :-1]
@@ -130,6 +134,11 @@ class QLearner:
         td_error = chosen_action_qvals - targets.detach()
 
         mask = mask.expand_as(td_error)
+        distance = None
+        if diagnose:
+            from tabx_td_success import distance_metrics
+            distance = distance_metrics(chosen_action_qvals, targets, batch["reward"][:, :-1], mask,
+                terminated, self.args.gamma, td_counts or (0, 0, batch.batch_size), batch["episode_win"])
 
         # 0-out the targets that came from padded data
         masked_td_error = td_error * mask
@@ -171,6 +180,23 @@ class QLearner:
         # Optimise
         self.optimiser.zero_grad()
         total_loss.backward()
+        if diagnose:
+            import json
+            from pathlib import Path
+            from tabx_td_success import gradient_norm
+            gradients = dict(agent=gradient_norm(self.mac.parameters()), mixer=gradient_norm(self.mixer.parameters()),
+                mixer_v=gradient_norm(self.mixer.V.parameters()))
+            record = dict(schema_version="tabx-td-distance-1", t_env=int(t_env),
+                learner_update=self.training_steps + 1, parameter_updates=self.training_steps,
+                timing="before_optimizer_step_before_gradient_clip", gamma=self.args.gamma,
+                td_loss=float(td_loss.detach()), total_loss=float(total_loss.detach()), bc_weight=effective_bc_weight,
+                last_target_sync_update=self.last_target_sync_update, target_sync_count=self.target_sync_count,
+                groups=distance, gradient_norms=gradients,
+                note="Trajectory returns describe the recorded behavior, not the current policy's exact Q.")
+            with (Path(self.args.tabx_run_dir) / "td_distance_metrics.jsonl").open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(record, allow_nan=False) + "\n")
+            for name, value in gradients.items():
+                self.logger.log_stat(f"{name}_grad_norm_before_clip", value, t_env)
         grad_norm = th.nn.utils.clip_grad_norm_(self.params, self.args.grad_norm_clip)
         self.optimiser.step()
 
@@ -214,6 +240,8 @@ class QLearner:
         self.target_mac.load_state(self.mac)
         if self.mixer is not None:
             self.target_mixer.load_state_dict(self.mixer.state_dict())
+        self.target_sync_count += 1
+        self.last_target_sync_update = self.training_steps
 
     def _update_targets_soft(self, tau):
         for target_param, param in zip(
@@ -227,6 +255,8 @@ class QLearner:
                 target_param.data.copy_(
                     target_param.data * (1.0 - tau) + param.data * tau
                 )
+        self.target_sync_count += 1
+        self.last_target_sync_update = self.training_steps
 
     def cuda(self):
         self.mac.cuda()
@@ -237,13 +267,22 @@ class QLearner:
 
     def save_models(self, path):
         self.mac.save_models(path)
+        th.save(self.target_mac.agent.state_dict(), "{}/target_agent.th".format(path))
         if self.mixer is not None:
             th.save(self.mixer.state_dict(), "{}/mixer.th".format(path))
+            th.save(self.target_mixer.state_dict(), "{}/target_mixer.th".format(path))
         th.save(self.optimiser.state_dict(), "{}/opt.th".format(path))
+        from tabx_storage import atomic_json
+        atomic_json("{}/target_state.json".format(path), dict(schema_version="q-target-state-1",
+            learner_updates=self.training_steps, last_target_sync_update=self.last_target_sync_update,
+            target_sync_count=self.target_sync_count, last_periodic_target_update=self.last_target_update_step,
+            target_update_interval_or_tau=self.args.target_update_interval_or_tau,
+            snapshot_timing="after_optimizer_step_and_target_update"))
 
     def load_models(self, path):
         self.mac.load_models(path)
-        # Not quite right but I don't want to save target networks
+        # Training restoration keeps the existing fresh-target semantics.
+        # Sealed historical target files are loaded separately by offline diagnostics.
         self.target_mac.load_models(path)
         if self.mixer is not None:
             self.mixer.load_state_dict(

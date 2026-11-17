@@ -17,6 +17,9 @@ def source_inventory(snapshot):
     for name, key in (("agent.th", "agent_sha256"), ("config.json", "config_sha256"), ("mixer.th", "mixer_sha256")):
         if key in manifest and manifest[key] != hashes[name]:
             raise ValueError(f"Source checkpoint checksum mismatch: {name}")
+    from tabx_storage import TARGET_FILES, target_snapshot_info
+    target_snapshot_info(path, manifest)
+    hashes.update({name: manifest[key] for name, key in TARGET_FILES if manifest.get(key)})
     return path, manifest, config, hashes
 
 

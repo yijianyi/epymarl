@@ -169,11 +169,18 @@ def evaluate_forks(runner, candidates, args, gammas):
             delta = np.array([b["returns"][str(gamma)]-a["returns"][str(gamma)] for a,b in zip(model, teacher)])
             row["paired_returns"][str(gamma)] = dict(model_mean=float(np.mean([a["returns"][str(gamma)] for a in model])),
                 teacher_mean=float(np.mean([b["returns"][str(gamma)] for b in teacher])), delta_mean=float(delta.mean()),
-                delta_std=float(delta.std(ddof=1)) if len(delta)>1 else 0., deltas=delta.tolist())
+                delta_std=float(delta.std(ddof=1)) if len(delta)>1 else 0.,
+                delta_standard_error=float(delta.std(ddof=1)/np.sqrt(len(delta))) if len(delta)>1 else None,
+                deltas=delta.tolist())
         row["model_outcomes"] = dict(wins=sum(r["is_win"] for r in model), elimination_wins=sum(r["elimination_win"] for r in model),
                                     timeout_wins=sum(r["timeout_win"] for r in model))
         row["teacher_outcomes"] = dict(wins=sum(r["is_win"] for r in teacher), elimination_wins=sum(r["elimination_win"] for r in teacher),
                                       timeout_wins=sum(r["timeout_win"] for r in teacher))
+        changes = [b["is_win"]-a["is_win"] for a, b in zip(model, teacher)]
+        row["paired_outcomes"] = dict(win_deltas=changes, win_delta_mean=float(np.mean(changes)),
+            model_loss_teacher_win=changes.count(1), model_win_teacher_loss=changes.count(-1),
+            model_remaining_steps_mean=float(np.mean([r["remaining_steps"] for r in model])),
+            teacher_remaining_steps_mean=float(np.mean([r["remaining_steps"] for r in teacher])))
         rows.append(row)
         print(f"diagnostic fork {index+1}/{len(candidates)} complete", flush=True)
     return rows
@@ -246,6 +253,8 @@ def diagnose_value(args):
                 "A better teacher first action under paired greedy continuations is evidence of ranking/greedy-policy error, "
                 "not proof of a specific cause. Returns estimate this policy's continuation, not optimal Q. "
                 "Small repeated samples are noisy. Discount re-ranking alone does not establish training benefit.")
+        from tabx_state_panel import cluster_summary
+        report["episode_cluster_summary"] = cluster_summary(forks, gammas, args.seed)
         atomic_json(output / "report.json", report)
         print(f"diagnostic report: {output / 'report.json'}", flush=True)
     finally:

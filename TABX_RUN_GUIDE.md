@@ -557,3 +557,74 @@ python "$EPYMARL_ROOT/src/tabx_pipeline.py" td-success-pair \
 TABX_TD_SUCCESS_SMOKE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
   python -m pytest -q tests/test_tabx_td_success.py
 ```
+
+## 14. 终局价值传播、固定轨迹与固定状态面板
+
+本阶段只补诊断和历史目标网络保存，保持一步 TD、目标更新间隔、学习率和成功回放比例原设置。目标更新频率对照与离策略多步备份留待诊断后单独实施。
+
+训练现场诊断默认关闭。需要为新训练记录时，在现有 `batch-train` 命令后添加：
+
+```bash
+--set tabx_td_diagnostics=True \
+--set tabx_td_diagnostic_interval=50
+```
+
+`main.py` 的对应参数为 `tabx_td_diagnostics=True tabx_td_diagnostic_interval=50`。这两个选项也适用于不启用 BC 的 TABX QMIX；当前仅支持未标准化奖励/回报。开关不改变动作、采样 RNG 或学习目标。在线胜负由每局环境终局信息随 replay 保存，不从奖励推测。
+
+每 50 次 learner 更新记录一次 `td_distance_metrics.jsonl`：按 `legacy_demo / success_td / online` 分组，online 再列出 `online_win / online_loss` 子集；online 及其两个子集不能重复相加。每组含总体及 `terminal=1`、`near=2–5`、`middle=6–20`、`earlier=21–50`、`far>=51` 五个距离分组。距离为实际有效动作数 `L-t`，排除 padding 和终局 frame。
+
+每组统计有效步数、轨迹数、实际动作联合 Q、一步目标、TD 误差均值/绝对值/平方误差、即时奖励和沿记录行为计算的折扣回报。空组均值为 null。行为回报只作诊断参考，不是当前模型 Q 的精确标准答案。日志同时记录一次正常 backward 后、裁剪前的 agent/mixer/mixer `V(s)` 梯度范数；梯度来自当次总损失（含尚未退出的辅助 BC），不执行额外 backward。
+
+`learner_update` 是正在执行的更新号，`parameter_updates` 是计算这些统计时已经完成的优化步数。例如第 50 次记录对应更新前的第 49 步参数；`timing` 明确标为 `before_optimizer_step_before_gradient_clip`。新 QMIX checkpoint 始终保存 `target_agent.th`、`target_mixer.th`、`target_state.json` 及 SHA-256，记录最近同步所在 learner update、实际同步调用次数和 `after_optimizer_step_and_target_update` 时序。同步次数包含 BC/预训练启动时的显式零步同步，构造器初始拷贝不计为调用。原有训练恢复/预训练启动仍保留新 attempt 的 target 同步语义，历史 target 文件供离线诊断读取。
+
+先对同一 run 的 0/约 10 万/20 万/30 万步 checkpoint 复评原始示范中的**全部胜局**（647 若仍为原数据，即 80 局；实际数量写入报告，不硬编码）：
+
+```bash
+export SOURCE_RUN="/实际结果目录/hp/647/1/<run_id>"
+export PROPAGATION_ROOT="$EPYMARL_ROOT/results/propagation-647-v1"
+python "$EPYMARL_ROOT/src/tabx_pipeline.py" diagnose-propagation \
+  --bank "$TASK_BANK" --rule hp \
+  --run "$SOURCE_RUN" --steps 0,100000,200000,300000 \
+  --demo-dir "$DEMO_ROOT/hp/647/advanced" \
+  --panel "$PROPAGATION_ROOT/fixed-trajectories.json" \
+  --output "$PROPAGATION_ROOT/trajectory-report"
+```
+
+也可用 `--snapshots <具体checkpoint目录> ...` 替代 `--run/--steps`。自动选择时取离请求步数最近的已发布 checkpoint，并同时记录请求步数与实际步数；训练未到 30 万步时，最近快照可能重复，不将其当成完整 30 万步结果。清单绑定原始 manifest、分片、轨迹编号/seed 和含奖励/终局的完整轨迹哈希；后续调用复用同一 `--panel`，数据改变会报错。
+
+每个 checkpoint 从轨迹开头用自己的网络重算全部 RNN 历史，输入实际执行的上一动作；有已封存目标网络时，用当时 target RNN/mixer 重建原 Double-Q/一步目标。旧 checkpoint 缺少已封存 target 时，仍报告当前 Q、即时奖励及行为回报，但 `target_status.available=false`，历史目标和 TD 误差/loss 留空，绝不以当前网络冒充历史 target。`trajectory-report/report.json` 含每局与整体五组统计。这是训练数据拟合/传播诊断，泛化需要独立采集轨迹。
+
+再生成固定状态面板，初始/最终模型各取最多 16 个候选状态，合计最多 32 个（候选不足会明确报告）：
+
+```bash
+export FINAL_CHECKPOINT="$SOURCE_RUN/checkpoints/<实际最终步数>"
+python "$EPYMARL_ROOT/src/tabx_pipeline.py" value-panel \
+  --bank "$TASK_BANK" --rule hp \
+  --snapshots "$PRETRAINED_CHECKPOINT" "$FINAL_CHECKPOINT" \
+  --panel "$PROPAGATION_ROOT/fixed-states.json" \
+  --states 16 --episodes 16 --spacing 8 --seed 1
+```
+
+面板保存原 episode seed、实际动作前缀、完整模拟器/RNG/敌方记忆校验值、advanced 确定性建议及来源模型哈希；不保存可供复用的 RNN 隐向量。必要时可加 `--include-search-turns` 纳入搜索转向状态。
+
+让多个 checkpoint 在同一状态面板上配对续跑：
+
+```bash
+python "$EPYMARL_ROOT/src/tabx_pipeline.py" diagnose-value-panel \
+  --bank "$TASK_BANK" --rule hp \
+  --panel "$PROPAGATION_ROOT/fixed-states.json" \
+  --snapshots "$PRETRAINED_CHECKPOINT" "$FINAL_CHECKPOINT" \
+  --output "$PROPAGATION_ROOT/state-report" \
+  --repeats 8 --bootstrap-samples 1000
+```
+
+可继续把 10 万、20 万步的具体目录加到 `--snapshots`。每个模型沿同一前缀重算自己的 RNN 与老师记忆，校验重建状态和老师建议后再分叉；两臂只有第一步动作不同，后续都由被评估模型 greedy 控制，未来随机种子配对且跨 checkpoint 固定。报告包含联合 Q 差、配对回报差/标准误、胜负变化、歼灭胜/超时胜、剩余步数，以及真实存活单位的动作差异、greedy 与次优动作 Q 间隔、老师与模型动作 Q 差。
+
+总体不确定性按原始 episode seed 聚类：先在每局内平均该局状态，再对整局做 bootstrap，避免把同局多个状态当成独立样本；只有一局时不报告总体置信区间。报告记录有效 episode 数，少量局/重复仍有不确定性。QMIX 单调性保证逐 agent greedy 联合 Q 最大，老师续跑收益更高但预测 Q 较低不能单独证明具体原因；应同时看收益差、Q 差与训练阶段变化。
+
+上述离线命令使用 CPU、不会更新模型，`--output` 必须是新目录，状态面板也不覆盖。首批验收入口：
+
+```bash
+TABX_PROPAGATION_SMOKE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+  python -m pytest -q tests/test_tabx_propagation.py
+```

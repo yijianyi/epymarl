@@ -183,6 +183,8 @@ def mix_batches(demos, online):
         values = {key: batch[key].to(online.device) for key in result.data.transition_data}
         result.update(values, bs=slice(offset, offset + batch.batch_size), ts=slice(0, batch.max_seq_length),
                       mark_filled=False)
+        result.update({key: batch[key].to(online.device) for key in result.data.episode_data},
+                      bs=slice(offset, offset + batch.batch_size), mark_filled=False)
     return result
 
 
