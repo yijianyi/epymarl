@@ -683,7 +683,9 @@ def parser():
     learning.add_argument("--online-budget", type=int, default=1500000)
     learning.add_argument("--output", required=True, help="Output stem for CSV and JSON")
     for command, description in (("gamma-pair", "Compare gamma=.99/.995 from one BC/DAgger checkpoint"),
-                                 ("td-success-pair", "Compare success TD fraction=0/.25 at gamma=.99")):
+                                 ("td-success-pair", "Compare success TD fraction=0/.25 at gamma=.99"),
+                                 ("lr-pair", "Compare RL learning rate=.00005/.0001 with success replay and diagnostics"),
+                                 ("terminal-weight-pair", "Compare terminal TD weight=1/3 at RL learning rate=.00005")):
         pair = common(command, description, bank=True, root=True, cpu_options=False)
         pair.add_argument("--source", required=True, help="Concrete BC/DAgger checkpoints/0")
         pair.add_argument("--demo-root", help="Relocated original demo root; default comes from source config")
@@ -786,7 +788,7 @@ def main(argv=None):
     elif args.command == "learning-report":
         from tabx_imitation_reporting import learning_report
         learning_report(args)
-    elif args.command in ("gamma-pair", "td-success-pair"):
+    elif args.command in ("gamma-pair", "td-success-pair", "lr-pair", "terminal-weight-pair"):
         from tabx_gamma_experiment import gamma_pair
         gamma_pair(args)
     elif args.command == "diagnose-value":

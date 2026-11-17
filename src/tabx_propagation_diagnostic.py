@@ -69,7 +69,8 @@ def evaluate_trajectory_batch(mac, mixer, target_mac, target_mixer, batch, args)
     if target_mac is not None:
         target_mac.init_hidden(batch.batch_size)
         future = th.stack([target_mac.forward(batch, t=t, test_mode=True) for t in range(batch.max_seq_length)], dim=1)[:, 1:]
-        future = future.masked_fill(~batch["avail_actions"][:, 1:].bool(), -th.inf)
+        # Match QLearner's finite sentinel: padded frames can have no legal actions.
+        future = future.masked_fill(~batch["avail_actions"][:, 1:].bool(), -9999999)
         if args.double_q:
             greedy = outputs[:, 1:].masked_fill(~batch["avail_actions"][:, 1:].bool(), -th.inf).argmax(-1, keepdim=True)
             values = future.gather(-1, greedy).squeeze(-1)

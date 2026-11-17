@@ -302,9 +302,9 @@ RESULT_ROOT/<rule>/<task>/<seed>/<run_id>/
   evaluation_requests/registered/    # 已登记但尚未放行的请求
 ~~~
 
-train_metrics.csv 的列为 t_env、learner_updates、loss、td_error_abs、grad_norm_before_clip、grad_norm_clip、q_taken_mean、target_mean、lr、bc_loss、bc_weight、total_loss。`loss` 始终表示纯 TD loss，`total_loss = loss + bc_weight × bc_loss` 用于反传；没有示范时 bc_loss 留空、bc_weight=0、total_loss=loss。混合阶段的 TD 公式与基线一致，但样本来自“示范＋在线”，采样分布不同。由 learner 复用同一组计算值，按 learner_log_interval 采样，默认每 2,000 环境步最多一行；首次更新也会采样。梯度范数是裁剪前的值，阈值单列。逐局 JSON 保留原始回报、局长、末帧血量、终局原因和种子，增加本局动作选择实际使用的探索率。
+train_metrics.csv 的基础列为 t_env、learner_updates、loss、td_error_abs、grad_norm_before_clip、grad_norm_clip、q_taken_mean、target_mean、lr、bc_loss、bc_weight、total_loss，并增加后文的来源与终局加权字段。`loss` 始终表示未加权纯 TD loss；反传使用 `total_loss = weighted_td_loss + bc_weight × bc_loss`。默认终局权重为 1 时 weighted_td_loss=loss；没有辅助示范时 bc_loss 留空、bc_weight=0、total_loss=weighted_td_loss。混合阶段的 TD 公式与基线一致，但样本来自“示范＋在线”，采样分布不同。由 learner 复用同一组计算值，按 learner_log_interval 采样，默认每 2,000 环境步最多一行；首次更新也会采样。梯度范数是裁剪前的值，阈值单列。逐局 JSON 保留原始回报、局长、末帧血量、终局原因和种子，增加本局动作选择实际使用的探索率。
 
-新 run 的 manifest 记录 training_metrics_version=tabx-train-metrics-v3-td-bc-total。拆分日志不改变反传总损失、梯度或参数更新。旧版 BC 混合阶段 CSV 的 loss 仍表示当时的总损失，读取时不重命名、不补成 TD loss，也不允许向旧表头追加新版指标。v2 的 q_taken_mean/target_mean 已按有效 mask 元素数计算；更早版本的 Q 均值曾缩小 10 倍，历史 CSV 均保留原值。
+新 run 的 manifest 记录当前 training_metrics_version=tabx-train-metrics-v5-terminal-weight；v3 引入 TD/BC/总损失拆分，v4 增加数据来源指标，v5 增加终局加权指标。仅拆分日志不改变反传总损失、梯度或参数更新；终局加权需显式设置非默认权重，见第 15 节。旧版 BC 混合阶段 CSV 的 loss 仍表示当时的总损失，读取时不重命名、不补成 TD loss，也不允许向旧表头追加新版指标。v2 的 q_taken_mean/target_mean 已按有效 mask 元素数计算；更早版本的 Q 均值曾缩小 10 倍，历史 CSV 均保留原值。
 
 eval_summary.csv 记录 request_id、checkpoint_step、phase、action_selection、episodes、wins、win_rate_pct、mean_return、return_std、elimination_wins、timeout_wins、pure_timeouts。胜率是 0–100 的百分数，回报为原始团队奖励之和的均值，return_std 为样本标准差（单局记 0）。评估晚返回也始终使用快照 manifest 的实际训练步数。每个 worker 只用本次新结果和既有 CSV 更新所属 run，不重读历史评估 JSON；run 写锁避免并发写坏和重复计数。批次汇总只由持有批次锁的调度器写入。
 
@@ -546,7 +546,7 @@ python "$EPYMARL_ROOT/src/tabx_pipeline.py" td-success-pair \
 
 - `td_success_pool.json`：实验组成功池大小、原始 manifest SHA-256、独立采样 seed、实际启用步数；尚未启用时步数为 null。
 - `td_source_metrics.jsonl`：每次更新的原示范/成功 TD/在线回合数、有效 transition 数、各组 TD loss、`q_taken_mean`、`target_mean`，以及成功回合/transition 比例、BC 样本数/权重和统一总损失。没有对应样本的组，其 loss/均值为 null。
-- `train_metrics.csv`：按原日志间隔保存上述分组指标，版本为 `tabx-train-metrics-v4-td-sources`；历史文件保持原字段和口径，不追加新 schema。
+- `train_metrics.csv`：按原日志间隔保存上述分组指标；这些字段由 `tabx-train-metrics-v4-td-sources` 引入，当前版本见第 15 节。历史文件保持原字段和口径，不追加新 schema。
 - `_td_success_pairs/<pair-id>/summary.json`：相同回合终点预算下的独立胜率、平均回报、歼灭胜/超时胜、首次获胜步数、样本累计次数及启用信息。`--report-only` 可根据已封存计划刷新；未完成的评估不记为零胜。
 
 `0.25` 是回合比例，成功局较短时有效 transition 比例可能更低。分组 TD loss 仅作诊断，最终独立胜率及真实收益仍需正式对照验证。需要复查价值判断时，可对两组最终 checkpoint 分别运行第 12 节的 `diagnose-value`。
@@ -627,4 +627,58 @@ python "$EPYMARL_ROOT/src/tabx_pipeline.py" diagnose-value-panel \
 ```bash
 TABX_PROPAGATION_SMOKE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
   python -m pytest -q tests/test_tabx_propagation.py
+```
+
+## 15. 先比较 RL 学习率，再单独比较终局 TD 权重
+
+两个入口均沿用 BC＋DAgger → RL＋成功示范回放，从同一份 `PRETRAINED_CHECKPOINT`（具体 `checkpoints/0`）及原聚合数据池开始，跳过新的 BC/DAgger。两组在线优化器/replay 全新、target 初始硬同步；保留原探索、示范抽样和辅助 BC 退出调度。源 run 的 `bc_summary.json`、DAgger rounds/采集权重和原始示范都需要保留。
+
+第一轮只比较 RL 学习率 0.00005 与 0.0001：
+
+```bash
+export LR_ROOT="$EPYMARL_ROOT/results/lr-pair-647-v1"
+python "$EPYMARL_ROOT/src/tabx_pipeline.py" lr-pair \
+  --bank "$TASK_BANK" --rule hp \
+  --source "$PRETRAINED_CHECKPOINT" --demo-root "$DEMO_ROOT" \
+  --root "$LR_ROOT" --task 647 --seed 1 --gpus 0 --eval-workers 2 \
+  --budget 300000 --pair-id lr-647-s1-300k --plan-only
+```
+
+去掉 `--plan-only` 执行两组（依次训练，各 30 万在线步）。封存计划为 `_lr_pairs/<pair-id>/pair.json`，子批次为 `<pair-id>-lr5e5` 和 `<pair-id>-lr1e4`，结果为同目录的 `summary.json`。
+
+第一轮两组共同固定：成功 TD 回放比例 0.25、batch=32、目标网络更新间隔 200、gamma=0.99、终局权重 1，以及 `tabx_td_diagnostics=True tabx_td_diagnostic_interval=50`。其余学习/探索/示范配置继承源配置。计划要求两份有效配置仅 `lr` 不同，并封存初始 agent/mixer、原始和 DAgger 数据哈希；各 checkpoint 使用同一组固定 128 个评估 seeds。学习率只影响 online TD Adam，不重新设置或运行 BC 优化器。
+
+第二轮仅在第一轮诊断仍显示终局拟合不足时执行，保持 RL 学习率 0.00005，单独比较终局权重 1 与 3：
+
+```bash
+export TERMINAL_ROOT="$EPYMARL_ROOT/results/terminal-weight-pair-647-v1"
+python "$EPYMARL_ROOT/src/tabx_pipeline.py" terminal-weight-pair \
+  --bank "$TASK_BANK" --rule hp \
+  --source "$PRETRAINED_CHECKPOINT" --demo-root "$DEMO_ROOT" \
+  --root "$TERMINAL_ROOT" --task 647 --seed 1 --gpus 0 --eval-workers 2 \
+  --budget 300000 --pair-id terminal-647-s1-300k --plan-only
+```
+
+去掉 `--plan-only` 执行。计划/结果在 `_terminal_weight_pairs/<pair-id>/`，子批次为 `<pair-id>-tw1`、`<pair-id>-tw3`。共同配置与第一轮一致，但两组 RL 学习率都为 0.00005，有效配置仅 `tabx_td_terminal_weight` 不同。这两轮不会自动串联启动，终局权重 3 尚无效果保证。
+
+底层新增 `tabx_td_terminal_weight: 1.0`，默认保持原有目标和更新。手动 `batch-train` 可增加 `--set tabx_td_terminal_weight=3.0`，`main.py` 对应 `tabx_td_terminal_weight=3.0`。权重要求有限且为正；普通有效 transition 为 1，所有来源中的真实终局 transition 为该权重，胜局和非胜局均适用。padding/终局额外 frame 没有贡献，实际执行动作、RNN 历史、奖励及一步 Double-Q 目标都不改变。
+
+优化的 TD 损失为 `sum(mask * weight * TD_error²) / sum(mask * weight)`，总损失为 `weighted_td_loss + bc_weight * bc_loss`。终局权重只作用于 TD，不改变辅助 BC 权重。默认权重为 1 时直接复用原 TD loss 张量，保持原参数更新。
+
+新指标版本为 `tabx-train-metrics-v5-terminal-weight`：
+
+- `loss`、`td_error_abs`、分来源的 TD loss 和距离分组统计仍是原始未加权误差，用于跨组比较。
+- `weighted_td_loss` 是实际优化使用的纯 TD 损失，`total_loss` 包含辅助 BC。
+- `td_terminal_weight`、`td_terminal_transitions`、`td_weight_sum`、`td_terminal_weight_fraction` 记录权重与实际占比；步数/权重和按有效联合 transition 计数，不重复计算 agent 维度。
+- `train_metrics.csv`、`td_source_metrics.jsonl` 和 `td_distance_metrics.jsonl` 均保存对应字段；历史 CSV 不重写、不追加新 schema。
+
+配对 `summary.json` 除完整对局胜率、平均回报、歼灭胜/超时胜外，还包含 `terminal_fit_history`（每次诊断中的分来源终局 Q/奖励/目标/未加权误差）及 `checkpoint_learning_state`（实际 learner updates、target 同步次数和最近同步 update）。胜局拟合重点查看 `success_td` 与 `online_win` 的 terminal；败局看 `online_loss`。以当时记录的 `reward_mean` 为实际目标参考，不把奖励硬编码为 1。现场统计仍受采样影响，固定轨迹及固定状态的比较继续使用第 14 节离线命令。
+
+`--report-only` 根据已封存计划刷新汇总；`--resume` 沿用批次恢复规则，失败训练新建 attempt 并从同一预训练起点重跑，不冒充恢复中断处 replay/优化器。正式判断同时要求终局拟合改善和独立胜率提高，再考虑多 seed 或更长预算。仅实现这些机制不代表已验证训练收益。
+
+验收入口：
+
+```bash
+TABX_REWARD_SMOKE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+  python -m pytest -q tests/test_tabx_reward_learning.py
 ```

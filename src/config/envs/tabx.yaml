@@ -49,3 +49,4 @@ tabx_demo_decay_steps: 100000
 tabx_td_success_fraction: 0.0  # Original teacher wins for TD only, after legacy demo_count reaches zero
 tabx_td_diagnostics: false  # Detached distance/gradient diagnostics; does not change learning or sampling
 tabx_td_diagnostic_interval: 50  # Learner updates, measured before optimizer.step
+tabx_td_terminal_weight: 1.0  # TD only: weight all valid win/loss terminal actions; 1 preserves baseline

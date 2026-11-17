@@ -8,14 +8,16 @@ from pathlib import Path
 import statistics
 import tempfile
 
-TRAIN_METRICS_VERSION = "tabx-train-metrics-v4-td-sources"
+TRAIN_METRICS_VERSION = "tabx-train-metrics-v5-terminal-weight"
+TD_WEIGHT_FIELDS = ("weighted_td_loss", "td_terminal_weight", "td_terminal_transitions", "td_weight_sum",
+                    "td_terminal_weight_fraction")
 
 TD_SOURCE_FIELDS = tuple(f"{source}_{metric}" for source in ("legacy_demo", "success_td", "online")
                          for metric in ("episodes", "transitions", "loss", "q_taken_mean", "target_mean")) + (
                              "success_td_episode_fraction", "success_td_transition_fraction", "bc_episodes")
 
 TRAIN_FIELDS = ("t_env", "learner_updates", "loss", "td_error_abs", "grad_norm_before_clip",
-                "grad_norm_clip", "q_taken_mean", "target_mean", "lr", "bc_loss", "bc_weight", "total_loss") + TD_SOURCE_FIELDS
+                "grad_norm_clip", "q_taken_mean", "target_mean", "lr", "bc_loss", "bc_weight", "total_loss") + TD_SOURCE_FIELDS + TD_WEIGHT_FIELDS
 EVAL_FIELDS = ("request_id", "checkpoint_step", "phase", "action_selection", "episodes", "wins",
                "win_rate_pct", "mean_return", "return_std", "elimination_wins", "timeout_wins", "pure_timeouts")
 
@@ -280,6 +282,8 @@ def train_line(rule, task, seed, gpu, row):
         losses += (f"success_td_episodes={row['success_td_episodes']} online_episodes={row['online_episodes']} "
                    f"success_td_transition_fraction={float(row['success_td_transition_fraction']):.6g} "
                    f"bc_episodes={row['bc_episodes']} ")
+    if row.get("weighted_td_loss") not in (None, ""):
+        losses += f"weighted_td_loss={float(row['weighted_td_loss']):.6g} terminal_weight={float(row['td_terminal_weight']):g} "
     # Old rows keep their original loss label and meaning, including mixed BC.
     return (f"[TRAIN] rule={rule} task={task} seed={seed} gpu={gpu} step={row['t_env']} "
             f"updates={row['learner_updates']} {losses}"

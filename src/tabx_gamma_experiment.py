@@ -4,6 +4,13 @@ import json
 
 from tabx_storage import atomic_json, file_sha256, read_json, stable_seed
 
+PAIR_SPECS = {
+    "gamma-pair": ("_gamma_pairs", "gamma", ((.99, "g099"), (.995, "g0995")), "tabx-gamma-pair-1"),
+    "td-success-pair": ("_td_success_pairs", "tabx_td_success_fraction", ((0., "td0"), (.25, "td025")), "tabx-td-success-pair-1"),
+    "lr-pair": ("_lr_pairs", "lr", ((.00005, "lr5e5"), (.0001, "lr1e4")), "tabx-lr-pair-1"),
+    "terminal-weight-pair": ("_terminal_weight_pairs", "tabx_td_terminal_weight", ((1., "tw1"), (3., "tw3")), "tabx-terminal-weight-pair-1"),
+}
+
 
 def _flatten(config, prefix=""):
     for key, value in config.items():
@@ -22,9 +29,9 @@ def make_pair_plan(args):
     if not 0 <= args.seed < 2**32:
         raise ValueError("Training seed must be an integer in [0,2**32)")
     if manifest.get("t_env") != 0 or manifest.get("policy_stage") != "after_bc_before_online":
-        raise ValueError("Gamma pair requires the BC/DAgger online-step-0 snapshot")
+        raise ValueError("Pair requires the BC/DAgger online-step-0 snapshot")
     if manifest["task_id"] != args.task or manifest["timeout_rule"] != args.rule:
-        raise ValueError("Gamma pair source task/rule mismatch")
+        raise ValueError("Pair source task/rule mismatch")
     _, task = load_task(args.bank, args.task, manifest["task_hash"], manifest["bank_hash"])
     root = Path(args.root).expanduser().resolve()
     demo_root = str(Path(args.demo_root or saved["tabx_demo_root"]).expanduser().resolve())
@@ -44,11 +51,16 @@ def make_pair_plan(args):
         tabx_source_agent_sha256=hashes["agent.th"], tabx_source_mixer_sha256=hashes["mixer.th"],
         tabx_source_pool_sha256=fingerprint, tabx_screen_episodes=128, tabx_bc_eval_episodes=128,
         tabx_eval_seed_phase="bc_holdout", t_max=args.budget)
-    success_pair = args.command == "td-success-pair"
-    treatment = "tabx_td_success_fraction" if success_pair else "gamma"
-    arms = ((0., "td0"), (.25, "td025")) if success_pair else ((.99, "g099"), (.995, "g0995"))
-    if success_pair:
+    _, treatment, arms, schema = PAIR_SPECS[args.command]
+    if args.command == "td-success-pair":
         overrides["gamma"] = .99
+    protocol = dict(t_max=args.budget, screen_episodes=128, bc_eval_episodes=128)
+    if args.command in ("lr-pair", "terminal-weight-pair"):
+        fixed = dict(lr=.00005, gamma=.99, batch_size=32, target_update_interval_or_tau=200,
+            tabx_td_success_fraction=.25, tabx_td_diagnostics=True, tabx_td_diagnostic_interval=50,
+            tabx_td_terminal_weight=1.)
+        overrides.update(fixed)
+        protocol.update({key: value for key, value in fixed.items() if key != treatment})
     configs, commands = [], []
     for value, suffix in arms:
         settings = [f"{key}={value!r}" for key, value in sorted(dict(overrides, **{treatment: value}).items())]
@@ -61,7 +73,7 @@ def make_pair_plan(args):
     differences = [key for key in configs[0] if configs[0][key] != configs[1][key]]
     if differences != [treatment]:
         raise RuntimeError(f"Single-factor treatment violated: {differences}")
-    return dict(schema_version="tabx-td-success-pair-1" if success_pair else "tabx-gamma-pair-1",
+    return dict(schema_version=schema,
         treatment_key=treatment, arms=[dict(value=value, suffix=suffix) for value, suffix in arms],
         pair_id=args.pair_id, task_id=args.task, rule=args.rule,
         seed=args.seed, budget=args.budget, source_snapshot=str(path), source_hashes=hashes,
@@ -69,7 +81,7 @@ def make_pair_plan(args):
         evaluation_episodes=128, seed_phase="bc_holdout",
         evaluation_seeds=[stable_seed(task["task_hash"], saved.get("tabx_master_seed", 0), "bc_holdout", i) for i in range(128)],
         treatment_differences=differences, training_configs=configs, commands=commands,
-        shared_protocol_overrides=dict(t_max=args.budget, screen_episodes=128, bc_eval_episodes=128))
+        shared_protocol_overrides=protocol)
 
 
 def summarize_pair(root, plan):
@@ -105,6 +117,17 @@ def summarize_pair(root, plan):
                 sampled_episodes={source: sum(m[f"{source}_episodes"] for m in metrics)
                                   for source in ("legacy_demo", "success_td", "online")},
                 latest=metrics[-1] if metrics else None)
+        from tabx_reporting import read_episodes
+        diagnostics = [entry for entry in read_episodes(run / "td_distance_metrics.jsonl") if entry["t_env"] <= row["cutoff_step"]]
+        row["terminal_fit_history"] = [dict(t_env=entry["t_env"], learner_update=entry["learner_update"],
+            parameter_updates=entry["parameter_updates"], timing=entry["timing"],
+            groups={key: value["terminal"] for key,value in entry["groups"].items()}) for entry in diagnostics]
+        checkpoints = [path for path in (run / "checkpoints").glob("*/manifest.json")
+                       if path.parent.name.isdigit() and int(path.parent.name) <= row["cutoff_step"]]
+        if checkpoints:
+            checkpoint = read_json(max(checkpoints, key=lambda p:int(p.parent.name)))
+            row["checkpoint_learning_state"] = {key: checkpoint.get(key) for key in
+                ("t_env", "learner_updates", "last_target_sync_update", "target_sync_count")}
         results.append(row)
     available = [row["online_start"] for row in results if "online_start" in row]
     if len(available) == 2:
@@ -120,7 +143,7 @@ def gamma_pair(args):
     from tabx_scheduler import batch_train
     from tabx_storage import safe_component
     safe_component(args.pair_id)
-    namespace = "_td_success_pairs" if args.command == "td-success-pair" else "_gamma_pairs"
+    namespace = PAIR_SPECS[args.command][0]
     directory = Path(args.root).expanduser().resolve() / namespace / args.pair_id
     path = directory / "pair.json"
     if args.report_only:

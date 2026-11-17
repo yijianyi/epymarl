@@ -145,7 +145,10 @@ class QLearner:
 
         # Normal L2 loss, take mean over actual data
         td_loss = (masked_td_error**2).sum() / mask.sum()
-        total_loss = td_loss
+        from tabx_td_loss import terminal_td_objective
+        weighted_td_loss, weighting_metrics = terminal_td_objective(masked_td_error, mask, terminated,
+            getattr(self.args, "tabx_td_terminal_weight", 1.), td_loss)
+        total_loss = weighted_td_loss
         bc_loss = None
         effective_bc_weight = 0.0
         if demo_batch is not None and bc_weight > 0:
@@ -155,7 +158,7 @@ class QLearner:
                 target=getattr(self.args, "tabx_bc_target", "actions"),
                 action_weights=getattr(self.args, "tabx_bc_action_weights", None))
             effective_bc_weight = float(bc_weight)
-            total_loss = td_loss + effective_bc_weight * bc_loss
+            total_loss = weighted_td_loss + effective_bc_weight * bc_loss
             self.logger.log_stat("online_bc_loss", bc_metrics["loss"], t_env)
             self.logger.log_stat("online_bc_accuracy", bc_metrics["accuracy"], t_env)
             self.logger.log_stat("online_bc_unweighted_ce", bc_metrics["unweighted_ce"], t_env)
@@ -175,7 +178,7 @@ class QLearner:
             with (Path(self.args.tabx_run_dir) / "td_source_metrics.jsonl").open("a", encoding="utf-8") as stream:
                 stream.write(json.dumps(dict(t_env=int(t_env), learner_updates=self.training_steps + 1,
                     loss=float(td_loss.detach()), bc_weight=effective_bc_weight,
-                    total_loss=float(total_loss.detach()), **source_metrics), allow_nan=False) + "\n")
+                    total_loss=float(total_loss.detach()), **weighting_metrics, **source_metrics), allow_nan=False) + "\n")
 
         # Optimise
         self.optimiser.zero_grad()
@@ -190,6 +193,7 @@ class QLearner:
                 learner_update=self.training_steps + 1, parameter_updates=self.training_steps,
                 timing="before_optimizer_step_before_gradient_clip", gamma=self.args.gamma,
                 td_loss=float(td_loss.detach()), total_loss=float(total_loss.detach()), bc_weight=effective_bc_weight,
+                **weighting_metrics,
                 last_target_sync_update=self.last_target_sync_update, target_sync_count=self.target_sync_count,
                 groups=distance, gradient_norms=gradients,
                 note="Trajectory returns describe the recorded behavior, not the current policy's exact Q.")
@@ -221,6 +225,7 @@ class QLearner:
                            target_mean=(targets * mask).sum().item() / mask_elems)
             if bc_loss is not None:
                 scalars["bc_loss"] = bc_loss.item()
+            scalars.update(weighting_metrics)
             scalars.update({key: value for key, value in source_metrics.items() if value is not None})
             for name, value in scalars.items():
                 self.logger.log_stat(name, value, t_env)
@@ -233,7 +238,7 @@ class QLearner:
                     bc_loss=scalars.get("bc_loss"), bc_weight=effective_bc_weight, total_loss=scalars["total_loss"],
                     grad_norm_before_clip=scalars["grad_norm"], grad_norm_clip=self.args.grad_norm_clip,
                     q_taken_mean=scalars["q_taken_mean"], target_mean=scalars["target_mean"],
-                    lr=self.optimiser.param_groups[0]["lr"], **source_metrics))
+                    lr=self.optimiser.param_groups[0]["lr"], **weighting_metrics, **source_metrics))
             self.log_stats_t = t_env
 
     def _update_targets_hard(self):
