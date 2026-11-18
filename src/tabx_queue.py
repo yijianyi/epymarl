@@ -340,9 +340,9 @@ class EvalQueue:
                 return candidate.stem, owner, record["request"]
         return None
 
-    def _owned(self, key, owner):
+    def _owned(self, key, owner, *, statuses=("running",)):
         path, record = self._find(key)
-        if record is None or record["status"] != "running" or record["owner"] != owner:
+        if record is None or record["status"] not in statuses or record["owner"] != owner:
             raise RuntimeError("Evaluation lease lost")
         return path, record
 
@@ -389,7 +389,11 @@ class EvalQueue:
 
     def finish(self, key, owner, error=None):
         with self._lock(key):
-            path, record = self._owned(key, owner)
+            statuses = ("running", "complete") if error is None else ("running",)
+            path, record = self._owned(key, owner, statuses=statuses)
+            # Checkpoint reconciliation can finish the published result first.
+            if record["status"] == "complete":
+                return
             if error is None:
                 if not record["request"].get("run") and not self.result_path(key).exists():
                     self._write(self.result_path(key), dict(request=record["request"], episodes=self.results(key)))

@@ -120,6 +120,17 @@ python "$EPYMARL_ROOT/src/tabx_pipeline.py" check-env \
 
 ### MAPPO
 
+从仓库根目录启动四卡调度。每卡一个训练进程，CPU worker 同时评估快照。通过 `--tasks` 传入逗号分隔的任务 ID，以下示例是之前 HP/QMIX 试点的 32 个任务。
+
+```bash
+export TASK_BANK="/your/data/1106_tasks_merged_multiagent.json"
+export RESULT_ROOT="/your/results/tabx-mappo-hp-advanced-pilot32"
+export GPUS="0,1,2,3"
+python src/train_tabx_mappo32.py --tasks '23,651,657,647,492,5030,373,383,426,1340,382,329,2583,25,173,396,523,5110,275,403,520,4714,5869,6481,419,357,130,2619,3068,4303,208,147'
+```
+
+启动器跳过任务库的预期哈希校验。批次汇总位于 `$RESULT_ROOT/_batches/hp/mappo32/batch_summary.csv`。用相同任务列表和配置再次执行可恢复该批次。更换任务列表时使用新的 `RESULT_ROOT`。
+
 用任务 23 验证训练、最终快照和 CPU 贪心评估。
 
 ```bash

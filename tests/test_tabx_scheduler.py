@@ -272,6 +272,8 @@ def test_task_sources_locking_and_hash_validation(batch_fixture, tmp_path):
     atomic_json(pilot, dict(bank_hash="wrong", pilot=tasks, splits=dict(train=tasks)))
     with pytest.raises(ValueError, match="hash mismatch"):
         scheduler.task_selection(args)
+    args.skip_bank_hash_check = True
+    assert scheduler.task_selection(args)[1] == tasks
     listing = tmp_path / "tasks.txt"
     listing.write_text("23\n651,647\n")
     args.pilot, args.task_list = None, str(listing)
@@ -282,6 +284,36 @@ def test_task_sources_locking_and_hash_validation(batch_fixture, tmp_path):
     with scheduler.batch_lock(f.directory):
         with pytest.raises(RuntimeError, match="Another scheduler"):
             scheduler.batch_train(parser().parse_args(f.argv))
+
+
+def test_mappo_batch_starts_ppo_and_formats_its_metrics(tmp_path):
+    from tabx_reporting import train_line
+
+    bank = tmp_path / "bank.json"
+    args = parser().parse_args([
+        "batch-train", "--alg", "mappo_tabx", "--skip-bank-hash-check", "--bank", str(bank),
+        "--root", str(tmp_path), "--tasks", "23", "--gpus", "0", "--batch-id", "test",
+    ])
+    config, overrides = scheduler.training_config(args.overrides, algorithm=args.alg)
+    assert config["learner"] == "ppo_learner"
+    assert config["buffer_size"] == config["batch_size"] == 8
+    with pytest.raises(ValueError, match="buffer_size=batch_size"):
+        scheduler.training_config(["batch_size=2"], algorithm=args.alg)
+
+    batch = scheduler.BatchScheduler(
+        args, tmp_path, dict(bank=str(bank), overrides=overrides), dict(jobs=[])
+    )
+    command = batch.training_command(
+        dict(task_id="23", train_seed=1), dict(run_id="run", gpu="0", log="train.log")
+    )
+    assert "--config=mappo_tabx" in command
+    assert not any(arg.startswith("env_args.expected_bank_hash=") for arg in command)
+    message = train_line("hp", "23", 1, "0", dict(
+        t_env=16, learner_updates=1, policy_loss=-0.1, critic_loss=0.3,
+        entropy=1.2, approx_kl=0.01, clip_fraction=0.05,
+    ))
+    assert "policy_loss=-0.1" in message
+    assert "critic_loss=0.3" in message
 
 
 def test_zero_exit_without_completion_inventory_is_failed(batch_fixture, monkeypatch):
@@ -468,7 +500,8 @@ def test_publication_is_idempotent_while_running_and_after_acknowledgement(tmp_p
     assert queue.active_keys("loss", "batch") == {}
 
 
-def test_partial_20_of_32_seeds_and_final_json_before_notification_recover(tmp_path):
+@pytest.mark.parametrize("worker_exited", [False, True])
+def test_partial_20_of_32_seeds_and_final_json_before_notification_recover(tmp_path, worker_exited):
     queue = EvalQueue(tmp_path)
     request = dict(rule="loss", seeds=list(range(32)), checkpoint_hash="weights", batch_id="batch")
     key = queue.enqueue(request)
@@ -485,10 +518,15 @@ def test_partial_20_of_32_seeds_and_final_json_before_notification_recover(tmp_p
     for seed in sorted(missing):
         recovered.record(key, next_owner, dict(seed=seed, return_value=1))
     recovered.publish_result(key, next_owner, dict(request=request, episodes=recovered.results(key)))
-    # Crash before finish(): the final JSON is authoritative on the next resume.
-    recovered.release_batch("loss", "batch")
+    # Both live reconciliation and crash recovery can observe the final JSON first.
+    if worker_exited:
+        recovered.release_batch("loss", "batch")
     result = EvalQueue(tmp_path).recover(request)
     assert result["status"] == "complete" and len(result["report"]["episodes"]) == 32
+    if not worker_exited:
+        recovered.finish(key, next_owner)
+        with pytest.raises(RuntimeError, match="lease lost"):
+            recovered.finish(key, owner)
     assert len(EvalQueue(tmp_path).notifications("loss", "batch")) == 1
 
 

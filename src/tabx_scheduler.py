@@ -40,11 +40,11 @@ def _merge(target, source):
     return target
 
 
-def training_config(overrides):
+def training_config(overrides, *, algorithm="qmix_tabx"):
     """Match main.py's default -> env -> algorithm -> CLI merge, without torch."""
     import yaml
     config = {}
-    for name in ("default.yaml", "envs/tabx.yaml", "algs/qmix_tabx.yaml"):
+    for name in ("default.yaml", "envs/tabx.yaml", f"algs/{algorithm}.yaml"):
         with (REPOSITORY / "src/config" / name).open(encoding="utf-8") as stream:
             _merge(config, yaml.safe_load(stream))
     canonical = {}
@@ -83,6 +83,8 @@ def training_config(overrides):
         raise ValueError("Require tabx_screen_episodes>=2")
     if config["buffer_size"] < config["batch_size"]:
         raise ValueError("buffer_size must be at least batch_size")
+    if config["learner"] == "ppo_learner" and config["buffer_size"] != config["batch_size"]:
+        raise ValueError("TABX PPO requires buffer_size=batch_size")
     if config["lr"] <= 0 or config["grad_norm_clip"] <= 0:
         raise ValueError("lr and grad_norm_clip must be positive")
     config.update(use_cuda=True, tabx_require_cuda=True)
@@ -150,7 +152,7 @@ def task_selection(args):
         selected = _split_unique(args.tasks, "tasks")
     elif args.pilot is not None:
         pilot = read_json(args.pilot)
-        if pilot["bank_hash"] != digest:
+        if not args.skip_bank_hash_check and pilot["bank_hash"] != digest:
             raise ValueError("Pilot task-bank hash mismatch")
         selected = pilot["pilot"]
         if not set(map(str, selected)).issubset(set(map(str, pilot["splits"]["train"]))):
@@ -504,11 +506,13 @@ class BatchScheduler:
     def training_command(self, job, attempt):
         values = dict(self.manifest["overrides"])
         values.update({"env_args.key": job["task_id"], "env_args.task_bank": self.manifest["bank"],
-                       "env_args.expected_bank_hash": self.manifest["bank_hash"], "env_args.timeout_rule": self.args.rule,
+                       "env_args.timeout_rule": self.args.rule,
                        "seed": job["train_seed"], "tabx_output_root": str(self.root), "tabx_run_id": attempt["run_id"],
                        "tabx_batch_id": self.args.batch_id, "tabx_assigned_gpu": attempt["gpu"],
                        "tabx_train_log": attempt["log"], "tabx_require_cuda": True, "use_cuda": True})
-        return [sys.executable, str(REPOSITORY / "src/main.py"), "--config=qmix_tabx", "--env-config=tabx", "with",
+        if not self.args.skip_bank_hash_check:
+            values["env_args.expected_bank_hash"] = self.manifest["bank_hash"]
+        return [sys.executable, str(REPOSITORY / "src/main.py"), f"--config={self.args.alg}", "--env-config=tabx", "with",
                 *[f"{key}={_sacred(value)}" for key, value in sorted(values.items())]]
 
     def launch(self, job, gpu):
@@ -941,9 +945,11 @@ def batch_train(args):
         from envs.tabx_tasks import official_tabx_root
         if Path(args.tabx_root).expanduser().resolve() != official_tabx_root().resolve():
             raise ValueError("Only the pinned official submodule may be used")
-    config, overrides = training_config(args.overrides)
+    config, overrides = training_config(args.overrides, algorithm=args.alg)
     identity = dict(rule=args.rule, tasks=tasks, seeds=seeds, bank_hash=bank_hash, task_hashes=hashes,
                     training_config=config, source_hash=code_hash(REPOSITORY))
+    if args.skip_bank_hash_check:
+        identity["skip_bank_hash_check"] = True
     root = Path(args.root).expanduser().resolve()
     # This MUST precede EvalQueue and worker startup in a new output root.
     ensure_output_contract(root)

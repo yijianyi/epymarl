@@ -617,7 +617,10 @@ def parser():
     worker.add_argument("--retry-failed", action="store_true")
     worker.add_argument("--poll-seconds", type=float, default=2.0)
     worker.add_argument("--lease-seconds", type=float, default=3600)
-    batch = common("batch-train", "Schedule independent QMIX GPU runs and shared CPU checkpoint evaluation", bank=True, root=True, cpu_options=False)
+    batch = common("batch-train", "Schedule independent TABX GPU runs and shared CPU checkpoint evaluation", bank=True, root=True, cpu_options=False)
+    batch.add_argument("--alg", choices=("qmix_tabx", "mappo_tabx"), default="qmix_tabx")
+    batch.add_argument("--skip-bank-hash-check", action="store_true",
+                       help="Use pilot task IDs without pinning the task bank to an expected hash")
     source = batch.add_mutually_exclusive_group(required=True)
     source.add_argument("--tasks", help="Comma-separated task IDs; never defaults to the whole bank")
     source.add_argument("--pilot", help="Frozen pilot JSON with task-bank hash")

@@ -262,8 +262,13 @@ def summarize_run(run_dir):
 
 
 def train_line(rule, task, seed, gpu, row):
-    return (f"[TRAIN] rule={rule} task={task} seed={seed} gpu={gpu} step={row['t_env']} "
-            f"updates={row['learner_updates']} loss={float(row['loss']):.6g} "
+    header = (f"[TRAIN] rule={rule} task={task} seed={seed} gpu={gpu} step={row['t_env']} "
+              f"updates={row['learner_updates']}")
+    if "policy_loss" in row:
+        return (f"{header} policy_loss={float(row['policy_loss']):.6g} "
+                f"critic_loss={float(row['critic_loss']):.6g} entropy={float(row['entropy']):.6g} "
+                f"approx_kl={float(row['approx_kl']):.6g} clip_fraction={float(row['clip_fraction']):.6g}")
+    return (f"{header} loss={float(row['loss']):.6g} "
             f"td_abs={float(row['td_error_abs']):.6g} grad_norm_preclip={float(row['grad_norm_before_clip']):.6g} "
             f"grad_clip={float(row['grad_norm_clip']):g}")
 
