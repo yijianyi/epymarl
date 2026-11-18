@@ -1,5 +1,6 @@
 # code heavily adapted from https://github.com/AnujMahajanOxf/MAVEN
 import copy
+from pathlib import Path
 
 import torch as th
 from torch.optim import Adam
@@ -15,6 +16,7 @@ class PPOLearner:
         self.n_agents = args.n_agents
         self.n_actions = args.n_actions
         self.logger = logger
+        self.tabx_rollouts = "agent_alive" in scheme
 
         self.mac = mac
         self.old_mac = copy.deepcopy(mac)
@@ -28,12 +30,13 @@ class PPOLearner:
         self.critic_optimiser = Adam(params=self.critic_params, lr=args.lr)
 
         self.last_target_update_step = 0
-        self.critic_training_steps = 0
+        self.training_steps = 0
         self.log_stats_t = -self.args.learner_log_interval - 1
 
         device = "cuda" if args.use_cuda else "cpu"
         if self.args.standardise_returns:
-            self.ret_ms = RunningMeanStd(shape=(self.n_agents,), device=device)
+            value_shape = (1,) if self.tabx_rollouts else (self.n_agents,)
+            self.ret_ms = RunningMeanStd(shape=value_shape, device=device)
         if self.args.standardise_rewards:
             rew_shape = (1,) if self.args.common_reward else (self.n_agents,)
             self.rew_ms = RunningMeanStd(shape=rew_shape, device=device)
@@ -42,11 +45,20 @@ class PPOLearner:
         # Get the relevant quantities
 
         rewards = batch["reward"][:, :-1]
-        actions = batch["actions"][:, :]
-        terminated = batch["terminated"][:, :-1].float()
-        mask = batch["filled"][:, :-1].float()
-        mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1])
-        actions = actions[:, :-1]
+        actions = batch["actions"][:, :-1]
+        if self.tabx_rollouts:
+            # The terminal observation is filled but has no successor.
+            filled = batch["filled"].bool()
+            transition_mask = filled[:, :-1] & filled[:, 1:]
+            alive_at_action = batch["agent_alive"][:, :-1].squeeze(-1)
+            actor_mask = (transition_mask & alive_at_action).float()
+            critic_mask = transition_mask
+        else:
+            terminated = batch["terminated"][:, :-1].float()
+            mask = batch["filled"][:, :-1].float()
+            mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1])
+            actor_mask = mask.repeat(1, 1, self.n_agents)
+            critic_mask = actor_mask
 
         if self.args.standardise_rewards:
             self.rew_ms.update(rewards)
@@ -56,24 +68,20 @@ class PPOLearner:
             assert (
                 rewards.size(2) == 1
             ), "Expected singular agent dimension for common rewards"
-            # reshape rewards to be of shape (batch_size, episode_length, n_agents)
-            rewards = rewards.expand(-1, -1, self.n_agents)
+            if not self.tabx_rollouts:
+                rewards = rewards.expand(-1, -1, self.n_agents)
 
-        mask = mask.repeat(1, 1, self.n_agents)
-
-        critic_mask = mask.clone()
-
-        old_mac_out = []
-        self.old_mac.init_hidden(batch.batch_size)
-        for t in range(batch.max_seq_length - 1):
-            agent_outs = self.old_mac.forward(batch, t=t)
-            old_mac_out.append(agent_outs)
-        old_mac_out = th.stack(old_mac_out, dim=1)  # Concat over time
-        old_pi = old_mac_out
-        old_pi[mask == 0] = 1.0
-
-        old_pi_taken = th.gather(old_pi, dim=3, index=actions).squeeze(3)
-        old_log_pi_taken = th.log(old_pi_taken + 1e-10)
+        actor_count = actor_mask.sum()
+        with th.no_grad():
+            old_mac_out = []
+            self.old_mac.init_hidden(batch.batch_size)
+            for t in range(batch.max_seq_length - 1):
+                agent_outs = self.old_mac.forward(batch, t=t)
+                old_mac_out.append(agent_outs)
+            old_pi = th.stack(old_mac_out, dim=1)
+            old_pi[actor_mask == 0] = 1.0
+            old_pi_taken = th.gather(old_pi, dim=3, index=actions).squeeze(3)
+            old_log_pi_taken = th.log(old_pi_taken + 1e-10)
 
         for k in range(self.args.epochs):
             mac_out = []
@@ -87,15 +95,16 @@ class PPOLearner:
             advantages, critic_train_stats = self.train_critic_sequential(
                 self.critic, self.target_critic, batch, rewards, critic_mask
             )
-            advantages = advantages.detach()
+            advantages = advantages.detach().expand_as(actor_mask)
             # Calculate policy grad with mask
 
-            pi[mask == 0] = 1.0
+            pi[actor_mask == 0] = 1.0
 
             pi_taken = th.gather(pi, dim=3, index=actions).squeeze(3)
             log_pi_taken = th.log(pi_taken + 1e-10)
 
-            ratios = th.exp(log_pi_taken - old_log_pi_taken.detach())
+            log_ratios = log_pi_taken - old_log_pi_taken
+            ratios = log_ratios.exp()
             surr1 = ratios * advantages
             surr2 = (
                 th.clamp(ratios, 1 - self.args.eps_clip, 1 + self.args.eps_clip)
@@ -105,9 +114,9 @@ class PPOLearner:
             entropy = -th.sum(pi * th.log(pi + 1e-10), dim=-1)
             pg_loss = (
                 -(
-                    (th.min(surr1, surr2) + self.args.entropy_coef * entropy) * mask
+                    (th.min(surr1, surr2) + self.args.entropy_coef * entropy) * actor_mask
                 ).sum()
-                / mask.sum()
+                / actor_count
             )
 
             # Optimise agents
@@ -120,17 +129,38 @@ class PPOLearner:
 
         self.old_mac.load_state(self.mac)
 
-        self.critic_training_steps += 1
+        self.training_steps += 1
         if (
             self.args.target_update_interval_or_tau > 1
-            and (self.critic_training_steps - self.last_target_update_step)
+            and (self.training_steps - self.last_target_update_step)
             / self.args.target_update_interval_or_tau
             >= 1.0
         ):
             self._update_targets_hard()
-            self.last_target_update_step = self.critic_training_steps
+            self.last_target_update_step = self.training_steps
         elif self.args.target_update_interval_or_tau <= 1.0:
             self._update_targets_soft(self.args.target_update_interval_or_tau)
+
+        ppo_stats = {}
+        if self.tabx_rollouts:
+            # Diagnostics use the policy and critic losses from the final PPO epoch.
+            with th.no_grad():
+                approx_kl = log_ratios.expm1() - log_ratios
+                clipped = (ratios - 1).abs() > self.args.eps_clip
+                ppo_stats = {
+                    "entropy": ((entropy * actor_mask).sum() / actor_count).item(),
+                    "approx_kl": ((approx_kl * actor_mask).sum() / actor_count).item(),
+                    "clip_fraction": ((clipped * actor_mask).sum() / actor_count).item(),
+                }
+            if getattr(self.args, "tabx_run_dir", None):
+                from tabx_reporting import PPO_TRAIN_FIELDS, append_train_metrics
+                append_train_metrics(
+                    Path(self.args.tabx_run_dir) / "train_metrics.csv",
+                    dict(t_env=t_env, learner_updates=self.training_steps,
+                         rollout_episodes=batch.batch_size, policy_loss=pg_loss.item(),
+                         critic_loss=critic_train_stats["critic_loss"][0], **ppo_stats),
+                    fields=PPO_TRAIN_FIELDS,
+                )
 
         if t_env - self.log_stats_t >= self.args.learner_log_interval:
             ts_logged = len(critic_train_stats["critic_loss"])
@@ -147,30 +177,37 @@ class PPOLearner:
 
             self.logger.log_stat(
                 "advantage_mean",
-                (advantages * mask).sum().item() / mask.sum().item(),
+                ((advantages * actor_mask).sum() / actor_count).item(),
                 t_env,
             )
             self.logger.log_stat("pg_loss", pg_loss.item(), t_env)
             self.logger.log_stat("agent_grad_norm", grad_norm.item(), t_env)
             self.logger.log_stat(
                 "pi_max",
-                (pi.max(dim=-1)[0] * mask).sum().item() / mask.sum().item(),
+                ((pi.max(dim=-1)[0] * actor_mask).sum() / actor_count).item(),
                 t_env,
             )
+            for key, value in ppo_stats.items():
+                self.logger.log_stat(key, value, t_env)
             self.log_stats_t = t_env
 
     def train_critic_sequential(self, critic, target_critic, batch, rewards, mask):
         # Optimise critic
         with th.no_grad():
-            target_vals = target_critic(batch)
-            target_vals = target_vals.squeeze(3)
+            target_vals = target_critic(batch).squeeze(3)
+            if self.tabx_rollouts:
+                alive = batch["agent_alive"].squeeze(-1)
+                target_vals = self._tabx_team_values(target_vals, alive)
 
         if self.args.standardise_returns:
             target_vals = target_vals * th.sqrt(self.ret_ms.var) + self.ret_ms.mean
 
-        target_returns = self.nstep_returns(
-            rewards, mask, target_vals, self.args.q_nstep
-        )
+        if self.tabx_rollouts:
+            target_returns = self.tabx_nstep_returns(
+                rewards, mask, batch["terminated"][:, :-1].bool(), target_vals
+            )
+        else:
+            target_returns = self.nstep_returns(rewards, mask, target_vals, self.args.q_nstep)
         if self.args.standardise_returns:
             self.ret_ms.update(target_returns)
             target_returns = (target_returns - self.ret_ms.mean) / th.sqrt(
@@ -186,6 +223,8 @@ class PPOLearner:
         }
 
         v = critic(batch)[:, :-1].squeeze(3)
+        if self.tabx_rollouts:
+            v = self._tabx_team_values(v, alive[:, :-1])
         td_error = target_returns.detach() - v
         masked_td_error = td_error * mask
         loss = (masked_td_error**2).sum() / mask.sum()
@@ -209,6 +248,21 @@ class PPOLearner:
         )
 
         return masked_td_error, running_log
+
+    @staticmethod
+    def _tabx_team_values(values, alive):
+        live_count = alive.sum(dim=-1, keepdim=True).clamp_min(1)
+        return values.masked_fill(~alive, 0).sum(dim=-1, keepdim=True) / live_count
+
+    def tabx_nstep_returns(self, rewards, transition_mask, terminated, team_values):
+        # Team value follows the episode through individual casualties.
+        continuation = transition_mask & ~terminated
+        returns = team_values
+        padding = th.zeros_like(returns[:, :1])
+        for _ in range(self.args.q_nstep):
+            targets = (rewards + self.args.gamma * returns[:, 1:] * continuation) * transition_mask
+            returns = th.cat((targets, padding), dim=1)
+        return returns[:, :-1]
 
     def nstep_returns(self, rewards, mask, values, nsteps):
         nstep_values = th.zeros_like(values[:, :-1])
@@ -260,6 +314,7 @@ class PPOLearner:
 
     def load_models(self, path):
         self.mac.load_models(path)
+        self.old_mac.load_state(self.mac)
         self.critic.load_state_dict(
             th.load(
                 "{}/critic.th".format(path), map_location=lambda storage, loc: storage

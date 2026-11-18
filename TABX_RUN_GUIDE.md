@@ -1,4 +1,4 @@
-# TABX QMIX：服务器运行说明
+# TABX MAPPO 和 QMIX 服务器运行说明
 
 本分支默认 `timeout_rule=hp`；共同代码也支持 `loss`，两规则均有测试。模拟器固定使用仓库内官方子模块 `third_party/TABX`，任务 JSON 和模型/数据输出路径由运行参数指定。训练划分、逐局种子和 CPU 队列协议沿用原方案；旧快照和旧采集数据不混入这次迁移。
 
@@ -23,7 +23,7 @@ python -m pip install -r requirements-tabx.txt
 ```bash
 export TASK_BANK="data/tasks/1106_tasks_merged_multiagent.json"
 export TASK_SHA256="775cee683a650a726f056f05a20b1dc67d9b09104ceff9fb26ca0d11b4ac6887"
-export RESULT_ROOT="$EPYMARL_ROOT/results/tabx-official-v1"
+export RESULT_ROOT="$EPYMARL_ROOT/results/tabx-mappo-hp-advanced"
 export RULE=hp
 ```
 
@@ -50,7 +50,9 @@ RESULT_ROOT/
     manifest.json                   # 任务/任务库 hash、版本、种子协议、部署信息
     config.json                     # 运行配置
     checkpoints/<实际环境步数>/
-      agent.th  mixer.th  opt.th
+      agent.th
+      critic.th  agent_opt.th  critic_opt.th  # MAPPO
+      mixer.th  opt.th                        # QMIX
       config.json  manifest.json    # 完整配置及 agent/config SHA-256
     evaluation_requests/<step>.json # 原 request_id、实际 checkpoint_step
     evaluations/<request_id>.json   # 每局回报、终局、HP、吞吐和 CPU 信息
@@ -61,6 +63,7 @@ RESULT_ROOT/
       needs_training.json           # 不达标时的原因
     data/<tiers文件hash前缀>/<medium|high>/
       *.h5  manifest.json
+    train_metrics.csv                # MAPPO 策略损失、团队价值损失、熵、近似 KL 和裁剪比例
     training_summary.json
     training_episodes.jsonl          # 每局 episode_index / episode_seed / 长度 / t_env
     training_complete.json          # 正常结束后原子发布的完整 checkpoint 清单
@@ -71,7 +74,7 @@ RESULT_ROOT/
   _batches/<rule>/<batch_id>/eval_queue/ # 批次文件队列
 ```
 
-当前使用官方 `medium` 启发式对手。切换对手后使用新的输出目录；已有不同参数的目录会被拒绝。`tabx_semantics.json` 将官方仓库 URL、子模块 commit、实际使用的 `physics/parameters/default.json`、`heuristic_policy/parameters/medium.json` 的 SHA-256、观测布局版本及终局定义绑定到输出根目录。这些字段也写入 run、checkpoint、CPU 评估和 HDF5；加载快照前校验 JSON，即使只修改参数 JSON 而没有修改 Python 源码，也不能悄悄改变模拟器。
+本分支的 TABX 训练和 CPU 评估统一使用官方 `advanced` 启发式对手。使用新的输出目录，已有 `medium` 参数清单的目录会被拒绝。`tabx_semantics.json` 将官方仓库 URL、子模块 commit、实际使用的 `physics/parameters/default.json` 和 `heuristic_policy/parameters/advanced.json` 的 SHA-256、观测布局版本及终局定义绑定到输出根目录。这些字段也写入 run、checkpoint、CPU 评估和 HDF5，加载快照时校验参数文件的哈希。
 
 快照和 tiers 内的模型引用相对于 `RESULT_ROOT`。整体迁移后使用新的 `--root` 和 `--bank`，项目内仍初始化同一子模块。运行清单中的原始绝对路径只用于溯源。权重、配置、源代码内容及 JAX/jaxlib/PyTorch 版本在加载前校验；CPU/CUDA wheel 的本地版本后缀可以不同。
 
@@ -115,7 +118,43 @@ python "$EPYMARL_ROOT/src/tabx_pipeline.py" check-env \
 
 ## 3. 冒烟与正式训练
 
+### MAPPO
+
+用任务 23 验证训练、最终快照和 CPU 贪心评估。
+
 ```bash
+SMOKE_ROOT="${RESULT_ROOT}-smoke"
+JAX_PLATFORMS=cpu python "$EPYMARL_ROOT/src/main.py" \
+  --config=mappo_tabx --env-config=tabx with \
+  'env_args.key="23"' env_args.task_bank="$TASK_BANK" \
+  env_args.expected_bank_hash="$TASK_SHA256" env_args.timeout_rule="$RULE" \
+  tabx_output_root="$SMOKE_ROOT" seed=1 use_cuda=False \
+  t_max=3000 batch_size=2 buffer_size=2 save_model_interval=1000 tabx_screen_episodes=2
+
+python "$EPYMARL_ROOT/src/tabx_pipeline.py" eval-worker \
+  --root "$SMOKE_ROOT" --bank "$TASK_BANK" --bank-sha256 "$TASK_SHA256" --rule "$RULE" --once
+```
+
+正式训练用同一配置运行 403、647、657，使用训练 seed 1、评估 master seed 0 和默认的 150 万步预算。每批用同一版策略收集 8 局，整批做 4 个 PPO epoch。Critic 将存活友方槽位的输出聚合为团队价值，每个有效环境步计算一次损失。5 步目标在对局继续时使用后续团队价值，在整局终止时保留最后一步奖励并截断 bootstrap。
+
+```bash
+for task in 403 647 657; do
+  JAX_PLATFORMS=cpu python "$EPYMARL_ROOT/src/main.py" \
+    --config=mappo_tabx --env-config=tabx with \
+    env_args.key="\"$task\"" env_args.task_bank="$TASK_BANK" \
+    env_args.expected_bank_hash="$TASK_SHA256" env_args.timeout_rule="$RULE" \
+    tabx_output_root="$RESULT_ROOT" seed=1 tabx_master_seed=0
+done
+```
+
+对照 MAPPO 和 QMIX 时，两种算法都使用本分支的 `advanced` 对手和相同任务、规则及种子。历史 `medium` 结果单独列为参考。
+
+### QMIX
+
+在独立 shell 中为 QMIX 设置结果目录，后续 CPU 评估使用同一个 `RESULT_ROOT`。
+
+```bash
+export RESULT_ROOT="$EPYMARL_ROOT/results/tabx-qmix-hp-advanced"
 JAX_PLATFORMS=cpu python "$EPYMARL_ROOT/src/main.py" \
   --config=qmix_tabx --env-config=tabx with \
   'env_args.key="23"' env_args.task_bank="$TASK_BANK" \

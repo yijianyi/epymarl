@@ -1,7 +1,9 @@
 import datetime
+from functools import partial
 import json
 import os
 from os.path import dirname, abspath
+from pathlib import Path
 import pprint
 import shutil
 import time
@@ -121,6 +123,10 @@ def evaluate_sequential(args, runner):
 
 
 def run_sequential(args, logger):
+    tabx_ppo = args.env == "tabx" and args.learner == "ppo_learner"
+    if tabx_ppo and (args.batch_size < 1 or args.buffer_size != args.batch_size):
+        raise ValueError("TABX PPO requires buffer_size=batch_size>=1")
+
     # Init runner so we can get env info
     runner = r_REGISTRY[args.runner](args=args, logger=logger)
 
@@ -130,9 +136,12 @@ def run_sequential(args, logger):
     args.n_actions = env_info["n_actions"]
     args.state_shape = env_info["state_shape"]
 
-    scheme, groups, preprocess = build_batch_schema(env_info, args.common_reward)
+    scheme, groups, preprocess = build_batch_schema(
+        env_info, args.common_reward, include_agent_alive=tabx_ppo
+    )
 
-    buffer = ReplayBuffer(
+    new_buffer = partial(
+        ReplayBuffer,
         scheme,
         groups,
         args.buffer_size,
@@ -140,6 +149,7 @@ def run_sequential(args, logger):
         preprocess=preprocess,
         device="cpu" if args.buffer_cpu_only else args.device,
     )
+    buffer = new_buffer()
 
     # Setup multiagent controller here
     mac = mac_REGISTRY[args.mac](buffer.scheme, groups, args)
@@ -170,7 +180,6 @@ def run_sequential(args, logger):
         # Accept either a concrete snapshot or an existing numbered parent.
         if os.path.isfile(os.path.join(args.checkpoint_path, "agent.th")):
             model_path = args.checkpoint_path
-            from pathlib import Path
             timestep_to_load = int(Path(model_path).name) if Path(model_path).name.isdigit() else 0
         else:
             model_path = None
@@ -229,21 +238,32 @@ def run_sequential(args, logger):
 
     logger.console_logger.info("Beginning training for {} timesteps".format(args.t_max))
 
-    while runner.t_env < args.t_max or (not async_tabx and runner.t_env == args.t_max):
+    while runner.t_env < args.t_max or (
+        not async_tabx and not tabx_ppo and runner.t_env == args.t_max
+    ):
         # Run for a whole episode at a time
         episode_batch = runner.run(test_mode=False)
         if args.env == "tabx":
-            from pathlib import Path
             record = dict(episode_index=runner.env.last_train_episode_index,
                           episode_seed=runner.env.last_episode_seed, t_env=runner.t_env,
-                          epsilon=float(mac.action_selector.epsilon),
+                          action_selection=args.action_selector,
                           **runner.last_episode_info)
+            if tabx_ppo:
+                record["policy_version"] = learner.training_steps
+            elif hasattr(mac.action_selector, "epsilon"):
+                record["epsilon"] = float(mac.action_selector.epsilon)
             with (Path(args.tabx_run_dir) / "training_episodes.jsonl").open("a", encoding="utf-8") as stream:
                 stream.write(json.dumps(record, sort_keys=True, allow_nan=False) + "\n")
         buffer.insert_episode_batch(episode_batch)
 
-        if buffer.can_sample(args.batch_size):
-            episode_sample = buffer.sample(args.batch_size)
+        rollout_ready = tabx_ppo and (
+            buffer.episodes_in_buffer == args.batch_size or runner.t_env >= args.t_max
+        )
+        if rollout_ready or (not tabx_ppo and buffer.can_sample(args.batch_size)):
+            if rollout_ready:
+                episode_sample = buffer[:buffer.episodes_in_buffer]
+            else:
+                episode_sample = buffer.sample(args.batch_size)
 
             # Truncate batch to only filled timesteps
             max_ep_t = episode_sample.max_t_filled()
@@ -253,6 +273,8 @@ def run_sequential(args, logger):
                 episode_sample.to(args.device)
 
             learner.train(episode_sample, runner.t_env, episode)
+            if rollout_ready:
+                buffer = new_buffer()
             if async_tabx:
                 logger.log_stat("learner_updates", learner.training_steps, runner.t_env)
 
@@ -274,12 +296,14 @@ def run_sequential(args, logger):
             for _ in range(n_test_runs):
                 runner.run(test_mode=True)
 
-        if publisher is not None and runner.t_env >= publisher.next_save:
+        can_save = not tabx_ppo or rollout_ready
+        if publisher is not None and can_save and runner.t_env >= publisher.next_save:
             publisher.publish(learner, runner.t_env)
 
-        if not async_tabx and args.save_model and (
+        if not async_tabx and can_save and args.save_model and (
             runner.t_env - model_save_time >= args.save_model_interval
             or model_save_time == 0
+            or (tabx_ppo and runner.t_env >= args.t_max)
         ):
             model_save_time = runner.t_env
             save_path = os.path.join(

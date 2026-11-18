@@ -9,18 +9,21 @@ import statistics
 import tempfile
 
 TRAIN_METRICS_VERSION = "tabx-train-metrics-v2-mask-mean"
+PPO_TRAIN_METRICS_VERSION = "tabx-ppo-train-metrics-v1"
 
 TRAIN_FIELDS = ("t_env", "learner_updates", "loss", "td_error_abs", "grad_norm_before_clip",
                 "grad_norm_clip", "q_taken_mean", "target_mean", "lr")
+PPO_TRAIN_FIELDS = ("t_env", "learner_updates", "rollout_episodes", "policy_loss", "critic_loss",
+                    "entropy", "approx_kl", "clip_fraction")
 EVAL_FIELDS = ("request_id", "checkpoint_step", "phase", "action_selection", "episodes", "wins",
                "win_rate_pct", "mean_return", "return_std", "elimination_wins", "timeout_wins", "pure_timeouts")
 
 
-def append_train_metrics(path, row):
+def append_train_metrics(path, row, *, fields=TRAIN_FIELDS):
     """Only the owning trainer writes this file; each row uses the update's t_env."""
     path = Path(path)
     with path.open("a", newline="", encoding="utf-8") as stream:
-        writer = csv.DictWriter(stream, fieldnames=TRAIN_FIELDS)
+        writer = csv.DictWriter(stream, fieldnames=fields)
         if stream.tell() == 0:
             writer.writeheader()
         writer.writerow(row)

@@ -64,7 +64,9 @@ def build_rollout(snapshot, bank, rule, tabx_root=None, random_policy=False):
     runner = EpisodeRunner(args, QuietLogger())
     info = runner.get_env_info()
     args.n_agents, args.n_actions, args.state_shape = info["n_agents"], info["n_actions"], info["state_shape"]
-    scheme, groups, preprocess = build_batch_schema(info)
+    scheme, groups, preprocess = build_batch_schema(
+        info, args.common_reward, include_agent_alive=config.get("learner") == "ppo_learner"
+    )
     derived = EpisodeBatch(scheme, groups, 1, 1, preprocess=preprocess)
     if random_policy:
         class RandomMAC:

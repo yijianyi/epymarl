@@ -157,6 +157,9 @@ class TABXWrapper(MultiAgentEnv):
     def get_avail_agent_actions(self, agent_id):
         return self._avail[agent_id].copy()
 
+    def get_agent_alive(self):
+        return self._all_alive[:self.n_agents].copy()
+
     def get_obs_size(self):
         return 378
 
@@ -168,7 +171,7 @@ class TABXWrapper(MultiAgentEnv):
 
     def get_frame(self):
         return dict(obs=self.get_obs(), state=self.get_state(), avail_actions=self.get_avail_actions(),
-                    present=self._present_all[:10].astype(np.uint8), alive=self._all_alive[:10].astype(np.uint8))
+                    present=self._present_all[:10].astype(np.uint8), alive=self.get_agent_alive().astype(np.uint8))
 
     def get_native_observations(self):
         return {key: value.copy() for key, value in self._native_obs.items()}

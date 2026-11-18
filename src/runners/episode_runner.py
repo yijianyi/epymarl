@@ -1,6 +1,7 @@
 from functools import partial
 
 import numpy as np
+import torch as th
 
 from components.episode_buffer import EpisodeBatch
 from envs import REGISTRY as env_REGISTRY
@@ -50,6 +51,7 @@ class EpisodeRunner:
             device=self.args.device,
         )
         self.mac = mac
+        self.record_agent_alive = "agent_alive" in scheme
 
     def get_env_info(self):
         return self.env.get_env_info()
@@ -68,6 +70,17 @@ class EpisodeRunner:
             self.env.reset(seed=episode_seed)
         self.t = 0
 
+    def _state_data(self):
+        data = {
+            "state": [self.env.get_state()],
+            "avail_actions": [self.env.get_avail_actions()],
+            "obs": [self.env.get_obs()],
+        }
+        if self.record_agent_alive:
+            data["agent_alive"] = [self.env.get_agent_alive()]
+        return data
+
+    @th.no_grad()
     def run(self, test_mode=False, *, episode_seed=None, recorder=None):
         self.reset(episode_seed=episode_seed)
         if recorder is not None:
@@ -81,13 +94,7 @@ class EpisodeRunner:
         self.mac.init_hidden(batch_size=self.batch_size)
 
         while not terminated:
-            pre_transition_data = {
-                "state": [self.env.get_state()],
-                "avail_actions": [self.env.get_avail_actions()],
-                "obs": [self.env.get_obs()],
-            }
-
-            self.batch.update(pre_transition_data, ts=self.t)
+            self.batch.update(self._state_data(), ts=self.t)
 
             # Pass the entire batch of experiences up till now to the agents
             # Receive the actions for each agent at this timestep in a batch of size 1
@@ -117,18 +124,13 @@ class EpisodeRunner:
 
             self.t += 1
 
-        last_data = {
-            "state": [self.env.get_state()],
-            "avail_actions": [self.env.get_avail_actions()],
-            "obs": [self.env.get_obs()],
-        }
         if test_mode and self.args.render:
             print(f"Episode return: {episode_return}")
-        self.batch.update(last_data, ts=self.t)
+        self.batch.update(self._state_data(), ts=self.t)
 
-        # Select actions in the last stored state
+        # Preserve the final-state action in the batch without drawing a PPO training sample.
         actions = self.mac.select_actions(
-            self.batch, t_ep=self.t, t_env=self.t_env, test_mode=test_mode
+            self.batch, t_ep=self.t, t_env=self.t_env, test_mode=test_mode or self.record_agent_alive
         )
         self.batch.update({"actions": actions}, ts=self.t)
 
@@ -156,7 +158,7 @@ class EpisodeRunner:
             self._log(cur_returns, cur_stats, log_prefix)
         elif self.t_env - self.log_train_stats_t >= self.args.runner_log_interval:
             self._log(cur_returns, cur_stats, log_prefix)
-            if hasattr(self.mac.action_selector, "epsilon"):
+            if not self.record_agent_alive and hasattr(self.mac.action_selector, "epsilon"):
                 self.logger.log_stat(
                     "epsilon", self.mac.action_selector.epsilon, self.t_env
                 )

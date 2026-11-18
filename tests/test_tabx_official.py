@@ -12,7 +12,7 @@ import pytest
 
 from envs.tabx_layout import TABXLayout, LAYOUT_VERSION, SIMULATOR_CONTRACT
 from envs.tabx_outcome import adjudicate, replace_terminal_reward
-from envs.tabx_tasks import import_tabx, validate_task_structure, official_tabx_root, file_sha256
+from envs.tabx_tasks import build_task_params, import_tabx, validate_task_structure, official_tabx_root, file_sha256
 from tabx_storage import atomic_json, ensure_output_contract, read_json, simulator_identity
 
 
@@ -113,6 +113,32 @@ def test_json_parameters_and_output_root_are_part_of_the_contract(tmp_path):
     atomic_json(new / "tabx_semantics.json", dict(identity, layout_version="legacy"))
     with pytest.raises(ValueError, match="different TABX"):
         ensure_output_contract(new)
+
+
+def test_advanced_enemy_parameters_match_recorded_identity():
+    params, _ = build_task_params(tiny_task())
+    enemy = params["heuristic_params"]
+    assert np.asarray(enemy.epsilon).item() == pytest.approx(0.1)
+    assert np.asarray(enemy.aggressive_threshold).item() == pytest.approx(0.5)
+
+    path = "src/tabx/heuristic_policy/parameters/advanced.json"
+    assert simulator_identity()["parameter_json_sha256"][path] == file_sha256(official_tabx_root() / path)
+
+
+def test_medium_output_root_is_rejected_without_changing_manifest(tmp_path):
+    identity = simulator_identity()
+    hashes = identity["parameter_json_sha256"]
+    hashes.pop("src/tabx/heuristic_policy/parameters/advanced.json")
+    medium_path = "src/tabx/heuristic_policy/parameters/medium.json"
+    hashes[medium_path] = file_sha256(official_tabx_root() / medium_path)
+    marker = tmp_path / "tabx_semantics.json"
+    atomic_json(marker, identity)
+    before = marker.read_bytes()
+
+    with pytest.raises(ValueError, match="different TABX"):
+        ensure_output_contract(tmp_path)
+
+    assert marker.read_bytes() == before
 
 
 def test_parameter_json_drift_rejects_a_snapshot(monkeypatch, tmp_path):

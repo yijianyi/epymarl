@@ -13,7 +13,9 @@ import tempfile
 import time
 import uuid
 
-from envs.tabx_tasks import TRAIN_SEED_PROTOCOL, OFFICIAL_TABX_URL, file_sha256, import_tabx, official_tabx_root
+from envs.tabx_tasks import (
+    ENEMY_HEURISTIC, OFFICIAL_TABX_URL, TRAIN_SEED_PROTOCOL, file_sha256, import_tabx, official_tabx_root,
+)
 from envs.tabx_layout import LAYOUT_VERSION, SIMULATOR_CONTRACT
 
 SEED_PROTOCOL = "sha256-json-v1:uint32(task_hash,master_seed,phase,index,stream)"
@@ -91,7 +93,8 @@ def runtime_versions():
 
 def simulator_identity():
     root = official_tabx_root().resolve()
-    files = ("src/tabx/physics/parameters/default.json", "src/tabx/heuristic_policy/parameters/medium.json")
+    files = ("src/tabx/physics/parameters/default.json",
+             f"src/tabx/heuristic_policy/parameters/{ENEMY_HEURISTIC}.json")
     if not all((root / name).is_file() for name in files):
         raise ImportError("Official TABX submodule missing; run git submodule update --init --recursive")
     return dict(simulator_contract=SIMULATOR_CONTRACT, layout_version=LAYOUT_VERSION,
@@ -173,7 +176,7 @@ def validate_snapshot(path, task_manifest, rule, *, check_runtime=True):
 
 
 def create_run(config, task_manifest):
-    from tabx_reporting import TRAIN_METRICS_VERSION
+    from tabx_reporting import PPO_TRAIN_METRICS_VERSION, TRAIN_METRICS_VERSION
     root_value = config.get("tabx_output_root")
     if not root_value:
         raise ValueError("Set tabx_output_root to your server's output directory")
@@ -191,7 +194,8 @@ def create_run(config, task_manifest):
     config["tabx_run_dir"] = str(path)
     config["local_results_path"] = str(path)
     manifest = dict(schema_version="tabx-run-1", run_id=run_id, timeout_rule=rule,
-                    training_metrics_version=TRAIN_METRICS_VERSION,
+                    training_metrics_version=(PPO_TRAIN_METRICS_VERSION if config.get("learner") == "ppo_learner"
+                                              else TRAIN_METRICS_VERSION),
                     task_id=task_manifest["task_id"], task_hash=task_manifest["task_hash"],
                     bank_hash=task_manifest["bank_hash"], task_manifest=task_manifest,
                     train_seed=int(config["seed"]), master_seed=int(config.get("tabx_master_seed", 0)),
