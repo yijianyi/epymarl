@@ -10,6 +10,8 @@ from tabx_pipeline import main
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tasks", required=True, help="Comma-separated TABX task IDs")
+    parser.add_argument("--jobs-per-gpu", type=int, default=1,
+                        help="Maximum concurrent training processes per GPU (default: 1)")
     options = parser.parse_args()
 
     for name in ("TASK_BANK", "RESULT_ROOT", "GPUS"):
@@ -29,6 +31,7 @@ if __name__ == "__main__":
         "batch-train", "--alg", "mappo_tabx", "--rule", "hp", "--skip-bank-hash-check",
         "--bank", os.environ["TASK_BANK"], "--root", str(output), "--tasks", options.tasks,
         "--batch-id", batch_id, "--gpus", gpus, "--eval-workers", "4",
+        "--jobs-per-gpu", str(options.jobs_per_gpu),
     ]
     if (output / "_batches" / "hp" / batch_id / "batch.json").is_file():
         args.append("--resume")
