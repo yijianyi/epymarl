@@ -24,6 +24,8 @@ eps_clip: 0.2
 entropy_coef: 0.001
 grad_norm_clip: 10
 gamma: 0.99
+use_gae: true
+gae_lambda: 0.97
 q_nstep: 5
 target_update_interval_or_tau: 0.01
 standardise_rewards: false
@@ -38,4 +40,4 @@ obs_individual_obs: false
 
 save_model: true
 save_model_interval: 25000
-t_max: 1500000
+t_max: 80000000

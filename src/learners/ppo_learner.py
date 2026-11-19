@@ -17,6 +17,7 @@ class PPOLearner:
         self.n_actions = args.n_actions
         self.logger = logger
         self.tabx_rollouts = "agent_alive" in scheme
+        self.use_gae = self.tabx_rollouts and getattr(args, "use_gae", False)
 
         self.mac = mac
         self.old_mac = copy.deepcopy(mac)
@@ -72,7 +73,20 @@ class PPOLearner:
                 rewards = rewards.expand(-1, -1, self.n_agents)
 
         actor_count = actor_mask.sum()
+        gae_advantages = None
+        gae_targets = None
         with th.no_grad():
+            if self.use_gae:
+                alive = batch["agent_alive"].squeeze(-1)
+                team_values = self._tabx_team_values(self.critic(batch).squeeze(-1), alive)
+                if self.args.standardise_returns:
+                    team_values = team_values * th.sqrt(self.ret_ms.var) + self.ret_ms.mean
+                gae_advantages, gae_targets = self._tabx_gae(
+                    rewards, transition_mask, batch["terminated"][:, :-1].bool(), team_values
+                )
+                if self.args.standardise_returns:
+                    gae_targets = self._standardise_targets(gae_targets)
+
             old_mac_out = []
             self.old_mac.init_hidden(batch.batch_size)
             for t in range(batch.max_seq_length - 1):
@@ -83,7 +97,7 @@ class PPOLearner:
             old_pi_taken = th.gather(old_pi, dim=3, index=actions).squeeze(3)
             old_log_pi_taken = th.log(old_pi_taken + 1e-10)
 
-        for k in range(self.args.epochs):
+        for _ in range(self.args.epochs):
             mac_out = []
             self.mac.init_hidden(batch.batch_size)
             for t in range(batch.max_seq_length - 1):
@@ -92,9 +106,11 @@ class PPOLearner:
             mac_out = th.stack(mac_out, dim=1)  # Concat over time
 
             pi = mac_out
-            advantages, critic_train_stats = self.train_critic_sequential(
-                self.critic, self.target_critic, batch, rewards, critic_mask
+            critic_advantages, critic_train_stats = self.train_critic_sequential(
+                self.critic, self.target_critic, batch, rewards, critic_mask,
+                target_returns=gae_targets,
             )
+            advantages = gae_advantages if self.use_gae else critic_advantages
             advantages = advantages.detach().expand_as(actor_mask)
             # Calculate policy grad with mask
 
@@ -130,16 +146,17 @@ class PPOLearner:
         self.old_mac.load_state(self.mac)
 
         self.training_steps += 1
-        if (
-            self.args.target_update_interval_or_tau > 1
-            and (self.training_steps - self.last_target_update_step)
-            / self.args.target_update_interval_or_tau
-            >= 1.0
-        ):
-            self._update_targets_hard()
-            self.last_target_update_step = self.training_steps
-        elif self.args.target_update_interval_or_tau <= 1.0:
-            self._update_targets_soft(self.args.target_update_interval_or_tau)
+        if not self.use_gae:
+            if (
+                self.args.target_update_interval_or_tau > 1
+                and (self.training_steps - self.last_target_update_step)
+                / self.args.target_update_interval_or_tau
+                >= 1.0
+            ):
+                self._update_targets_hard()
+                self.last_target_update_step = self.training_steps
+            elif self.args.target_update_interval_or_tau <= 1.0:
+                self._update_targets_soft(self.args.target_update_interval_or_tau)
 
         ppo_stats = {}
         if self.tabx_rollouts:
@@ -191,28 +208,26 @@ class PPOLearner:
                 self.logger.log_stat(key, value, t_env)
             self.log_stats_t = t_env
 
-    def train_critic_sequential(self, critic, target_critic, batch, rewards, mask):
-        # Optimise critic
-        with th.no_grad():
-            target_vals = target_critic(batch).squeeze(3)
+    def train_critic_sequential(self, critic, target_critic, batch, rewards, mask, *,
+                                target_returns=None):
+        alive = batch["agent_alive"].squeeze(-1) if self.tabx_rollouts else None
+        if target_returns is None:
+            with th.no_grad():
+                target_vals = target_critic(batch).squeeze(3)
+                if alive is not None:
+                    target_vals = self._tabx_team_values(target_vals, alive)
+
+            if self.args.standardise_returns:
+                target_vals = target_vals * th.sqrt(self.ret_ms.var) + self.ret_ms.mean
+
             if self.tabx_rollouts:
-                alive = batch["agent_alive"].squeeze(-1)
-                target_vals = self._tabx_team_values(target_vals, alive)
-
-        if self.args.standardise_returns:
-            target_vals = target_vals * th.sqrt(self.ret_ms.var) + self.ret_ms.mean
-
-        if self.tabx_rollouts:
-            target_returns = self.tabx_nstep_returns(
-                rewards, mask, batch["terminated"][:, :-1].bool(), target_vals
-            )
-        else:
-            target_returns = self.nstep_returns(rewards, mask, target_vals, self.args.q_nstep)
-        if self.args.standardise_returns:
-            self.ret_ms.update(target_returns)
-            target_returns = (target_returns - self.ret_ms.mean) / th.sqrt(
-                self.ret_ms.var
-            )
+                target_returns = self.tabx_nstep_returns(
+                    rewards, mask, batch["terminated"][:, :-1].bool(), target_vals
+                )
+            else:
+                target_returns = self.nstep_returns(rewards, mask, target_vals, self.args.q_nstep)
+            if self.args.standardise_returns:
+                target_returns = self._standardise_targets(target_returns)
 
         running_log = {
             "critic_loss": [],
@@ -223,7 +238,7 @@ class PPOLearner:
         }
 
         v = critic(batch)[:, :-1].squeeze(3)
-        if self.tabx_rollouts:
+        if alive is not None:
             v = self._tabx_team_values(v, alive[:, :-1])
         td_error = target_returns.detach() - v
         masked_td_error = td_error * mask
@@ -249,10 +264,31 @@ class PPOLearner:
 
         return masked_td_error, running_log
 
+    def _standardise_targets(self, targets):
+        self.ret_ms.update(targets)
+        return (targets - self.ret_ms.mean) / th.sqrt(self.ret_ms.var)
+
     @staticmethod
     def _tabx_team_values(values, alive):
         live_count = alive.sum(dim=-1, keepdim=True).clamp_min(1)
         return values.masked_fill(~alive, 0).sum(dim=-1, keepdim=True) / live_count
+
+    def _tabx_gae(self, rewards, transition_mask, terminated, team_values):
+        continuation = transition_mask & ~terminated
+        state_values = team_values[:, :-1]
+        next_values = team_values[:, 1:].masked_fill(~continuation, 0)
+        deltas = rewards + self.args.gamma * next_values - state_values
+        deltas = deltas.masked_fill(~transition_mask, 0)
+
+        trace_decay = (self.args.gamma * self.args.gae_lambda) * continuation
+        advantages = th.zeros_like(deltas)
+        next_advantage = th.zeros_like(team_values[:, 0])
+        for t in reversed(range(rewards.size(1))):
+            next_advantage = deltas[:, t] + trace_decay[:, t] * next_advantage
+            advantages[:, t] = next_advantage
+
+        targets = (state_values + advantages).masked_fill(~transition_mask, 0)
+        return advantages, targets
 
     def tabx_nstep_returns(self, rewards, transition_mask, terminated, team_values):
         # Team value follows the episode through individual casualties.

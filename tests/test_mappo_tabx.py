@@ -11,11 +11,11 @@ from controllers.basic_controller import BasicMAC
 from learners.ppo_learner import PPOLearner
 
 
-@pytest.fixture
-def tabx_ppo():
+def make_tabx_ppo(**overrides):
     config_path = Path(__file__).resolve().parents[1] / "src/config/algs/mappo_tabx.yaml"
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    config.update(gamma=0.5, epochs=1, entropy_coef=0.)
+    config.update(gamma=0.5, epochs=1, entropy_coef=0., use_gae=False)
+    config.update(overrides)
     args = SimpleNamespace(
         **config, common_reward=True, use_cuda=False, n_agents=2, n_actions=2, learner_log_interval=1
     )
@@ -38,8 +38,8 @@ class FixedCritic(torch.nn.Module):
         return self.values.unsqueeze(-1)
 
 
-def test_tabx_ppo_uses_team_targets_and_masks_actor_slots(tabx_ppo):
-    learner, batch, stats = tabx_ppo
+def test_tabx_ppo_uses_team_targets_and_masks_actor_slots():
+    learner, batch, stats = make_tabx_ppo()
     # One unit dies after the second transition. The other trajectory ends
     # after two transitions and leaves four padded frames.
     batch["filled"][0, :, 0] = 1
@@ -81,8 +81,8 @@ def test_tabx_ppo_uses_team_targets_and_masks_actor_slots(tabx_ppo):
     assert not learner.critic.values.grad[1, 2:].any()
 
 
-def test_tabx_ppo_ignores_nonzero_terminal_value_at_bootstrap_horizon(tabx_ppo):
-    learner, _, _ = tabx_ppo
+def test_tabx_ppo_ignores_nonzero_terminal_value_at_bootstrap_horizon():
+    learner, _, _ = make_tabx_ppo()
     rewards = torch.zeros(1, 5, 1)
     rewards[0, -1, 0] = 7.
     valid = torch.ones_like(rewards, dtype=torch.bool)
@@ -94,3 +94,71 @@ def test_tabx_ppo_ignores_nonzero_terminal_value_at_bootstrap_horizon(tabx_ppo):
     targets = learner.tabx_nstep_returns(rewards, valid, terminated, team_values)
 
     torch.testing.assert_close(targets.flatten(), torch.tensor([0.4375, 0.875, 1.75, 3.5, 7.]))
+
+
+def test_tabx_gae_freezes_team_advantages_and_targets_for_four_epochs(monkeypatch):
+    learner, batch, stats = make_tabx_ppo(use_gae=True, gamma=0.99, epochs=4)
+    batch["filled"][0, :4, 0] = 1
+    batch["filled"][1, :3, 0] = 1
+    batch["avail_actions"].fill_(1)
+    batch["terminated"][0, 2, 0] = batch["terminated"][1, 1, 0] = 1
+    batch["reward"].fill_(100.)
+    batch["reward"][0, :3, 0] = torch.tensor([0., 0., 1.])
+    batch["reward"][1, :2, 0] = torch.tensor([0., 1.])
+    batch["agent_alive"][0, :4, 0] = batch["agent_alive"][0, 0, 1] = True
+    batch["agent_alive"][1, :3] = True
+    initial_values = torch.full((2, 7, 2), 500.)
+    initial_values[0, :4, 0] = torch.tensor([2., 1., 2., 999.])
+    initial_values[0, 0, 1] = 4.
+    initial_values[1, :2] = 0.
+    initial_values[1, 2] = 999.
+    learner.critic = FixedCritic(initial_values.clone())
+    learner.critic_params = list(learner.critic.parameters())
+    learner.critic_optimiser = torch.optim.Adam(learner.critic_params, lr=learner.args.lr)
+
+    def unexpected_target_critic(_batch):
+        pytest.fail("GAE must use the pre-update online critic")
+
+    monkeypatch.setattr(learner.target_critic, "forward", unexpected_target_critic)
+    computed_advantages, epoch_targets, actor_gradients = [], [], []
+    compute_gae = learner._tabx_gae
+    train_critic = learner.train_critic_sequential
+
+    def capture_advantages(*args):
+        assert not torch.is_grad_enabled()
+        advantages, targets = compute_gae(*args)
+        computed_advantages.append(advantages.clone())
+        return advantages, targets
+
+    def capture_targets(*args, target_returns):
+        assert not target_returns.requires_grad
+        epoch_targets.append(target_returns.clone())
+        return train_critic(*args, target_returns=target_returns)
+
+    def capture_actor_gradient():
+        # Hold the actor fixed so changes in the critic cannot be hidden by a policy update.
+        actor_gradients.append(torch.cat([param.grad.flatten() for param in learner.agent_params]))
+
+    monkeypatch.setattr(learner, "_tabx_gae", capture_advantages)
+    monkeypatch.setattr(learner, "train_critic_sequential", capture_targets)
+    monkeypatch.setattr(learner.agent_optimiser, "step", capture_actor_gradient)
+
+    learner.train(batch, t_env=5, episode_num=2)
+
+    expected_advantages = torch.tensor([
+        [-1.99108209, 0.0197, -1., 0., 0., 0.],
+        [0.9603, 1., 0., 0., 0., 0.],
+    ])
+    expected_targets = expected_advantages + torch.tensor([
+        [3., 1., 2., 0., 0., 0.], [0., 0., 0., 0., 0., 0.],
+    ])
+    assert len(computed_advantages) == 1
+    torch.testing.assert_close(computed_advantages[0].squeeze(-1), expected_advantages)
+    assert len(epoch_targets) == len(actor_gradients) == 4
+    for target, gradient in zip(epoch_targets, actor_gradients):
+        torch.testing.assert_close(target.squeeze(-1), expected_targets)
+        torch.testing.assert_close(gradient, actor_gradients[0])
+    assert not torch.equal(learner.critic.values, initial_values)
+    live_counts = torch.tensor([[2., 1., 1., 0., 0., 0.], [2., 2., 0., 0., 0., 0.]])
+    expected_policy_loss = -(expected_advantages * live_counts).sum() / live_counts.sum()
+    assert stats["pg_loss"] == pytest.approx(expected_policy_loss.item(), abs=1e-6)
