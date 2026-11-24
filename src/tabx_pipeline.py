@@ -177,6 +177,12 @@ def _eval_worker(args):
     from tabx_storage import ensure_output_contract
     ensure_output_contract(args.root)
     os.environ.setdefault("JAX_COMPILATION_CACHE_DIR", str(Path(args.root).expanduser().resolve() / "_jax_cache"))
+    owner = dict(pid=getattr(args, "scheduler_pid", None), process_start=getattr(args, "scheduler_start", None))
+    from tabx_scheduler import process_alive
+
+    def scheduler_alive():
+        return not owner["pid"] or process_alive(owner)
+
     if args.workers > 1:
         children = []
         command = [sys.executable, str(Path(__file__).resolve()), "eval-worker", "--root", args.root,
@@ -186,6 +192,8 @@ def _eval_worker(args):
             command.extend(["--tabx-root", args.tabx_root])
         if getattr(args, "batch_id", None):
             command.extend(["--batch-id", args.batch_id])
+        if owner["pid"]:
+            command.extend(["--scheduler-pid", str(owner["pid"]), "--scheduler-start", owner["process_start"]])
         if getattr(args, "external_dispatch", False) or args._dispatcher is not None:
             command.append("--external-dispatch")
         command.extend(["--eval-prefetch", str(getattr(args, "eval_prefetch", 4))])
@@ -207,13 +215,13 @@ def _eval_worker(args):
             for group in core_groups:
                 child_command = command + (["--cpu-affinity", ",".join(map(str, group))] if group else [])
                 children.append(subprocess.Popen(child_command, env=os.environ.copy()))
-            while any(child.poll() is None for child in children):
+            while scheduler_alive() and any(child.poll() is None for child in children):
                 if args._dispatcher is not None:
                     args._dispatcher.poll()
                 if any(child.poll() is not None and (child.returncode != 0 or not args.once) for child in children):
                     raise RuntimeError("An evaluation worker process exited unexpectedly")
                 time.sleep(0.5)
-            if any(child.returncode for child in children):
+            if scheduler_alive() and any(child.returncode for child in children):
                 raise RuntimeError("An evaluation worker process exited unsuccessfully")
         finally:
             for child in children:
@@ -233,7 +241,7 @@ def _eval_worker(args):
     if args.retry_failed:
         queue.retry_failed(args.rule, getattr(args, "batch_id", None))
     failed = False
-    while True:
+    while scheduler_alive():
         if args._dispatcher is not None:
             args._dispatcher.poll()
         claim = queue.claim(args.rule, args.lease_seconds, getattr(args, "batch_id", None))
@@ -612,6 +620,8 @@ def parser():
     worker.add_argument("--workers", type=int, default=1)
     worker.add_argument("--eval-prefetch", type=int, default=4)
     worker.add_argument("--external-dispatch", action="store_true", help=argparse.SUPPRESS)
+    worker.add_argument("--scheduler-pid", type=int, help=argparse.SUPPRESS)
+    worker.add_argument("--scheduler-start", help=argparse.SUPPRESS)
     worker.add_argument("--batch-id", help="Claim only this batch; omitted claims only unbatched single-run requests")
     worker.add_argument("--once", action="store_true", help="Drain the current queue, then exit")
     worker.add_argument("--retry-failed", action="store_true")

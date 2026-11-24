@@ -1,6 +1,4 @@
 """Recurrent MAPPO behavior cloning from verified official TABX demonstrations."""
-import hashlib
-import json
 from pathlib import Path
 
 import numpy as np
@@ -9,22 +7,16 @@ from torch.nn import functional as F
 
 from tabx_dataset import SCHEMA_VERSION, episodes_to_batch, read_episode, verify_shard
 from tabx_expert import HeuristicTeacher
-from tabx_expert_shards import demonstration_directory, published_expert_shards
-from tabx_storage import atomic_json, file_sha256, simulator_identity
+from tabx_expert_shards import demonstration_directory, read_expert_manifest, verified_expert_shards
+from tabx_storage import atomic_json, simulator_identity
 
 
 class DemonstrationPool:
     def __init__(self, env, args):
         task = env.manifest["task_id"]
         directory = demonstration_directory(args.tabx_demo_root, env.rule, task, args.tabx_bc_teacher)
-        manifest_path = directory / "manifest.json"
-        manifest_bytes = manifest_path.read_bytes()
-        self.manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
         expected_sha256 = getattr(args, "tabx_expected_demo_manifest_sha256", None)
-        if expected_sha256 is not None and self.manifest_sha256 != expected_sha256:
-            raise ValueError(f"Demonstration manifest SHA-256 mismatch for task {task}: "
-                             f"expected {expected_sha256}, got {self.manifest_sha256} ({manifest_path})")
-        self.manifest = json.loads(manifest_bytes)
+        self.manifest, self.manifest_sha256 = read_expert_manifest(directory, expected_sha256)
         metadata = self.manifest["metadata"]
         expected = dict(env.manifest, **HeuristicTeacher(env, args.tabx_bc_teacher).metadata(),
                         timeout_rule=env.rule, episode_limit=env.episode_limit, collection_phase="expert_collect")
@@ -33,18 +25,9 @@ class DemonstrationPool:
                 raise ValueError(f"Demonstration metadata mismatch: {key} in {directory}")
         identity = simulator_identity()
         self._check_identity(metadata, identity)
-        shards = self.manifest["shards"]
-        files = {path.name: path for path in published_expert_shards(directory)}
-        registered = {entry["path"] for entry in shards}
-        # The captured manifest defines the pool even if a collector publishes more shards.
-        if len(registered) != len(shards) or not registered.issubset(files):
-            raise ValueError("Demonstration manifest has duplicate or missing shards; rerun collect-expert")
         self.entries = []
         seeds = set()
-        for entry in shards:
-            path = files[entry["path"]]
-            if file_sha256(path) != entry["sha256"]:
-                raise ValueError(f"Demonstration shard SHA-256 mismatch: {path}")
+        for path in verified_expert_shards(directory, self.manifest):
             verified = verify_shard(path, {key: value for key, value in metadata.items() if key != "provenance"})
             self._check_identity(verified["metadata"], identity)
             if verified["schema_version"] != SCHEMA_VERSION or verified["label_source"] != "deterministic_teacher":

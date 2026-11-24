@@ -238,7 +238,10 @@ def run_sequential(args, logger):
                 else:
                     from tabx_imitation import pretrain_actor
                     pretrain_actor(learner, runner, args, logger)
-            publisher.publish(learner, 0, force_eval=True, policy_stage=stage, initial_weights=source)
+            step0 = publisher.publish(learner, 0, force_eval=True, policy_stage=stage, initial_weights=source)
+            if getattr(args, "tabx_publish_bc_step0", False) and source is None:
+                from tabx_online_start import publish_step0_record
+                publish_step0_record(args, runner.env.manifest, step0)
         else:
             publisher.next_save = (runner.t_env // publisher.interval + 1) * publisher.interval
 

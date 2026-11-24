@@ -53,6 +53,8 @@ tabx_bc_lr: 0.0005
 tabx_dagger_rounds: 0
 tabx_online_source: null
 tabx_source_index_sha256: null
+tabx_source_step0_sha256: null
+tabx_publish_bc_step0: false
 tabx_mix_start: 0.0
 tabx_mix_decay_steps: 50000
 tabx_mix_block_steps: 8

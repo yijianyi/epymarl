@@ -33,7 +33,7 @@ def safe_component(value):
     return value
 
 
-def atomic_json(path, value):
+def atomic_json(path, value, *, replace=True):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, tmp = tempfile.mkstemp(prefix=".publish-", dir=path.parent)
@@ -43,7 +43,10 @@ def atomic_json(path, value):
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(tmp, path)
+        if replace:
+            os.replace(tmp, path)
+        else:
+            os.link(tmp, path)
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)

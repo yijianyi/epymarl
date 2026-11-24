@@ -120,6 +120,37 @@ python "$EPYMARL_ROOT/src/tabx_pipeline.py" check-env \
 
 ### MAPPO 四组 Medium 实验
 
+#### 并行启动
+
+从仓库根目录在同一个 Python 3.10 环境中运行五个脚本。下面的任务列表可替换为任意逗号分隔的任务 ID。
+
+```bash
+TASK_BANK="/your/data/1106_tasks_merged_multiagent.json"
+TASKS="23,651,657,647"
+GPUS="0,1,2,3"
+
+python scripts/collect_mappo_medium_demos.py --bank "$TASK_BANK" --tasks "$TASKS" &
+python scripts/run_mappo_medium_a.py --bank "$TASK_BANK" --tasks "$TASKS" --gpus "$GPUS" &
+python scripts/run_mappo_medium_b.py --bank "$TASK_BANK" --tasks "$TASKS" --gpus "$GPUS" &
+python scripts/run_mappo_medium_c.py --bank "$TASK_BANK" --tasks "$TASKS" --gpus "$GPUS" &
+python scripts/run_mappo_medium_d.py --bank "$TASK_BANK" --tasks "$TASKS" --gpus "$GPUS" &
+wait
+```
+
+四组用同一 `--root`、`--rule`、`--gpus` 和 `--jobs-per-gpu`。训练根目录是共享名额池的作用范围。默认每卡合计 12 个训练进程，在就绪组之间轮转。采集默认同时运行 4 个 CPU 进程，每个训练组各有 1 个 CPU 评估 worker。相对路径从仓库根目录解析。各脚本的 `--help` 列出参数和默认值。
+
+采集脚本和 B 共用 `--collection-id`，默认值为 `default`。每个任务达到请求局数后，采集脚本在示范目录的 `collection.json` 发布就绪状态，记录请求局数、实际局数和 manifest 哈希。B 可以先启动，会等到对应采集 ID 的任务就绪，再在分配 GPU 前校验 HDF5 v3 分片和 episode 索引，锁定就绪记录给出的哈希。训练子进程在 BC 前复核锁定哈希及轨迹。
+
+B 每个 job 封存 `_batches/hp/<B 批次>/step0/<task>/<seed>.json` 后，C、D 即可使用其中的 actor 和 critic。B 结束时汇总已封存的 step‑0。各组的 `batch.log` 和 `batch_summary.csv` 可查询任务的等待、运行和完成状态。
+
+恢复训练组时给原命令追加 `--resume`。若 B 已封存某个 job 的 step‑0，在线重试从该权重开始。C、D 可以先恢复，等待 B 登记下一次调度尝试；新尝试确实失败且仍缺权重时，只结束受影响的 job。
+
+要纳入同目录补采的数据，给采集脚本和新 B 批次传入同一个新 `--collection-id`。为 B、C、D 指定新的 `--batch-id`，并把 C、D 的 `--source-batch-id` 指到新的 B。串行入口已有同名批次时，为并行实验使用新根目录或新批次名。
+
+短流程可设置两个任务并统一使用 `--episode-limit 8`。采集可用 `--workers 1 --episodes 4`，四组可用 `--seeds 1 --jobs-per-gpu 3 --t-max 128 --batch-size 2 --screen-episodes 2`，B 再加 `--bc-steps 2 --bc-batch-size 2`。如需缩短接管与 warmup，C/D 设 `--mix-decay-steps 32`，D 设 `--temp-peak-step 16 --temp-end-step 64`。使用独立的示范和训练根目录，并给 B 的 `--demo-root` 传入采集的 `--root`。
+
+#### 串行批次入口
+
 从仓库根目录运行以下命令。示范与训练分别写入不同的根目录。
 
 ```bash

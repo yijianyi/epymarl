@@ -28,7 +28,8 @@ BATCH_FIELDS = ("snapshot_time_utc", "task_id", "train_seed", "gpu", "status", "
 PROTECTED = {"env", "runner", "batch_size_run", "learner", "mixer", "mac", "agent", "use_rnn", "use_cuda",
              "device", "seed", "tabx_require_cuda", "tabx_batch_id", "tabx_assigned_gpu", "tabx_train_log",
              "tabx_run_id", "tabx_run_dir", "tabx_output_root", "tabx_source_index_sha256",
-             "tabx_expected_demo_manifest_sha256", "local_results_path", "checkpoint_path",
+             "tabx_expected_demo_manifest_sha256", "tabx_source_step0_sha256", "tabx_publish_bc_step0",
+             "local_results_path", "checkpoint_path",
              "evaluate", "save_replay", "env_args.key", "env_args.seed", "env_args.task_bank",
              "env_args.timeout_rule", "env_args.expected_bank_hash", "env_args.tabx_root"}
 
@@ -232,7 +233,7 @@ def _sacred(value):
     return repr(value) if isinstance(value, (bool, type(None))) else json.dumps(value)
 
 
-def derive_job_status(attempt):
+def derive_job_status(attempt, dependency=None):
     """One definition for state.json, CSV and terminal; only exact screen IDs count."""
     train = attempt.get("train_status", "pending")
     expected = attempt.get("eval_expected")
@@ -262,6 +263,12 @@ def derive_job_status(attempt):
         status = f"evaluation_{evaluation}"
     else:
         status = "evaluating"
+    if dependency == "dependency_failed":
+        status = dependency
+        if train != "complete":
+            train = "failed"
+    elif dependency and train != "complete":
+        status = dependency
     return dict(train_status=train, eval_status=evaluation, eval_expected=expected, eval_done=done,
                 eval_pending=counts["pending"] + counts["registered"], eval_running=counts["running"], eval_failed=counts["failed"],
                 eval_remaining=None if expected is None else max(0, expected - done), status=status)
@@ -270,6 +277,8 @@ def derive_job_status(attempt):
 class BatchScheduler:
     def __init__(self, args, directory, manifest, state):
         self.args, self.directory, self.manifest, self.state = args, directory, manifest, state
+        self.process_start = process_identity(os.getpid())
+        self.scheduler_attempt_id = None
         self.root = Path(args.root).expanduser().resolve()
         self.queue = EvalQueue(self.root)
         self.jobs = state["jobs"]
@@ -504,6 +513,8 @@ class BatchScheduler:
                    "--threads", str(self.args.eval_threads), "--poll-seconds", str(self.args.poll_seconds)]
         if self.args.eval_cpu_affinity:
             command.extend(["--cpu-affinity", self.args.eval_cpu_affinity])
+        if getattr(self.args, "medium_group", None):
+            command.extend(["--scheduler-pid", str(os.getpid()), "--scheduler-start", self.process_start])
         environment = dict(os.environ, CUDA_VISIBLE_DEVICES="", JAX_PLATFORMS="cpu", PYTHONUNBUFFERED="1")
         self.worker_log = (self.directory / "eval-workers.log").open("a", encoding="utf-8", buffering=1)
         self.worker = subprocess.Popen(command, cwd=REPOSITORY, env=environment, stdout=self.worker_log,
@@ -527,6 +538,9 @@ class BatchScheduler:
         return [sys.executable, str(REPOSITORY / "src/main.py"), f"--config={self.args.alg}", "--env-config=tabx", "with",
                 *[f"{key}={_sacred(value)}" for key, value in sorted(values.items())]]
 
+    def training_pass_fds(self, job, attempt):
+        return ()
+
     def launch(self, job, gpu):
         number = len(job["attempts"]) + 1
         run_id = f"{self.args.batch_id[:64]}-t{job['task_id'][:32]}-s{job['train_seed']}-a{number}-{uuid.uuid4().hex[:8]}"
@@ -548,7 +562,8 @@ class BatchScheduler:
         stream.flush()
         try:
             process = subprocess.Popen(command, cwd=REPOSITORY, env=environment, stdout=stream,
-                                       stderr=subprocess.STDOUT, start_new_session=True)
+                                       stderr=subprocess.STDOUT, start_new_session=True,
+                                       pass_fds=self.training_pass_fds(job, attempt))
         except OSError as error:
             stream.write(f"[FAILED] {error}\n")
             stream.close()
@@ -713,6 +728,12 @@ class BatchScheduler:
                           f"train_status={job['train_status']} eval_status={job['eval_status']} status={job['status']} "
                           f"eval_done={job['eval_done']} eval_expected={job['eval_expected']} eval_remaining={job['eval_remaining']}")
 
+    def seal_initial_weights(self, failed):
+        config = self.manifest["training_config"]
+        if not failed and config.get("tabx_bc") and not (config["tabx_online_source"] or config["tabx_mix_start"]):
+            from tabx_online_start import seal_step_zero
+            seal_step_zero(self.directory, self.root, self.jobs, self.manifest)
+
     def run(self):
         previous_handlers = {}
         def stop(signum, frame):
@@ -751,10 +772,7 @@ class BatchScheduler:
                 if training_done and (eval_done or self.worker_error):
                     self.verify_counts()
                     failed = bool(self.worker_error) or self.model_counts["complete"] != len(self.jobs)
-                    config = self.manifest["training_config"]
-                    if not failed and config.get("tabx_bc") and not (config["tabx_online_source"] or config["tabx_mix_start"]):
-                        from tabx_online_start import seal_step_zero
-                        seal_step_zero(self.directory, self.root, self.jobs, self.manifest)
+                    self.seal_initial_weights(failed)
                     self.state.update(status="failed" if failed else "complete", ended_at=time.time(),
                         failed_requests=[key for key, value in self.records.items() if value["status"] == "failed"],
                         worker_error=self.worker_error)
@@ -826,11 +844,15 @@ class BatchScheduler:
     def _write_runtime(self):
         if not self.authorized:
             return
-        atomic_json(self.directory / "runtime.json", dict(
+        runtime = dict(
             status=self.state["status"], worker=self.state.get("worker", {}), scheduler_pid=os.getpid(),
+            scheduler_start=self.process_start,
             updated_at=time.time(), active_trainers=[dict(job_id=job["job_id"], **{
                 key: job["attempts"][-1].get(key) for key in ("run_id", "run", "log", "gpu", "pid", "process_start", "started_at")})
-                for _, _, job in self.running.values()]))
+                for _, _, job in self.running.values()])
+        if self.scheduler_attempt_id is not None:
+            runtime["scheduler_attempt_id"] = self.scheduler_attempt_id
+        atomic_json(self.directory / "runtime.json", runtime)
 
     def _append_event(self, event):
         with (self.directory / "jobs.jsonl").open("a", encoding="utf-8") as stream:
@@ -847,7 +869,7 @@ class BatchScheduler:
         self.pending_train.clear()
         for job in self.jobs:
             attempt = job["attempts"][-1] if job["attempts"] else {}
-            derived = derive_job_status(attempt)
+            derived = derive_job_status(attempt, job.get("dependency_status"))
             if attempt:
                 attempt.update(derived)
             job.update(derived)
@@ -881,13 +903,14 @@ class BatchScheduler:
             latest_eval_episodes=latest.get("episodes"), latest_eval_wins=latest.get("wins"),
             latest_eval_win_rate_pct=latest.get("win_rate_pct"), latest_eval_mean_return=latest.get("mean_return"),
             latest_eval_return_std=latest.get("return_std"),
-            log_path=str(self.root / attempt["log"]) if attempt else None, error=attempt.get("error"))
+            log_path=str(self.root / attempt["log"]) if attempt else None,
+            error=job.get("dependency_error") or attempt.get("error"))
 
     def _flush_job(self, job_id):
         job = self.jobs_by_id[job_id]
         attempt = job["attempts"][-1] if job["attempts"] else {}
         if job_id in self.dirty_jobs:
-            derived = derive_job_status(attempt)
+            derived = derive_job_status(attempt, job.get("dependency_status"))
             previous_train, previous_model = self.status_cache[job_id]
             if previous_train != derived["train_status"]:
                 self.train_counts[previous_train] -= 1
@@ -933,7 +956,7 @@ class BatchScheduler:
         # Final verification is allowed to be O(batch size), unlike the hot path.
         trains, models, evaluations = Counter(), Counter(), Counter()
         for job in self.jobs:
-            derived = derive_job_status(job["attempts"][-1] if job["attempts"] else {})
+            derived = derive_job_status(job["attempts"][-1] if job["attempts"] else {}, job.get("dependency_status"))
             if any(job.get(key) != value for key, value in derived.items()):
                 raise RuntimeError("Job cache differs from its exact checkpoint completion status")
             trains[derived["train_status"]] += 1
@@ -957,7 +980,7 @@ def demonstration_manifest_hashes(config, rule, tasks):
     return hashes
 
 
-def batch_train(args):
+def batch_train(args, *, scheduler_class=BatchScheduler):
     for name in ("jobs_per_gpu", "eval_workers", "eval_threads", "eval_prefetch", "poll_seconds", "status_interval", "snapshot_interval"):
         if getattr(args, name) <= 0:
             raise ValueError(f"{name.replace('_', '-')} must be positive")
@@ -975,7 +998,8 @@ def batch_train(args):
         if Path(args.tabx_root).expanduser().resolve() != official_tabx_root().resolve():
             raise ValueError("Only the pinned official submodule may be used")
     config, overrides = training_config(args.overrides, algorithm=args.alg)
-    if config.get("tabx_online_source"):
+    medium_group = getattr(args, "medium_group", None)
+    if config.get("tabx_online_source") and not medium_group:
         from tabx_online_start import read_source_index, resolve_source
         index, digest = read_source_index(config["tabx_online_source"], args.rule, bank_hash)
         for task in tasks:
@@ -985,6 +1009,10 @@ def batch_train(args):
         config["tabx_source_index_sha256"] = overrides["tabx_source_index_sha256"] = digest
     identity = dict(rule=args.rule, tasks=tasks, seeds=seeds, bank_hash=bank_hash, task_hashes=hashes,
                     training_config=config, source_hash=code_hash(REPOSITORY))
+    if medium_group:
+        identity["medium_group"] = medium_group
+    if medium_group == "B":
+        identity["collection_id"] = args.collection_id
     if args.skip_bank_hash_check:
         identity["skip_bank_hash_check"] = True
     root = Path(args.root).expanduser().resolve()
@@ -994,14 +1022,18 @@ def batch_train(args):
     with batch_lock(directory):
         path = directory / "batch.json"
         trains_bc = config.get("tabx_bc") and not config["tabx_online_source"]
-        if trains_bc:
+        if medium_group == "B":
+            identity["demo_manifest_sha256"] = {}
+        elif trains_bc:
             demo_hashes = demonstration_manifest_hashes(config, args.rule, tasks)
             identity["demo_manifest_sha256"] = demo_hashes
         if path.exists():
             if not args.resume:
                 raise FileExistsError(f"Batch already exists: {directory}; use --resume")
             manifest = read_json(path)
-            if trains_bc:
+            if medium_group == "B":
+                identity["demo_manifest_sha256"] = manifest["identity"].get("demo_manifest_sha256")
+            elif trains_bc:
                 saved_identity = manifest["identity"]
                 frozen = saved_identity.get("demo_manifest_sha256")
                 if frozen is None and saved_identity["training_config"].get("tabx_bc") and not (
@@ -1019,12 +1051,13 @@ def batch_train(args):
             state = read_json(directory / "state.json")
             runtime_path = directory / "runtime.json"
             runtime = read_json(runtime_path) if runtime_path.exists() else {}
-            for previous in (state.get("worker", {}), runtime.get("worker", {})):
-                if process_alive(previous):
-                    raise RuntimeError(f"Previous batch worker PID {previous['pid']} is still running")
-            for trainer in runtime.get("active_trainers", []):
-                if process_alive(trainer):
-                    raise RuntimeError(f"Previous training PID {trainer['pid']} is still running; stop it before resuming")
+            if not medium_group:
+                for previous in (state.get("worker", {}), runtime.get("worker", {})):
+                    if process_alive(previous):
+                        raise RuntimeError(f"Previous batch worker PID {previous['pid']} is still running")
+                for trainer in runtime.get("active_trainers", []):
+                    if process_alive(trainer):
+                        raise RuntimeError(f"Previous training PID {trainer['pid']} is still running; stop it before resuming")
             # Per-job files are newer than the five-minute whole-batch snapshot.
             for index, job in enumerate(state["jobs"]):
                 job_id = job.get("job_id", f"{index:06d}")
@@ -1046,7 +1079,7 @@ def batch_train(args):
         else:
             if args.resume:
                 raise FileNotFoundError(f"Cannot resume a batch that has no batch.json: {directory}")
-            if trains_bc:
+            if trains_bc and not medium_group:
                 missing = sorted(task for task, digest in demo_hashes.items() if digest is None)
                 if missing:
                     raise FileNotFoundError(f"Missing demonstration manifests for tasks: {', '.join(missing)} "
@@ -1059,5 +1092,5 @@ def batch_train(args):
                                              for task in tasks for seed in seeds])
             atomic_json(path, manifest)
             atomic_json(directory / "state.json", state)
-        scheduler = BatchScheduler(args, directory, manifest, state)
+        scheduler = scheduler_class(args, directory, manifest, state)
         return scheduler.run()

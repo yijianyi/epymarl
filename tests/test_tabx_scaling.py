@@ -104,7 +104,8 @@ def test_one_evaluation_updates_one_job_and_duplicate_is_free(tmp_path, monkeypa
     manager = make_logical_batch(tmp_path)
     calls = []
     original = scheduling.derive_job_status
-    monkeypatch.setattr(scheduling, "derive_job_status", lambda attempt: (calls.append(attempt["run_id"]), original(attempt))[1])
+    monkeypatch.setattr(scheduling, "derive_job_status", lambda attempt, dependency=None: (
+        calls.append(attempt["run_id"]), original(attempt, dependency))[1])
     request = dict(run_id="run0", task_id="0", train_seed=1, rule="loss", snapshot="loss/0/1/run0/checkpoints/0",
                    phase="screen", action_selection="greedy", seeds=[7])
     report = dict(request=request, episodes=[dict(seed=7, is_win=1, end_reason=1, return_value=1)])

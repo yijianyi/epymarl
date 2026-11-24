@@ -215,7 +215,8 @@ def _shard_fields(data):
     return fields
 
 
-def verify_shard(path, expected=None):
+def verify_shard(path, expected=None, *, verify_trajectories=True):
+    """Validate a shard's structure, optionally decoding its episode payloads."""
     with h5py.File(path, "r") as data:
         fields = _shard_fields(data)
         schema = data.attrs["schema_version"]
@@ -243,14 +244,15 @@ def verify_shard(path, expected=None):
         for name, dtype in EPISODE_FIELDS.items():
             if data[f"episodes/{name}"].shape != (len(lengths),) or data[f"episodes/{name}"].dtype != np.dtype(dtype):
                 raise ValueError(f"Invalid episode dataset {name}")
-    for index in range(len(lengths)):
-        episode = read_episode(path, index)
-        validate_episode(episode, metadata.get("episode_limit", 512))
-        expected_present = np.broadcast_to(layout.present[:10], episode["frames"]["present"].shape)
-        if not np.array_equal(episode["frames"]["present"], expected_present):
-            raise ValueError("Present masks differ from the native roster")
-        if trajectory_hash(episode) != hashes[index]:
-            raise ValueError("Trajectory checksum mismatch")
+    if verify_trajectories:
+        for index in range(len(lengths)):
+            episode = read_episode(path, index)
+            validate_episode(episode, metadata.get("episode_limit", 512))
+            expected_present = np.broadcast_to(layout.present[:10], episode["frames"]["present"].shape)
+            if not np.array_equal(episode["frames"]["present"], expected_present):
+                raise ValueError("Present masks differ from the native roster")
+            if trajectory_hash(episode) != hashes[index]:
+                raise ValueError("Trajectory checksum mismatch")
     return dict(episodes=len(lengths), steps=int(so[-1]), frames=int(fo[-1]), seeds=seeds,
                 trajectory_hashes=hashes, metadata=metadata, schema_version=schema,
                 label_source=metadata.get("label_source", "executed_actions"), bytes=Path(path).stat().st_size)
