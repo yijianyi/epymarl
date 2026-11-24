@@ -4,14 +4,14 @@
 
 ## 1. 安装和指定路径
 
-从 EPyMARL 根目录初始化子模块，再使用 Python ≥3.10 的独立环境。`requirements-tabx.txt` 是 CPU 实测版本组合；训练服务器先安装对应 CUDA 的 PyTorch 2.6.0，再安装该文件。初版使用 JAX CPU 模拟、PyTorch CPU 或 GPU 策略/更新，不安装官方 pyproject 中整套 CUDA 依赖。
+从 EPyMARL 根目录初始化子模块，再使用 Python 3.10 的独立环境。固定版本的 TABX 子模块使用含 JAX 数组默认值的 dataclass。`requirements-tabx.txt` 是 CPU 实测版本组合；训练服务器先安装对应 CUDA 的 PyTorch 2.6.0，再安装该文件。模拟使用 JAX CPU，策略和更新使用 PyTorch。
 
 ```bash
 cd /your/server/epymarl
 export EPYMARL_ROOT="$PWD"
 git submodule update --init --recursive
 git submodule status
-python -m venv .venv-tabx
+python3.10 -m venv .venv-tabx
 source .venv-tabx/bin/activate
 # CPU 测试；GPU 服务器在这里改用对应 CUDA 的 wheel 源
 python -m pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu
@@ -23,7 +23,7 @@ python -m pip install -r requirements-tabx.txt
 ```bash
 export TASK_BANK="data/tasks/1106_tasks_merged_multiagent.json"
 export TASK_SHA256="775cee683a650a726f056f05a20b1dc67d9b09104ceff9fb26ca0d11b4ac6887"
-export RESULT_ROOT="$EPYMARL_ROOT/results/tabx-mappo-hp-advanced"
+export RESULT_ROOT="$EPYMARL_ROOT/results/tabx-mappo-hp-all-medium"
 export RULE=hp
 ```
 
@@ -53,7 +53,7 @@ RESULT_ROOT/
       agent.th
       critic.th  agent_opt.th  critic_opt.th  # MAPPO
       mixer.th  opt.th                        # QMIX
-      config.json  manifest.json    # 完整配置及 agent/config SHA-256
+      config.json  manifest.json    # 完整配置、actor/critic 权重和配置的 SHA-256
     evaluation_requests/<step>.json # 原 request_id、实际 checkpoint_step
     evaluations/<request_id>.json   # 每局回报、终局、HP、吞吐和 CPU 信息
     evaluations/partial/<request_id>/<seed>.json # 单局原子发布，恢复时复用
@@ -63,7 +63,7 @@ RESULT_ROOT/
       needs_training.json           # 不达标时的原因
     data/<tiers文件hash前缀>/<medium|high>/
       *.h5  manifest.json
-    train_metrics.csv                # MAPPO 策略损失、团队价值损失、熵、近似 KL 和裁剪比例
+    train_metrics.csv                # MAPPO 损失、动作熵、接管比例、采样温度和首轮概率比误差
     training_summary.json
     training_episodes.jsonl          # 每局 episode_index / episode_seed / 长度 / t_env
     training_complete.json          # 正常结束后原子发布的完整 checkpoint 清单
@@ -74,7 +74,7 @@ RESULT_ROOT/
   _batches/<rule>/<batch_id>/eval_queue/ # 批次文件队列
 ```
 
-本分支的 TABX 训练和 CPU 评估统一使用官方 `advanced` 启发式对手。使用新的输出目录，已有 `medium` 参数清单的目录会被拒绝。`tabx_semantics.json` 将官方仓库 URL、子模块 commit、实际使用的 `physics/parameters/default.json` 和 `heuristic_policy/parameters/advanced.json` 的 SHA-256、观测布局版本及终局定义绑定到输出根目录。这些字段也写入 run、checkpoint、CPU 评估和 HDF5，加载快照时校验参数文件的哈希。
+本分支的 TABX 示范、训练和 CPU 评估统一使用官方 `medium` 启发式对手，ε=0.20。为本实验指定新的输出目录。`tabx_semantics.json` 将官方仓库 URL、子模块 commit、实际使用的 `physics/parameters/default.json` 和 `heuristic_policy/parameters/medium.json` 的 SHA-256、观测布局版本及终局定义绑定到输出根目录。这些字段也写入 run、checkpoint、CPU 评估和 HDF5，加载快照时校验参数文件的哈希。
 
 快照和 tiers 内的模型引用相对于 `RESULT_ROOT`。整体迁移后使用新的 `--root` 和 `--bank`，项目内仍初始化同一子模块。运行清单中的原始绝对路径只用于溯源。权重、配置、源代码内容及 JAX/jaxlib/PyTorch 版本在加载前校验；CPU/CUDA wheel 的本地版本后缀可以不同。
 
@@ -118,13 +118,70 @@ python "$EPYMARL_ROOT/src/tabx_pipeline.py" check-env \
 
 ## 3. 冒烟与正式训练
 
-### MAPPO
+### MAPPO 四组 Medium 实验
+
+从仓库根目录运行以下命令。示范与训练分别写入不同的根目录。
+
+```bash
+export DEMO_ROOT="$EPYMARL_ROOT/results/tabx-demos-hp-medium-vs-medium"
+export RESULT_ROOT="$EPYMARL_ROOT/results/tabx-mappo-hp-all-medium"
+export TASKS="23,647,403,657" SEEDS="1,2,3" GPUS="0,1,2,3"
+export JOBS_PER_GPU=12 BUDGET=300000
+
+IFS=, read -r -a task_ids <<< "$TASKS"
+for task in "${task_ids[@]}"; do
+  python src/tabx_pipeline.py collect-expert \
+    --bank "$TASK_BANK" --bank-sha256 "$TASK_SHA256" \
+    --root "$DEMO_ROOT" --rule hp --task "$task" \
+    --teacher medium --opponent medium --seed 0 --episodes 128 --episode-limit 512 || break
+done
+```
+
+检查 `DEMO_ROOT/hp/<task>/medium/teacher_summary.json` 的胜局数、歼灭胜、超时胜和动作支持数。`zero_wins=true` 的任务会打印 `review_teacher_before_bc` 并保留示范。重跑采集会复用已通过校验的分片。HDF5 v3 的 `actions` 记录 ε=0.20 的实际动作，`teacher_actions` 记录同一状态下 ε=0 的标签。
+
+```bash
+train() {
+  local batch_id=$1
+  shift
+  python src/tabx_pipeline.py batch-train \
+    --alg mappo_tabx --bank "$TASK_BANK" --bank-sha256 "$TASK_SHA256" \
+    --root "$RESULT_ROOT" --rule hp --tasks "$TASKS" --seeds "$SEEDS" \
+    --gpus "$GPUS" --jobs-per-gpu "$JOBS_PER_GPU" --eval-workers 4 \
+    --batch-id "$batch_id" --set "t_max=$BUDGET" "$@"
+}
+
+bc=(--set tabx_bc=True --set "tabx_demo_root=$DEMO_ROOT"
+    --set tabx_bc_teacher=medium --set tabx_demo_opponent=medium
+    --set tabx_bc_steps=1000 --set tabx_bc_batch_size=32 --set tabx_dagger_rounds=0)
+
+train mappo-baseline
+train mappo-bc-medium "${bc[@]}"
+```
+
+B 组启动时在 `batch.json` 的 `identity.demo_manifest_sha256` 中锁定各任务的示范版本。`--resume` 会列出 manifest 已变化的任务并停止，排队的子进程也会在 BC 前校验预期哈希。要使用补采后的示范，为 B 指定新的 `--batch-id`，并让 C、D 指向新批次。
+
+B 组完成后，`_batches/hp/mappo-bc-medium/step0_index.json` 封存每个 task × seed 的 checkpoint、actor 和 critic 权重哈希及实际使用的示范 manifest 哈希。C、D 从该索引加载同一对权重，并从在线步数 0 初始化优化器。每个 PPO 批次固定一次接管概率和温度，每 8 步抽取一次全队控制权。
+
+```bash
+source_dir="$RESULT_ROOT/_batches/hp/mappo-bc-medium"
+mix=(--set "tabx_online_source=$source_dir" --set tabx_mix_start=0.5
+     --set tabx_mix_decay_steps=50000 --set tabx_mix_block_steps=8)
+
+train mappo-mix "${bc[@]}" "${mix[@]}"
+train mappo-mix-warmup "${bc[@]}" "${mix[@]}" \
+  --set tabx_mappo_temp_peak=1.2 --set tabx_mappo_temp_peak_step=20000 \
+  --set tabx_mappo_temp_end_step=100000
+```
+
+每个训练进程对应一个 task × seed，四卡每卡 12 个进程最多并发 48 个 job。中断时用原命令追加 `--resume`。短流程可用 task `23,647`、一个 seed、每卡一个进程，并同时缩短采集的 `--episode-limit` 和训练的 `env_args.max_episode_steps`。各组以同一套留出种子做纯 MAPPO greedy 评估。用 `eval_summary.csv` 对比 step 0、最接近 5 万与 10 万步的已发布快照，以及 30 万步结束时的胜率。接管比例、MAPPO 动作熵和首次 PPO 概率比最大误差见 `train_metrics.csv`。
+
+### MAPPO 32 任务基础训练
 
 从仓库根目录启动四卡调度。每卡一个训练进程，CPU worker 同时评估快照。通过 `--tasks` 传入逗号分隔的任务 ID，以下示例是之前 HP/QMIX 试点的 32 个任务。
 
 ```bash
 export TASK_BANK="/your/data/1106_tasks_merged_multiagent.json"
-export RESULT_ROOT="/your/results/tabx-mappo-hp-advanced-pilot32"
+export RESULT_ROOT="/your/results/tabx-mappo-hp-all-medium-pilot32"
 export GPUS="0,1,2,3"
 python src/train_tabx_mappo32.py --tasks '23,651,657,647,492,5030,373,383,426,1340,382,329,2583,25,173,396,523,5110,275,403,520,4714,5869,6481,419,357,130,2619,3068,4303,208,147'
 ```
@@ -146,7 +203,7 @@ python "$EPYMARL_ROOT/src/tabx_pipeline.py" eval-worker \
   --root "$SMOKE_ROOT" --bank "$TASK_BANK" --bank-sha256 "$TASK_SHA256" --rule "$RULE" --once
 ```
 
-正式训练用同一配置运行 403、647、657，使用训练 seed 1、评估 master seed 0 和默认的 150 万步预算。每批用同一版策略收集 8 局，整批做 4 个 PPO epoch。Critic 将存活友方槽位的输出聚合为团队价值，每个有效环境步计算一次损失。5 步目标在对局继续时使用后续团队价值，在整局终止时保留最后一步奖励并截断 bootstrap。
+正式训练用同一配置运行 403、647、657，使用训练 seed 1 和评估 master seed 0。本示例显式运行 150 万步。每批用同一版策略收集 8 局，整批做 4 个 PPO epoch。Critic 将存活友方槽位的输出聚合为团队价值，每个有效环境步计算一次损失。5 步目标在对局继续时使用后续团队价值，在整局终止时保留最后一步奖励并截断 bootstrap。
 
 ```bash
 for task in 403 647 657; do
@@ -154,18 +211,18 @@ for task in 403 647 657; do
     --config=mappo_tabx --env-config=tabx with \
     env_args.key="\"$task\"" env_args.task_bank="$TASK_BANK" \
     env_args.expected_bank_hash="$TASK_SHA256" env_args.timeout_rule="$RULE" \
-    tabx_output_root="$RESULT_ROOT" seed=1 tabx_master_seed=0
+    tabx_output_root="$RESULT_ROOT" seed=1 tabx_master_seed=0 t_max=1500000
 done
 ```
 
-对照 MAPPO 和 QMIX 时，两种算法都使用本分支的 `advanced` 对手和相同任务、规则及种子。历史 `medium` 结果单独列为参考。
+对照 MAPPO 和 QMIX 时，两种算法都使用本分支的官方 `medium` 对手和相同任务、规则及种子。
 
 ### QMIX
 
 在独立 shell 中为 QMIX 设置结果目录，后续 CPU 评估使用同一个 `RESULT_ROOT`。
 
 ```bash
-export RESULT_ROOT="$EPYMARL_ROOT/results/tabx-qmix-hp-advanced"
+export RESULT_ROOT="$EPYMARL_ROOT/results/tabx-qmix-hp-medium"
 JAX_PLATFORMS=cpu python "$EPYMARL_ROOT/src/main.py" \
   --config=qmix_tabx --env-config=tabx with \
   'env_args.key="23"' env_args.task_bank="$TASK_BANK" \

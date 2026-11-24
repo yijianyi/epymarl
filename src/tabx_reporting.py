@@ -9,14 +9,16 @@ import statistics
 import tempfile
 
 TRAIN_METRICS_VERSION = "tabx-train-metrics-v2-mask-mean"
-PPO_TRAIN_METRICS_VERSION = "tabx-ppo-train-metrics-v1"
+PPO_TRAIN_METRICS_VERSION = "tabx-ppo-train-metrics-v2"
 
 TRAIN_FIELDS = ("t_env", "learner_updates", "loss", "td_error_abs", "grad_norm_before_clip",
                 "grad_norm_clip", "q_taken_mean", "target_mean", "lr")
 PPO_TRAIN_FIELDS = ("t_env", "learner_updates", "rollout_episodes", "policy_loss", "critic_loss",
-                    "entropy", "approx_kl", "clip_fraction")
+                    "entropy", "approx_kl", "clip_fraction", "teacher_fraction", "policy_temperature",
+                    "actor_actions", "first_ratio_max_error")
 EVAL_FIELDS = ("request_id", "checkpoint_step", "phase", "action_selection", "episodes", "wins",
-               "win_rate_pct", "mean_return", "return_std", "elimination_wins", "timeout_wins", "pure_timeouts")
+               "win_rate_pct", "mean_return", "return_std", "elimination_wins", "timeout_wins", "pure_timeouts",
+               "elimination_win_rate_pct", "timeout_win_rate_pct")
 
 
 def append_train_metrics(path, row, *, fields=TRAIN_FIELDS):
@@ -153,12 +155,15 @@ def evaluation_summary(request_id, report, checkpoint_step):
         raise ValueError("Evaluation summary seeds do not match the request")
     returns = [float(row["return_value"]) for row in rows]
     wins = sum(bool(row["is_win"]) for row in rows)
+    elimination_wins = sum(bool(row["is_win"]) and int(row["end_reason"]) == 1 for row in rows)
+    timeout_wins = sum(bool(row["is_win"]) and int(row["end_reason"]) == 2 for row in rows)
     return dict(request_id=request_id, checkpoint_step=int(checkpoint_step), phase=report["request"]["phase"],
                 action_selection=report["request"]["action_selection"], episodes=len(rows), wins=wins,
                 win_rate_pct=100.0 * wins / len(rows), mean_return=statistics.mean(returns),
                 return_std=statistics.stdev(returns) if len(rows) > 1 else 0.0,
-                elimination_wins=sum(bool(row["is_win"]) and int(row["end_reason"]) == 1 for row in rows),
-                timeout_wins=sum(bool(row["is_win"]) and int(row["end_reason"]) == 2 for row in rows),
+                elimination_wins=elimination_wins, timeout_wins=timeout_wins,
+                elimination_win_rate_pct=100.0 * elimination_wins / len(rows),
+                timeout_win_rate_pct=100.0 * timeout_wins / len(rows),
                 pure_timeouts=sum(int(row["end_reason"]) == 2 for row in rows))
 
 

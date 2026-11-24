@@ -24,20 +24,22 @@ class BasicMAC:
         return chosen_actions
 
     def forward(self, ep_batch, t, test_mode=False):
-        agent_inputs = self._build_inputs(ep_batch, t)
-        avail_actions = ep_batch["avail_actions"][:, t]
-        agent_outs, self.hidden_states = self.agent(agent_inputs, self.hidden_states)
-
-        # Softmax the agent outputs if they're policy logits
+        agent_outs = self.forward_logits(ep_batch, t)
         if self.agent_output_type == "pi_logits":
-
             if getattr(self.args, "mask_before_softmax", True):
-                # Make the logits for unavailable actions very negative to minimise their affect on the softmax
-                reshaped_avail_actions = avail_actions.reshape(ep_batch.batch_size * self.n_agents, -1)
-                agent_outs[reshaped_avail_actions == 0] = -1e10
+                agent_outs = agent_outs.masked_fill(ep_batch["avail_actions"][:, t] == 0, -1e10)
             agent_outs = th.nn.functional.softmax(agent_outs, dim=-1)
+        return agent_outs
 
+    def forward_logits(self, ep_batch, t):
+        agent_inputs = self._build_inputs(ep_batch, t)
+        agent_outs, self.hidden_states = self.agent(agent_inputs, self.hidden_states)
         return agent_outs.view(ep_batch.batch_size, self.n_agents, -1)
+
+    def policy_log_probs(self, ep_batch, t, temperature):
+        logits = self.forward_logits(ep_batch, t) / temperature
+        legal = ep_batch["avail_actions"][:, t].bool()
+        return logits.masked_fill(~legal, -1e10).log_softmax(dim=-1)
 
     def init_hidden(self, batch_size):
         self.hidden_states = self.agent.init_hidden().unsqueeze(0).expand(batch_size, self.n_agents, -1)  # bav

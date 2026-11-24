@@ -52,6 +52,15 @@ class EpisodeRunner:
         )
         self.mac = mac
         self.record_agent_alive = "agent_alive" in scheme
+        self.record_ppo_behavior = "behavior_log_prob" in scheme
+        self.teacher = None
+        if self.record_ppo_behavior and self.args.tabx_mix_start:
+            from tabx_expert import HeuristicTeacher
+            self.teacher = HeuristicTeacher(self.env)
+
+    def start_ppo_batch(self):
+        from tabx_config import rollout_schedule
+        self.teacher_probability, self.policy_temperature = rollout_schedule(self.args, self.t_env)
 
     def get_env_info(self):
         return self.env.get_env_info()
@@ -92,15 +101,42 @@ class EpisodeRunner:
         else:
             episode_return = np.zeros(self.args.n_agents)
         self.mac.init_hidden(batch_size=self.batch_size)
+        record_behavior = self.record_ppo_behavior and not test_mode
+        teacher_steps = 0
+        if record_behavior:
+            block_size = self.args.tabx_mix_block_steps
+            if self.teacher_probability:
+                seed = self.env.last_episode_seed
+                self.teacher.reset(seed)
+                control_rng = np.random.default_rng([seed, 0x4D4958])
 
         while not terminated:
             self.batch.update(self._state_data(), ts=self.t)
 
             # Pass the entire batch of experiences up till now to the agents
             # Receive the actions for each agent at this timestep in a batch of size 1
-            actions = self.mac.select_actions(
-                self.batch, t_ep=self.t, t_env=self.t_env, test_mode=test_mode
-            )
+            behavior = {}
+            if record_behavior:
+                offset = self.t % block_size
+                if offset == 0:
+                    teacher_control = bool(self.teacher_probability and control_rng.random() < self.teacher_probability)
+                log_prob = self.mac.policy_log_probs(self.batch, self.t, self.policy_temperature)
+                teacher_actions = self.teacher.actions() if self.teacher_probability else None
+                if teacher_control:
+                    actions = th.as_tensor(teacher_actions, device=self.args.device).unsqueeze(0)
+                    taken_log_prob = th.zeros_like(actions, dtype=th.float).unsqueeze(-1)
+                    teacher_steps += 1
+                else:
+                    actions = self.mac.action_selector.select_action(
+                        log_prob.exp(), self.batch["avail_actions"][:, self.t], self.t_env
+                    )
+                    taken_log_prob = log_prob.gather(-1, actions.unsqueeze(-1))
+                behavior = dict(teacher_control=[[teacher_control]], control_remaining=[[block_size - offset]],
+                                policy_temperature=[[self.policy_temperature]], behavior_log_prob=taken_log_prob)
+            else:
+                actions = self.mac.select_actions(
+                    self.batch, t_ep=self.t, t_env=self.t_env, test_mode=test_mode
+                )
 
             _, reward, terminated, truncated, env_info = self.env.step(actions[0])
             terminated = terminated or truncated
@@ -111,6 +147,7 @@ class EpisodeRunner:
             post_transition_data = {
                 "actions": actions,
                 "terminated": [(terminated != env_info.get("episode_limit", False),)],
+                **behavior,
             }
             if self.args.common_reward:
                 post_transition_data["reward"] = [(reward,)]
@@ -146,6 +183,10 @@ class EpisodeRunner:
         cur_stats["n_episodes"] = 1 + cur_stats.get("n_episodes", 0)
         cur_stats["ep_length"] = self.t + cur_stats.get("ep_length", 0)
         self.last_episode_info = dict(env_info, length=self.t, return_value=float(np.sum(episode_return)))
+        if record_behavior:
+            self.last_episode_info.update(teacher_steps=teacher_steps, teacher_fraction=teacher_steps / self.t,
+                                          teacher_probability=self.teacher_probability,
+                                          policy_temperature=self.policy_temperature)
         if recorder is not None:
             recorder.finish(self.last_episode_info)
 

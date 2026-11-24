@@ -617,6 +617,15 @@ def parser():
     worker.add_argument("--retry-failed", action="store_true")
     worker.add_argument("--poll-seconds", type=float, default=2.0)
     worker.add_argument("--lease-seconds", type=float, default=3600)
+    expert = common("collect-expert", "Collect official medium demonstrations and deterministic labels",
+                    bank=True, root=True)
+    expert.add_argument("--task", required=True)
+    expert.add_argument("--teacher", choices=("medium",), default="medium")
+    expert.add_argument("--opponent", choices=("medium",), default="medium")
+    expert.add_argument("--seed", type=int, default=0)
+    expert.add_argument("--episodes", type=int, default=128)
+    expert.add_argument("--episode-limit", type=int, choices=range(1, 513), default=512, metavar="1..512")
+    expert.add_argument("--shard-episodes", type=int, default=8)
     batch = common("batch-train", "Schedule independent TABX GPU runs and shared CPU checkpoint evaluation", bank=True, root=True, cpu_options=False)
     batch.add_argument("--alg", choices=("qmix_tabx", "mappo_tabx"), default="qmix_tabx")
     batch.add_argument("--skip-bank-hash-check", action="store_true",
@@ -686,6 +695,11 @@ def main(argv=None):
         check_bank(args)
     elif args.command == "eval-worker":
         eval_worker(args)
+    elif args.command == "collect-expert":
+        if args.episodes < 1 or not 0 <= args.seed < 2**32:
+            raise ValueError("collect-expert requires positive episodes and a uint32 seed")
+        from tabx_expert import collect_expert
+        collect_expert(args)
     elif args.command == "batch-train":
         from tabx_scheduler import batch_train
         raise SystemExit(batch_train(args))

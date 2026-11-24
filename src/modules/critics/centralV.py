@@ -12,6 +12,7 @@ class CentralVCritic(nn.Module):
         self.args = args
         self.n_actions = args.n_actions
         self.n_agents = args.n_agents
+        self.control_context = "teacher_control" in scheme
 
         input_shape = self._get_input_shape(scheme)
         self.output_type = "v"
@@ -35,6 +36,9 @@ class CentralVCritic(nn.Module):
         inputs = []
         # state
         inputs.append(batch["state"][:, ts].unsqueeze(2).repeat(1, 1, self.n_agents, 1))
+        if self.control_context:
+            control = th.cat((batch["teacher_control"][:, ts], batch["control_remaining"][:, ts]), dim=-1)
+            inputs.append(control.unsqueeze(2).expand(-1, -1, self.n_agents, -1).float())
 
         # observations
         if self.args.obs_individual_obs:
@@ -43,13 +47,12 @@ class CentralVCritic(nn.Module):
         # last actions
         if self.args.obs_last_action:
             if t == 0:
-                inputs.append(th.zeros_like(batch["actions_onehot"][:, 0:1]).view(bs, max_t, 1, -1))
+                last_actions = th.zeros_like(batch["actions_onehot"][:, 0:1])
             elif isinstance(t, int):
-                inputs.append(batch["actions_onehot"][:, slice(t-1, t)].view(bs, max_t, 1, -1))
+                last_actions = batch["actions_onehot"][:, slice(t-1, t)]
             else:
                 last_actions = th.cat([th.zeros_like(batch["actions_onehot"][:, 0:1]), batch["actions_onehot"][:, :-1]], dim=1)
-                last_actions = last_actions.view(bs, max_t, 1, -1).repeat(1, 1, self.n_agents, 1)
-                inputs.append(last_actions)
+            inputs.append(last_actions.reshape(bs, max_t, 1, -1).expand(-1, -1, self.n_agents, -1))
 
         inputs.append(th.eye(self.n_agents, device=batch.device).unsqueeze(0).unsqueeze(0).expand(bs, max_t, -1, -1))
 
@@ -59,6 +62,8 @@ class CentralVCritic(nn.Module):
     def _get_input_shape(self, scheme):
         # state
         input_shape = scheme["state"]["vshape"]
+        if self.control_context:
+            input_shape += 2
         # observations
         if self.args.obs_individual_obs:
             input_shape += scheme["obs"]["vshape"] * self.n_agents

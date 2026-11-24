@@ -17,6 +17,7 @@ class PPOLearner:
         self.n_actions = args.n_actions
         self.logger = logger
         self.tabx_rollouts = "agent_alive" in scheme
+        self.recorded_behavior = "behavior_log_prob" in scheme
         self.use_gae = self.tabx_rollouts and getattr(args, "use_gae", False)
 
         self.mac = mac
@@ -52,7 +53,10 @@ class PPOLearner:
             filled = batch["filled"].bool()
             transition_mask = filled[:, :-1] & filled[:, 1:]
             alive_at_action = batch["agent_alive"][:, :-1].squeeze(-1)
-            actor_mask = (transition_mask & alive_at_action).float()
+            actor_mask = transition_mask & alive_at_action
+            if self.recorded_behavior:
+                actor_mask = actor_mask & ~batch["teacher_control"][:, :-1]
+            actor_mask = actor_mask.float()
             critic_mask = transition_mask
         else:
             terminated = batch["terminated"][:, :-1].float()
@@ -73,6 +77,10 @@ class PPOLearner:
                 rewards = rewards.expand(-1, -1, self.n_agents)
 
         actor_count = actor_mask.sum()
+        actor_denom = actor_count.clamp_min(1)
+        actor_active = bool(actor_count.item())
+        if not actor_active:
+            self.agent_optimiser.zero_grad()
         gae_advantages = None
         gae_targets = None
         with th.no_grad():
@@ -87,47 +95,40 @@ class PPOLearner:
                 if self.args.standardise_returns:
                     gae_targets = self._standardise_targets(gae_targets)
 
-            old_mac_out = []
-            self.old_mac.init_hidden(batch.batch_size)
-            for t in range(batch.max_seq_length - 1):
-                agent_outs = self.old_mac.forward(batch, t=t)
-                old_mac_out.append(agent_outs)
-            old_pi = th.stack(old_mac_out, dim=1)
-            old_pi[actor_mask == 0] = 1.0
-            old_pi_taken = th.gather(old_pi, dim=3, index=actions).squeeze(3)
-            old_log_pi_taken = th.log(old_pi_taken + 1e-10)
+            if self.recorded_behavior:
+                old_log_pi_taken = batch["behavior_log_prob"][:, :-1].squeeze(-1)
+            elif actor_active:
+                old_log_probs = self._log_policy(self.old_mac, batch)
+                old_log_pi_taken = old_log_probs.gather(-1, actions).squeeze(-1)
 
-        for _ in range(self.args.epochs):
-            mac_out = []
-            self.mac.init_hidden(batch.batch_size)
-            for t in range(batch.max_seq_length - 1):
-                agent_outs = self.mac.forward(batch, t=t)
-                mac_out.append(agent_outs)
-            mac_out = th.stack(mac_out, dim=1)  # Concat over time
-
-            pi = mac_out
+        pg_loss = grad_norm = first_ratio_error = rewards.new_zeros(())
+        entropy = log_ratios = pi_max = th.zeros_like(actor_mask)
+        ratios = th.ones_like(actor_mask)
+        for epoch in range(self.args.epochs):
             critic_advantages, critic_train_stats = self.train_critic_sequential(
                 self.critic, self.target_critic, batch, rewards, critic_mask,
                 target_returns=gae_targets,
             )
             advantages = gae_advantages if self.use_gae else critic_advantages
             advantages = advantages.detach().expand_as(actor_mask)
-            # Calculate policy grad with mask
+            if not actor_active:
+                continue
 
-            pi[actor_mask == 0] = 1.0
-
-            pi_taken = th.gather(pi, dim=3, index=actions).squeeze(3)
-            log_pi_taken = th.log(pi_taken + 1e-10)
-
-            log_ratios = log_pi_taken - old_log_pi_taken
+            log_probs = self._log_policy(self.mac, batch)
+            log_pi_taken = log_probs.gather(-1, actions).squeeze(-1)
+            log_ratios = (log_pi_taken - old_log_pi_taken).masked_fill(actor_mask == 0, 0)
             ratios = log_ratios.exp()
+            if self.recorded_behavior and epoch == 0:
+                first_ratio_error = (ratios.detach() - 1).abs().max()
             surr1 = ratios * advantages
             surr2 = (
                 th.clamp(ratios, 1 - self.args.eps_clip, 1 + self.args.eps_clip)
                 * advantages
             )
 
-            entropy = -th.sum(pi * th.log(pi + 1e-10), dim=-1)
+            pi = log_probs.exp()
+            pi_max = pi.max(dim=-1)[0]
+            entropy = -th.sum(pi * log_probs, dim=-1)
             pg_loss = (
                 -(
                     (th.min(surr1, surr2) + self.args.entropy_coef * entropy) * actor_mask
@@ -165,10 +166,18 @@ class PPOLearner:
                 approx_kl = log_ratios.expm1() - log_ratios
                 clipped = (ratios - 1).abs() > self.args.eps_clip
                 ppo_stats = {
-                    "entropy": ((entropy * actor_mask).sum() / actor_count).item(),
-                    "approx_kl": ((approx_kl * actor_mask).sum() / actor_count).item(),
-                    "clip_fraction": ((clipped * actor_mask).sum() / actor_count).item(),
+                    "entropy": ((entropy * actor_mask).sum() / actor_denom).item(),
+                    "approx_kl": ((approx_kl * actor_mask).sum() / actor_denom).item(),
+                    "clip_fraction": ((clipped * actor_mask).sum() / actor_denom).item(),
                 }
+                if self.recorded_behavior:
+                    total = transition_mask.sum()
+                    ppo_stats.update(
+                        teacher_fraction=((batch["teacher_control"][:, :-1] & transition_mask).sum() / total).item(),
+                        policy_temperature=((batch["policy_temperature"][:, :-1] * transition_mask).sum() / total).item(),
+                        actor_actions=int(actor_count.item()),
+                        first_ratio_max_error=first_ratio_error.item(),
+                    )
             if getattr(self.args, "tabx_run_dir", None):
                 from tabx_reporting import PPO_TRAIN_FIELDS, append_train_metrics
                 append_train_metrics(
@@ -194,19 +203,38 @@ class PPOLearner:
 
             self.logger.log_stat(
                 "advantage_mean",
-                ((advantages * actor_mask).sum() / actor_count).item(),
+                ((advantages * actor_mask).sum() / actor_denom).item(),
                 t_env,
             )
             self.logger.log_stat("pg_loss", pg_loss.item(), t_env)
             self.logger.log_stat("agent_grad_norm", grad_norm.item(), t_env)
             self.logger.log_stat(
                 "pi_max",
-                ((pi.max(dim=-1)[0] * actor_mask).sum() / actor_count).item(),
+                ((pi_max * actor_mask).sum() / actor_denom).item(),
                 t_env,
             )
             for key, value in ppo_stats.items():
                 self.logger.log_stat(key, value, t_env)
             self.log_stats_t = t_env
+
+    def _log_policy(self, mac, batch):
+        mac.init_hidden(batch.batch_size)
+        if self.recorded_behavior:
+            temperature = batch["policy_temperature"].clamp_min(1).unsqueeze(-1)
+            return th.stack([
+                mac.policy_log_probs(batch, t, temperature[:, t])
+                for t in range(batch.max_seq_length - 1)
+            ], dim=1)
+        return th.stack([
+            (mac.forward(batch, t=t) + 1e-10).log()
+            for t in range(batch.max_seq_length - 1)
+        ], dim=1)
+
+    def load_initial_weights(self, path):
+        self.mac.load_models(str(path))
+        self.old_mac.load_state(self.mac)
+        self.critic.load_state_dict(th.load(path / "critic.th", map_location="cpu", weights_only=True))
+        self.target_critic.load_state_dict(self.critic.state_dict())
 
     def train_critic_sequential(self, critic, target_critic, batch, rewards, mask, *,
                                 target_returns=None):

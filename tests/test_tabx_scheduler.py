@@ -16,7 +16,7 @@ import pytest
 from tabx_pipeline import parser
 from tabx_reporting import evaluation_summary, read_csv, refresh_eval_summary
 import tabx_scheduler as scheduler
-from tabx_storage import EvalQueue, atomic_json, completed_checkpoints, read_json
+from tabx_storage import EvalQueue, atomic_json, completed_checkpoints, file_sha256, read_json
 from test_tabx_official import tiny_task
 
 
@@ -314,6 +314,42 @@ def test_mappo_batch_starts_ppo_and_formats_its_metrics(tmp_path):
     ))
     assert "policy_loss=-0.1" in message
     assert "critic_loss=0.3" in message
+
+
+def test_bc_batch_pins_demonstrations_per_task_across_seeds(tmp_path, monkeypatch):
+    bank = tmp_path / "bank.json"
+    root = tmp_path / "runs"
+    demos = tmp_path / "demos"
+    task_ids = ["23", "647", "651"]
+    paths = {task: demos / "hp" / task / "medium/manifest.json" for task in task_ids}
+    for task, path in paths.items():
+        atomic_json(path, {"task_id": task, "episodes": 3})
+    frozen = {task: file_sha256(path) for task, path in paths.items()}
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.delenv("NVIDIA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setattr(scheduler, "task_selection", lambda args: (bank, task_ids, "bank-hash", frozen))
+    calls = []
+
+    def inspect_commands(batch):
+        calls.append(batch.args.resume)
+        assert batch.manifest["identity"]["demo_manifest_sha256"] == frozen
+        for job in batch.jobs:
+            command = batch.training_command(job, dict(run_id="r", gpu="0", log="train.log"))
+            assert f'tabx_expected_demo_manifest_sha256="{frozen[job["task_id"]]}"' in command
+        return 0
+
+    monkeypatch.setattr(scheduler.BatchScheduler, "run", inspect_commands)
+    argv = ["batch-train", "--alg", "mappo_tabx", "--bank", str(bank), "--root", str(root),
+            "--rule", "hp", "--tasks", ",".join(task_ids), "--seeds", "1,2", "--gpus", "0", "--batch-id", "B",
+            "--set", "tabx_bc=True", "--set", f"tabx_demo_root={demos}"]
+    assert scheduler.batch_train(parser().parse_args(argv)) == 0
+    assert scheduler.batch_train(parser().parse_args(argv + ["--resume"])) == 0
+    atomic_json(paths["23"], {"task_id": "23", "episodes": 4})
+    atomic_json(paths["647"], {"task_id": "647", "episodes": 5})
+    with pytest.raises(ValueError, match=r"manifests changed for tasks: 23, 647\."):
+        scheduler.batch_train(parser().parse_args(argv + ["--resume"]))
+    assert calls == [False, True]
+    assert read_json(root / "_batches/hp/B/batch.json")["identity"]["demo_manifest_sha256"] == frozen
 
 
 def test_zero_exit_without_completion_inventory_is_failed(batch_fixture, monkeypatch):

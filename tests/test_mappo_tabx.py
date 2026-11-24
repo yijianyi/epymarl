@@ -11,7 +11,7 @@ from controllers.basic_controller import BasicMAC
 from learners.ppo_learner import PPOLearner
 
 
-def make_tabx_ppo(**overrides):
+def make_tabx_ppo(*, recorded_behavior=False, **overrides):
     config_path = Path(__file__).resolve().parents[1] / "src/config/algs/mappo_tabx.yaml"
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     config.update(gamma=0.5, epochs=1, entropy_coef=0., use_gae=False)
@@ -20,7 +20,8 @@ def make_tabx_ppo(**overrides):
         **config, common_reward=True, use_cuda=False, n_agents=2, n_actions=2, learner_log_interval=1
     )
     scheme, groups, preprocess = build_batch_schema(
-        dict(n_agents=2, n_actions=2, obs_shape=3, state_shape=4), include_agent_alive=True
+        dict(n_agents=2, n_actions=2, obs_shape=3, state_shape=4), include_agent_alive=True,
+        include_ppo_behavior=recorded_behavior,
     )
     batch = EpisodeBatch(scheme, groups, 2, 7, preprocess=preprocess)
     stats = {}
@@ -162,3 +163,117 @@ def test_tabx_gae_freezes_team_advantages_and_targets_for_four_epochs(monkeypatc
     live_counts = torch.tensor([[2., 1., 1., 0., 0., 0.], [2., 2., 0., 0., 0., 0.]])
     expected_policy_loss = -(expected_advantages * live_counts).sum() / live_counts.sum()
     assert stats["pg_loss"] == pytest.approx(expected_policy_loss.item(), abs=1e-6)
+
+
+def test_recorded_temperature_and_teacher_control_in_ppo():
+    learner, batch, stats = make_tabx_ppo(recorded_behavior=True, use_gae=True, obs_last_action=True)
+    batch["filled"][:, :4] = 1
+    batch["avail_actions"].fill_(1)
+    batch["agent_alive"][0, :3] = True
+    batch["agent_alive"][1, :3, 0] = True
+    batch["reward"][:, :3] = 1
+    batch["terminated"][:, 2] = 1
+    batch["teacher_control"][:, 1] = True
+    batch["control_remaining"][:, :3, 0] = torch.tensor([2, 1, 2])
+    batch["policy_temperature"][:, :3] = 1.2
+    with torch.no_grad():
+        recorded = learner._log_policy(learner.mac, batch).gather(-1, batch["actions"][:, :-1])
+        batch["behavior_log_prob"][:, :-1] = recorded
+        batch["behavior_log_prob"][:, 1] = -1000
+
+    learner.train(batch, t_env=6, episode_num=2)
+
+    assert stats["first_ratio_max_error"] < 1e-6
+    assert stats["teacher_fraction"] == pytest.approx(1 / 3)
+    assert stats["actor_actions"] == 6
+    actor = [parameter.detach().clone() for parameter in learner.agent_params]
+    critic = [parameter.detach().clone() for parameter in learner.critic_params]
+    optimizer_steps = [state["step"].item() for state in learner.agent_optimiser.state.values()]
+
+    batch["teacher_control"][:, :3] = True
+    learner.train(batch, t_env=12, episode_num=4)
+
+    assert stats["teacher_fraction"] == 1
+    assert stats["actor_actions"] == stats["pg_loss"] == stats["entropy"] == 0
+    assert all(torch.equal(before, after) for before, after in zip(actor, learner.agent_params))
+    assert optimizer_steps == [state["step"].item() for state in learner.agent_optimiser.state.values()]
+    assert any(not torch.equal(before, after) for before, after in zip(critic, learner.critic_params))
+
+
+def test_medium_bc_schedule_and_batch_overrides(tmp_path):
+    from tabx_config import rollout_schedule
+    from tabx_scheduler import training_config
+
+    config, overrides = training_config(
+        ["tabx_bc=True", f"tabx_demo_root={tmp_path}", "tabx_dagger_rounds=0",
+         "tabx_mix_start=0.5", "tabx_mappo_temp_peak=1.2"],
+        algorithm="mappo_tabx",
+    )
+    args = SimpleNamespace(**config)
+    assert overrides["tabx_dagger_rounds"] == 0
+    assert rollout_schedule(args, 0) == (0.5, 1.0)
+    assert rollout_schedule(args, 20000) == pytest.approx((0.3, 1.2))
+    assert rollout_schedule(args, 50000) == pytest.approx((0.0, 1.125))
+    assert rollout_schedule(args, 100000) == (0.0, 1.0)
+
+
+def test_bc_uses_legal_teacher_labels_on_live_transitions():
+    from tabx_imitation import behavior_cloning_loss
+
+    batch = {
+        "teacher_actions": torch.ones((1, 3, 3, 1), dtype=torch.long),
+        "actions": torch.zeros((1, 3, 3, 1), dtype=torch.long),
+        "transition_mask": torch.tensor([[[1], [1], [0]]]),
+        "filled": torch.ones((1, 3, 1)),
+        "present": torch.tensor([1, 1, 0]).reshape(1, 1, 3, 1).expand(1, 3, 3, 1),
+        "alive": torch.tensor([1, 0, 1]).reshape(1, 1, 3, 1).expand(1, 3, 3, 1),
+        "teacher_mask": torch.tensor([1, 0, 0]).reshape(1, 3, 1, 1).expand(1, 3, 3, 1),
+        "avail_actions": torch.tensor([1, 1, 0]).expand(1, 3, 3, 3),
+    }
+    logits = torch.tensor([0., 1., 100.]).expand(1, 2, 3, 3).clone().requires_grad_()
+    loss = behavior_cloning_loss(logits, batch)
+    loss.backward()
+
+    assert loss.item() == pytest.approx(torch.log1p(torch.exp(torch.tensor(-1.))).item())
+    assert logits.grad[0, 0, 0, 1] < 0
+    assert logits.grad[0, 0, 0, 2] == 0
+    assert not logits.grad[0, 0, 1:].any()
+    assert not logits.grad[0, 1:].any()
+
+
+def test_bc_uses_manifest_bytes_that_passed_the_hash_check(tmp_path, monkeypatch):
+    import tabx_imitation
+    from tabx_storage import atomic_json, file_sha256
+
+    directory = tmp_path / "hp/23/medium"
+    manifest = directory / "manifest.json"
+    shard = directory / "0000000001.h5"
+    metadata = dict(task_id="23", timeout_rule="hp", episode_limit=8, collection_phase="expert_collect")
+    directory.mkdir(parents=True)
+    shard.write_bytes(b"verified shard")
+    atomic_json(manifest, dict(metadata=metadata, shards=[dict(path=shard.name, sha256=file_sha256(shard))]))
+    pinned = file_sha256(manifest)
+    args = SimpleNamespace(tabx_demo_root=str(tmp_path), tabx_bc_teacher="medium",
+                           tabx_expected_demo_manifest_sha256=pinned, seed=1)
+    env = SimpleNamespace(manifest={"task_id": "23"}, rule="hp", episode_limit=8)
+    monkeypatch.setattr(tabx_imitation, "HeuristicTeacher", lambda *_: SimpleNamespace(metadata=lambda: {}))
+    monkeypatch.setattr(tabx_imitation, "simulator_identity", lambda: {})
+    monkeypatch.setattr(tabx_imitation, "verify_shard", lambda *_: dict(
+        metadata=metadata, schema_version=tabx_imitation.SCHEMA_VERSION,
+        label_source="deterministic_teacher", episodes=1, seeds=[1],
+    ))
+    read_bytes = Path.read_bytes
+
+    def read_then_publish(path):
+        data = read_bytes(path)
+        if path == manifest:
+            (directory / "0000000002.h5").write_bytes(b"new shard")
+            atomic_json(manifest, dict(metadata=metadata, shards=[]))
+        return data
+
+    monkeypatch.setattr(Path, "read_bytes", read_then_publish)
+    pool = tabx_imitation.DemonstrationPool(env, args)
+    assert pool.manifest_sha256 == pinned
+    assert pool.entries == [(shard, 0)]
+    with pytest.raises(ValueError, match="manifest SHA-256 mismatch for task 23"):
+        tabx_imitation.DemonstrationPool(env, args)

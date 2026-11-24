@@ -1,4 +1,4 @@
-# Standalone TABX/QMIX CPU validation environment (Python >=3.10).
+# Standalone TABX CPU validation environment (Python 3.10 for the pinned simulator).
 # Install the appropriate torch CPU/CUDA wheel for the server before this file.
 # Do not combine the old PyYAML pin in requirements.txt with this environment.
 torch==2.6.0

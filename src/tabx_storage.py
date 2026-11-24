@@ -93,13 +93,15 @@ def runtime_versions():
 
 def simulator_identity():
     root = official_tabx_root().resolve()
+    enemy_parameters = f"src/tabx/heuristic_policy/parameters/{ENEMY_HEURISTIC}.json"
     files = ("src/tabx/physics/parameters/default.json",
-             f"src/tabx/heuristic_policy/parameters/{ENEMY_HEURISTIC}.json")
+             enemy_parameters)
     if not all((root / name).is_file() for name in files):
         raise ImportError("Official TABX submodule missing; run git submodule update --init --recursive")
     return dict(simulator_contract=SIMULATOR_CONTRACT, layout_version=LAYOUT_VERSION,
                 repository_url=OFFICIAL_TABX_URL, submodule_commit=git_version(root)["commit"],
                 source_hash=code_hash(root, "src/tabx/**/*.py"),
+                enemy_heuristic=ENEMY_HEURISTIC, enemy_epsilon=read_json(root / enemy_parameters)["epsilon"][0],
                 parameter_json_sha256={name: file_sha256(root / name) for name in files},
                 outcome_definition=dict(hp="raw ally_hp_ratio > enemy_hp_ratio; exact tie loses; no rounding",
                                         loss="ally loses pure timeout", priority="post-action elimination before timeout",
@@ -160,6 +162,8 @@ def validate_snapshot(path, task_manifest, rule, *, check_runtime=True):
         raise ValueError("Snapshot agent SHA-256 mismatch")
     if file_sha256(path / "config.json") != manifest["config_sha256"]:
         raise ValueError("Snapshot config SHA-256 mismatch")
+    if "critic_sha256" in manifest and file_sha256(path / "critic.th") != manifest["critic_sha256"]:
+        raise ValueError("Snapshot critic SHA-256 mismatch")
     if check_runtime:
         current = provenance()
         for library in ("epymarl", "tabx"):
@@ -257,7 +261,7 @@ class SnapshotPublisher:
         self.last_step = None
         self.next_save = self.interval
 
-    def publish(self, learner, step, *, force_eval=False):
+    def publish(self, learner, step, *, force_eval=False, policy_stage=None, initial_weights=None):
         step = int(step)
         if self.last_step == step:
             return self.run_dir / "checkpoints" / str(step)
@@ -267,6 +271,14 @@ class SnapshotPublisher:
         tmp = Path(tempfile.mkdtemp(prefix=".snapshot-", dir=parent))
         try:
             learner.save_models(str(tmp))
+            if initial_weights is not None:
+                from shutil import copyfile
+                from tabx_online_start import WEIGHTS
+                source = read_json(self.run_dir / "online_start.json")
+                for name, key in WEIGHTS.items():
+                    copyfile(initial_weights / name, tmp / name)
+                    if file_sha256(tmp / name) != source[key]:
+                        raise ValueError(f"Source weights changed during step-0 publication: {name}")
             atomic_json(tmp / "config.json", vars(self.args))
             run = read_json(self.run_dir / "manifest.json")
             manifest = dict(schema_version="tabx-snapshot-1", t_env=step,
@@ -275,6 +287,10 @@ class SnapshotPublisher:
                             timeout_rule=run["timeout_rule"], train_seed=run["train_seed"],
                             provenance=run["provenance"], agent_sha256=file_sha256(tmp / "agent.th"),
                             config_sha256=file_sha256(tmp / "config.json"))
+            if (tmp / "critic.th").is_file():
+                manifest["critic_sha256"] = file_sha256(tmp / "critic.th")
+            if policy_stage:
+                manifest["policy_stage"] = policy_stage
             manifest["train_seed_protocol"] = TRAIN_SEED_PROTOCOL
             manifest["training_metrics_version"] = run.get("training_metrics_version")
             if run.get("batch_id"):
@@ -357,6 +373,8 @@ def completed_checkpoints(run_dir):
             if file_sha256(snapshot / filename) != entry[key]:
                 raise ValueError(f"Completed checkpoint checksum mismatch: {snapshot / filename}")
         manifest = read_json(snapshot / "manifest.json")
+        if "critic_sha256" in manifest and file_sha256(snapshot / "critic.th") != manifest["critic_sha256"]:
+            raise ValueError(f"Completed checkpoint critic checksum mismatch: {snapshot / 'critic.th'}")
         for key in ("task_id", "task_hash", "bank_hash", "timeout_rule", "run_id", "train_seed"):
             if manifest[key] != run[key]:
                 raise ValueError(f"Completed checkpoint identity mismatch: {key}")

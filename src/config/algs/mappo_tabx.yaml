@@ -41,3 +41,21 @@ obs_individual_obs: false
 save_model: true
 save_model_interval: 25000
 t_max: 80000000
+
+tabx_bc: false
+tabx_demo_root: null
+tabx_expected_demo_manifest_sha256: null
+tabx_bc_teacher: medium
+tabx_demo_opponent: medium
+tabx_bc_steps: 1000
+tabx_bc_batch_size: 32
+tabx_bc_lr: 0.0005
+tabx_dagger_rounds: 0
+tabx_online_source: null
+tabx_source_index_sha256: null
+tabx_mix_start: 0.0
+tabx_mix_decay_steps: 50000
+tabx_mix_block_steps: 8
+tabx_mappo_temp_peak: 1.0
+tabx_mappo_temp_peak_step: 20000
+tabx_mappo_temp_end_step: 100000

@@ -115,22 +115,23 @@ def test_json_parameters_and_output_root_are_part_of_the_contract(tmp_path):
         ensure_output_contract(new)
 
 
-def test_advanced_enemy_parameters_match_recorded_identity():
+def test_medium_enemy_parameters_match_recorded_identity():
     params, _ = build_task_params(tiny_task())
     enemy = params["heuristic_params"]
-    assert np.asarray(enemy.epsilon).item() == pytest.approx(0.1)
-    assert np.asarray(enemy.aggressive_threshold).item() == pytest.approx(0.5)
+    assert np.asarray(enemy.epsilon).item() == pytest.approx(0.2)
+    assert np.asarray(enemy.aggressive_threshold).item() == pytest.approx(0.3)
 
-    path = "src/tabx/heuristic_policy/parameters/advanced.json"
+    path = "src/tabx/heuristic_policy/parameters/medium.json"
     assert simulator_identity()["parameter_json_sha256"][path] == file_sha256(official_tabx_root() / path)
 
 
-def test_medium_output_root_is_rejected_without_changing_manifest(tmp_path):
+def test_advanced_output_root_is_rejected_without_changing_manifest(tmp_path):
     identity = simulator_identity()
     hashes = identity["parameter_json_sha256"]
-    hashes.pop("src/tabx/heuristic_policy/parameters/advanced.json")
-    medium_path = "src/tabx/heuristic_policy/parameters/medium.json"
-    hashes[medium_path] = file_sha256(official_tabx_root() / medium_path)
+    hashes.pop("src/tabx/heuristic_policy/parameters/medium.json")
+    advanced_path = "src/tabx/heuristic_policy/parameters/advanced.json"
+    hashes[advanced_path] = file_sha256(official_tabx_root() / advanced_path)
+    identity.update(enemy_heuristic="advanced", enemy_epsilon=0.1)
     marker = tmp_path / "tabx_semantics.json"
     atomic_json(marker, identity)
     before = marker.read_bytes()

@@ -24,6 +24,9 @@ from utils.timehelper import time_left, time_str
 
 def run(_run, _config, _log):
     # check args sanity
+    if _config["env"] == "tabx":
+        from tabx_config import configure_mappo
+        configure_mappo(_config)
     _config = args_sanity_check(_config, _log)
 
     args = SN(**_config)
@@ -124,6 +127,7 @@ def evaluate_sequential(args, runner):
 
 def run_sequential(args, logger):
     tabx_ppo = args.env == "tabx" and args.learner == "ppo_learner"
+    record_ppo_behavior = tabx_ppo and hasattr(args, "tabx_mix_start")
     if tabx_ppo and (args.batch_size < 1 or args.buffer_size != args.batch_size):
         raise ValueError("TABX PPO requires buffer_size=batch_size>=1")
 
@@ -137,7 +141,7 @@ def run_sequential(args, logger):
     args.state_shape = env_info["state_shape"]
 
     scheme, groups, preprocess = build_batch_schema(
-        env_info, args.common_reward, include_agent_alive=tabx_ppo
+        env_info, args.common_reward, include_agent_alive=tabx_ppo, include_ppo_behavior=record_ppo_behavior
     )
 
     new_buffer = partial(
@@ -223,7 +227,18 @@ def run_sequential(args, logger):
         publisher = SnapshotPublisher(args, runner.env)
         # Restored weights start a NEW attempt. Never label them random step 0.
         if not args.checkpoint_path:
-            publisher.publish(learner, 0, force_eval=True)
+            source = None
+            stage = "random_before_online" if record_ppo_behavior else None
+            if getattr(args, "tabx_bc", False):
+                from tabx_online_start import BC_STAGE
+                stage = BC_STAGE
+                if args.tabx_online_source:
+                    from tabx_online_start import initialize_online
+                    source = initialize_online(learner, runner, args)
+                else:
+                    from tabx_imitation import pretrain_actor
+                    pretrain_actor(learner, runner, args, logger)
+            publisher.publish(learner, 0, force_eval=True, policy_stage=stage, initial_weights=source)
         else:
             publisher.next_save = (runner.t_env // publisher.interval + 1) * publisher.interval
 
@@ -242,6 +257,8 @@ def run_sequential(args, logger):
         not async_tabx and not tabx_ppo and runner.t_env == args.t_max
     ):
         # Run for a whole episode at a time
+        if record_ppo_behavior and buffer.episodes_in_buffer == 0:
+            runner.start_ppo_batch()
         episode_batch = runner.run(test_mode=False)
         if args.env == "tabx":
             record = dict(episode_index=runner.env.last_train_episode_index,

@@ -15,7 +15,8 @@ import uuid
 
 from tabx_reporting import eval_line, train_line, write_csv
 from tabx_storage import (EvalQueue, atomic_json, code_hash, completed_checkpoints, ensure_output_contract,
-                          evaluation_request, git_version, read_json, resolve_under, runtime_versions, safe_component)
+                          evaluation_request, file_sha256, git_version, read_json, resolve_under, runtime_versions,
+                          safe_component)
 
 
 REPOSITORY = Path(__file__).resolve().parents[1]
@@ -26,7 +27,8 @@ BATCH_FIELDS = ("snapshot_time_utc", "task_id", "train_seed", "gpu", "status", "
                 "latest_eval_return_std", "log_path", "error")
 PROTECTED = {"env", "runner", "batch_size_run", "learner", "mixer", "mac", "agent", "use_rnn", "use_cuda",
              "device", "seed", "tabx_require_cuda", "tabx_batch_id", "tabx_assigned_gpu", "tabx_train_log",
-             "tabx_run_id", "tabx_run_dir", "tabx_output_root", "local_results_path", "checkpoint_path",
+             "tabx_run_id", "tabx_run_dir", "tabx_output_root", "tabx_source_index_sha256",
+             "tabx_expected_demo_manifest_sha256", "local_results_path", "checkpoint_path",
              "evaluate", "save_replay", "env_args.key", "env_args.seed", "env_args.task_bank",
              "env_args.timeout_rule", "env_args.expected_bank_hash", "env_args.tabx_root"}
 
@@ -73,7 +75,9 @@ def training_config(overrides, *, algorithm="qmix_tabx"):
             if isinstance(previous, (int, float)) and not isinstance(previous, bool):
                 if isinstance(value, bool) or not isinstance(value, (int, float)):
                     raise ValueError(f"{key} requires a number")
-                if isinstance(previous, int) and (not isinstance(value, int) or value <= 0):
+                if isinstance(previous, int) and key != "tabx_dagger_rounds" and (
+                    not isinstance(value, int) or value <= 0
+                ):
                     raise ValueError(f"{key} requires a positive integer")
         target[parts[-1]] = value
         canonical[key] = value
@@ -87,6 +91,11 @@ def training_config(overrides, *, algorithm="qmix_tabx"):
         raise ValueError("TABX PPO requires buffer_size=batch_size")
     if config["lr"] <= 0 or config["grad_norm_clip"] <= 0:
         raise ValueError("lr and grad_norm_clip must be positive")
+    from tabx_config import configure_mappo
+    configure_mappo(config)
+    for key in ("tabx_online_source", "tabx_demo_root"):
+        if key in canonical:
+            canonical[key] = config[key]
     config.update(use_cuda=True, tabx_require_cuda=True)
     # Identity and deployment are supplied independently, not part of hyperparameters.
     for key in ("seed", "tabx_batch_id", "tabx_assigned_gpu", "tabx_train_log", "tabx_run_id",
@@ -512,6 +521,9 @@ class BatchScheduler:
                        "tabx_train_log": attempt["log"], "tabx_require_cuda": True, "use_cuda": True})
         if not self.args.skip_bank_hash_check:
             values["env_args.expected_bank_hash"] = self.manifest["bank_hash"]
+        demo_hashes = self.manifest.get("identity", {}).get("demo_manifest_sha256")
+        if demo_hashes is not None:
+            values["tabx_expected_demo_manifest_sha256"] = demo_hashes[job["task_id"]]
         return [sys.executable, str(REPOSITORY / "src/main.py"), f"--config={self.args.alg}", "--env-config=tabx", "with",
                 *[f"{key}={_sacred(value)}" for key, value in sorted(values.items())]]
 
@@ -739,6 +751,10 @@ class BatchScheduler:
                 if training_done and (eval_done or self.worker_error):
                     self.verify_counts()
                     failed = bool(self.worker_error) or self.model_counts["complete"] != len(self.jobs)
+                    config = self.manifest["training_config"]
+                    if not failed and config.get("tabx_bc") and not (config["tabx_online_source"] or config["tabx_mix_start"]):
+                        from tabx_online_start import seal_step_zero
+                        seal_step_zero(self.directory, self.root, self.jobs, self.manifest)
                     self.state.update(status="failed" if failed else "complete", ended_at=time.time(),
                         failed_requests=[key for key, value in self.records.items() if value["status"] == "failed"],
                         worker_error=self.worker_error)
@@ -928,6 +944,19 @@ class BatchScheduler:
 
 
 
+def demonstration_manifest_hashes(config, rule, tasks):
+    from tabx_expert_shards import demonstration_directory
+
+    hashes = {}
+    for task in tasks:
+        path = demonstration_directory(config["tabx_demo_root"], rule, task, config["tabx_bc_teacher"]) / "manifest.json"
+        try:
+            hashes[task] = file_sha256(path)
+        except FileNotFoundError:
+            hashes[task] = None
+    return hashes
+
+
 def batch_train(args):
     for name in ("jobs_per_gpu", "eval_workers", "eval_threads", "eval_prefetch", "poll_seconds", "status_interval", "snapshot_interval"):
         if getattr(args, name) <= 0:
@@ -946,6 +975,14 @@ def batch_train(args):
         if Path(args.tabx_root).expanduser().resolve() != official_tabx_root().resolve():
             raise ValueError("Only the pinned official submodule may be used")
     config, overrides = training_config(args.overrides, algorithm=args.alg)
+    if config.get("tabx_online_source"):
+        from tabx_online_start import read_source_index, resolve_source
+        index, digest = read_source_index(config["tabx_online_source"], args.rule, bank_hash)
+        for task in tasks:
+            task_manifest = dict(task_id=task, task_hash=hashes[task], bank_hash=bank_hash)
+            for seed in seeds:
+                resolve_source(config, task_manifest, args.rule, seed, index=index)
+        config["tabx_source_index_sha256"] = overrides["tabx_source_index_sha256"] = digest
     identity = dict(rule=args.rule, tasks=tasks, seeds=seeds, bank_hash=bank_hash, task_hashes=hashes,
                     training_config=config, source_hash=code_hash(REPOSITORY))
     if args.skip_bank_hash_check:
@@ -956,10 +993,27 @@ def batch_train(args):
     directory = root / "_batches" / args.rule / args.batch_id
     with batch_lock(directory):
         path = directory / "batch.json"
+        trains_bc = config.get("tabx_bc") and not config["tabx_online_source"]
+        if trains_bc:
+            demo_hashes = demonstration_manifest_hashes(config, args.rule, tasks)
+            identity["demo_manifest_sha256"] = demo_hashes
         if path.exists():
             if not args.resume:
                 raise FileExistsError(f"Batch already exists: {directory}; use --resume")
             manifest = read_json(path)
+            if trains_bc:
+                saved_identity = manifest["identity"]
+                frozen = saved_identity.get("demo_manifest_sha256")
+                if frozen is None and saved_identity["training_config"].get("tabx_bc") and not (
+                    saved_identity["training_config"].get("tabx_online_source")
+                ):
+                    raise ValueError("This BC batch has no pinned demonstration manifests; start B with a new --batch-id")
+                if frozen is not None:
+                    changed = sorted(task for task in demo_hashes.keys() & frozen.keys()
+                                     if demo_hashes[task] != frozen[task])
+                    if changed:
+                        raise ValueError(f"Demonstration manifests changed for tasks: {', '.join(changed)}. "
+                                         "Start B with a new --batch-id")
             if manifest["identity"] != identity:
                 raise ValueError("Resume requires identical tasks, seeds, rule, training hyperparameters, task bank and source code")
             state = read_json(directory / "state.json")
@@ -992,6 +1046,11 @@ def batch_train(args):
         else:
             if args.resume:
                 raise FileNotFoundError(f"Cannot resume a batch that has no batch.json: {directory}")
+            if trains_bc:
+                missing = sorted(task for task, digest in demo_hashes.items() if digest is None)
+                if missing:
+                    raise FileNotFoundError(f"Missing demonstration manifests for tasks: {', '.join(missing)} "
+                                            f"under {config['tabx_demo_root']}")
             manifest = dict(schema_version="tabx-batch-1", batch_id=args.batch_id, created_at=time.time(),
                             identity=identity, bank=str(bank), bank_hash=bank_hash, task_hashes=hashes,
                             tasks=tasks, seeds=seeds, rule=args.rule, training_config=config, overrides=overrides,

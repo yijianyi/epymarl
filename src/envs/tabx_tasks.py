@@ -11,7 +11,7 @@ from pathlib import Path
 import sys
 
 TRAIN_SEED_PROTOCOL = "sha256-json-v2:uint32(task_content_hash,train_seed,'train',episode_index)"
-ENEMY_HEURISTIC = "advanced"
+ENEMY_HEURISTIC = "medium"
 
 
 def training_episode_seed(content_hash, train_seed, episode_index):
