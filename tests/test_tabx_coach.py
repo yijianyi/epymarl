@@ -100,71 +100,152 @@ def test_collection_skips_an_older_selection_with_incomplete_training(tmp_path):
     assert reasons == dict(high="training_incomplete", half="training_incomplete")
 
 
+class TrainingProcess:
+    pid = 0
+
+    def __init__(self, pass_fds):
+        self.fd = os.dup(pass_fds[0])
+        self.returncode = None
+
+    def poll(self):
+        return self.returncode
+
+    def exit(self):
+        if self.returncode is None:
+            os.close(self.fd)
+            self.returncode = 17
+
+
 @pytest.fixture
-def scheduler(tmp_path, monkeypatch):
-    args = SimpleNamespace(root=str(tmp_path), rule="hp", gpus=["0", "1"], jobs_per_gpu=2, batch_id="coach")
-    jobs = [dict(spec, status="pending", needs_training=True, attempts=[]) for spec in coach_jobs(["25", "147"], [1])]
-    batch = CoachScheduler(args, tmp_path / "_batches/hp/coach", dict(training_config={}), dict(jobs=jobs))
-    batch.bundles.extend({job["group"]: job for job in jobs if job["task_id"] == task} for task in ("25", "147"))
-    batch.initialize_job_cache()
-    batch.pool.register()
-    batch.started = []
-    batch.sealed = set()
-    children = {}
+def make_scheduler(tmp_path, monkeypatch):
+    batches = []
 
-    def launch(job, gpu):
-        task, group = job["task_id"], job["group"]
-        key = f"{task}-{group}"
-        batch.started.append(key)
-        job["attempts"].append(dict(run_id=key, gpu=gpu, status="running"))
-        job["needs_training"] = False
-        batch.running[key] = None
-        children[key] = os.dup(batch.lease[-1])
+    def make(tasks, *, gpus=("0", "1"), jobs_per_gpu=2, seeds=(1,), demos=None):
+        args = SimpleNamespace(root=str(tmp_path), rule="hp", gpus=list(gpus), jobs_per_gpu=jobs_per_gpu,
+                               batch_id="coach", resume=False, eval_workers=1, poll_seconds=0.01)
+        jobs = [dict(spec, status="pending", attempts=[]) for spec in coach_jobs(tasks, seeds)]
+        batch = CoachScheduler(args, tmp_path / "_batches/hp/coach", dict(training_config={}), dict(jobs=jobs))
+        batch.pool.register()
+        batches.append(batch)
+        batch.prepare_resume()
+        ready_demos = set(tasks if demos is None else demos)
+        sealed, started, children = set(), [], {}
+        launch = batch.launch
 
-    def finish(key):
-        del batch.running[key]
-        os.close(children.pop(key))
+        def record_launch(job, gpu):
+            launch(job, gpu)
+            key = (job["task_id"], job["train_seed"], job["group"])
+            started.append(key)
+            children[key] = batch.running[job["attempts"][-1]["run_id"]][0]
 
-    monkeypatch.setattr(batch, "launch", launch)
-    monkeypatch.setattr(batch, "demo_ready", lambda task: True)
-    monkeypatch.setattr(batch, "source_ready", lambda job: job["task_id"] in batch.sealed)
-    batch.finish = finish
-    try:
-        yield batch
-    finally:
-        batch.release_reservations()
+        def finish(task, group="B", seed=1):
+            children[task, seed, group].exit()
+            assert batch.poll_training()
+
+        monkeypatch.setattr("tabx_scheduler.subprocess.Popen",
+                            lambda *args, pass_fds, **kwargs: TrainingProcess(pass_fds))
+        monkeypatch.setattr(batch, "training_command", lambda job, attempt: [])
+        monkeypatch.setattr(batch, "launch", record_launch)
+        monkeypatch.setattr(batch, "demo_ready", lambda task: task in ready_demos)
+        monkeypatch.setattr(batch, "source_ready", lambda job: (job["task_id"], job["train_seed"]) in sealed)
+        return SimpleNamespace(batch=batch, started=started, sealed=sealed, finish=finish, ready_demos=ready_demos)
+
+    yield make
+
+    for batch in batches:
+        for process, stream, _ in batch.running.values():
+            process.exit()
+            stream.close()
+        batch.dispatcher.close()
+        batch.log.close()
         batch.pool.unregister()
-        for fd in children.values():
-            os.close(fd)
 
 
-def test_admits_task_trios_in_input_order_without_waiting_for_training_to_finish(scheduler):
-    scheduler.fill_slots()
-    assert scheduler.started == ["25-B"]
-    assert list(scheduler.reserved) == ["C", "D"]
-    scheduler.sealed.add("25")
-    scheduler.fill_slots()
-    assert scheduler.started == ["25-B", "25-C", "25-D"]
-    assert not scheduler.reserved
-    scheduler.finish("25-B")
-    scheduler.finish("25-C")
-    scheduler.fill_slots()
-    assert scheduler.started[-1] == "147-B" and "25-D" in scheduler.running
-    scheduler.sealed.add("147")
-    scheduler.fill_slots()
-    assert scheduler.started[-2:] == ["147-C", "147-D"]
+def test_four_slots_start_four_b_jobs_and_refill_one_at_a_time(make_scheduler):
+    tasks = ["25", "147", *(str(task) for task in range(200, 230))]
+    scheduler = make_scheduler(tasks)
+    batch = scheduler.batch
+    batch.fill_slots()
+    assert scheduler.started == [(task, 1, "B") for task in tasks[:4]]
+    assert batch.gpu_in_use == {"0": 2, "1": 2}
+    ready = [batch.jobs_by_id[job_id] for job_id in batch.pending_train
+             if batch.jobs_by_id[job_id]["dependency_status"] == "waiting_gpu"]
+    assert [job["task_id"] for job in ready] == tasks[4:]
+    assert all(job["group"] == "B" for job in ready)
+
+    scheduler.sealed.add(("25", 1))
+    batch.fill_slots()
+    ready_queue = [batch.jobs_by_id[job_id] for job_id in list(batch.pending_train)[:30]]
+    assert [(job["task_id"], job["group"]) for job in ready_queue] == (
+        [(task, "B") for task in tasks[4:]] + [("25", "C"), ("25", "D")])
+    scheduler.sealed.add(("147", 1))
+    scheduler.finish("147")
+    assert scheduler.started == [(task, 1, "B") for task in tasks[:5]]
+    assert batch.gpu_in_use == {"0": 2, "1": 2}
+
+
+def test_single_slot_runs_b_then_c_and_d(make_scheduler):
+    scheduler = make_scheduler(["25"], gpus=("0",), jobs_per_gpu=1)
+    batch = scheduler.batch
+    batch.fill_slots()
+    assert scheduler.started == [("25", 1, "B")]
+    assert [job["dependency_status"] for job in batch.jobs[1:]] == ["waiting_step0", "waiting_step0"]
+    scheduler.sealed.add(("25", 1))
+    batch.fill_slots()
+    assert [job["dependency_status"] for job in batch.jobs[1:]] == ["waiting_gpu", "waiting_gpu"]
+    scheduler.finish("25")
+    assert scheduler.started == [("25", 1, "B"), ("25", 1, "C")]
+    scheduler.finish("25", "C")
+    assert scheduler.started == [("25", 1, group) for group in "BCD"]
+
+
+def test_waiting_demo_does_not_block_other_b_or_overtake_ready_jobs(make_scheduler):
+    scheduler = make_scheduler(["25", "147"], gpus=("0",), jobs_per_gpu=1, demos=["147"])
+    batch = scheduler.batch
+    batch.fill_slots()
+    assert scheduler.started == [("147", 1, "B")]
+    assert batch.jobs[0]["dependency_status"] == "waiting_demo"
+    scheduler.sealed.add(("147", 1))
+    batch.fill_slots()
+    scheduler.ready_demos.add("25")
+    batch.fill_slots()
+
+    scheduler.finish("147")
+    assert scheduler.started[-1] == ("147", 1, "C")
+    scheduler.finish("147", "C")
+    assert scheduler.started[-1] == ("147", 1, "D")
+    scheduler.finish("147", "D")
+    assert scheduler.started[-1] == ("25", 1, "B")
+
+
+def test_c_and_d_can_start_while_their_b_is_running(make_scheduler):
+    scheduler = make_scheduler(["25"], seeds=(9, 1))
+    batch = scheduler.batch
+    batch.fill_slots()
+    assert scheduler.started == [("25", 9, "B"), ("25", 1, "B")]
+    scheduler.sealed.add(("25", 9))
+    batch.fill_slots()
+    assert scheduler.started[2:] == [("25", 9, "C"), ("25", 9, "D")]
+    assert len(batch.running) == 4
+    assert [job["dependency_status"] for job in batch.jobs if job["group"] != "B" and job["train_seed"] == 1] == [
+        "waiting_step0", "waiting_step0"]
 
 
 @pytest.mark.parametrize("sealed", [False, True])
-def test_b_failure_releases_reservations_or_allows_sealed_dependents(scheduler, sealed):
-    scheduler.fill_slots()
-    scheduler.finish("25-B")
+def test_b_failure_only_blocks_its_dependents_if_step0_is_missing(make_scheduler, sealed):
+    scheduler = make_scheduler(["25", "147"])
+    batch = scheduler.batch
+    batch.fill_slots()
     if sealed:
-        scheduler.sealed.add("25")
-    scheduler.fill_slots()
+        scheduler.sealed.add(("25", 1))
+    scheduler.finish("25")
     if sealed:
-        assert not any(job.get("dependency_error") for job in scheduler.jobs[1:3])
-        assert scheduler.started == ["25-B", "25-C", "25-D"]
+        assert scheduler.started[2:] == [("25", 1, "C"), ("25", 1, "D")]
+        assert all(not job.get("dependency_error") for job in batch.jobs[1:3])
     else:
-        assert all("B failed before sealing" in job["dependency_error"] for job in scheduler.jobs[1:3])
-        assert scheduler.started == ["25-B", "147-B"]
+        assert scheduler.started == [("25", 1, "B"), ("147", 1, "B")]
+        assert all("B failed before sealing step 0: Training exited with code 17" == job["dependency_error"]
+                   for job in batch.jobs[1:3])
+        assert all(job["dependency_status"] == "dependency_failed" and not job["needs_training"]
+                   for job in batch.jobs[1:3])
+    assert all(job["dependency_status"] == "waiting_step0" for job in batch.jobs[4:])

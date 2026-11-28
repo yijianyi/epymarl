@@ -69,10 +69,6 @@ class SharedGpuPool:
         return fd
 
     def acquire(self, *, more_ready):
-        leases = self.acquire_many(1, more_ready=more_ready)
-        return leases[0] if leases else None
-
-    def acquire_many(self, count, *, more_ready):
         with self._locked() as state:
             groups = state["groups"]
             start = GROUPS.index(state["last"]) + 1 if state["last"] else 0
@@ -80,26 +76,20 @@ class SharedGpuPool:
             winner = next((group for group in order if groups.get(group, {}).get("ready")
                            and process_alive(groups[group])), None)
             if winner != self.group:
-                return []
-            leases = []
-            acquired = False
-            try:
-                for gpu, slot in self.slots:
-                    fd = self._try_lock(slot)
-                    if fd is None:
-                        continue
-                    leases.append((gpu, slot, fd))
-                    if len(leases) == count:
-                        state["last"] = self.group
-                        groups[self.group]["ready"] = more_ready
-                        atomic_json(self.path, state)
-                        acquired = True
-                        return leases
-            finally:
-                if not acquired:
-                    for _, _, fd in leases:
-                        os.close(fd)
-        return []
+                return None
+            for gpu, slot in self.slots:
+                fd = self._try_lock(slot)
+                if fd is None:
+                    continue
+                try:
+                    state["last"] = self.group
+                    groups[self.group]["ready"] = more_ready
+                    atomic_json(self.path, state)
+                except BaseException:
+                    os.close(fd)
+                    raise
+                return gpu, slot, fd
+        return None
 
     def record_launch(self, slot, job, attempt):
         record = dict(batch_id=self.member["batch_id"], task_id=job["task_id"],

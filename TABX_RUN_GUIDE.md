@@ -120,20 +120,21 @@ python "$EPYMARL_ROOT/src/tabx_pipeline.py" check-env \
 
 ### MAPPO Medium 教练批次
 
-先为每个任务采集 128 局官方 `medium vs medium` 示范，再启动统一的 B/C/D 批次。把以下路径变量设为服务器上的绝对路径。`TASKS` 的顺序决定任务的放行顺序。
+先为每个任务采集 128 局官方 `medium vs medium` 示范，再启动统一的 B/C/D 批次。把以下路径变量设为服务器上的绝对路径。初始 B 队列按 `TASKS` 和训练 seed 的顺序排列。
 
 ```bash
 TASKS="25,147,208,275,396,419,520,647,651,2619,4303,4714"
+COLLECTION="coach-medium-v1"
 BATCH="coach-medium-v1"
 
 python scripts/collect_mappo_medium_demos.py \
   --bank "$TASK_BANK" --bank-sha256 "$TASK_SHA256" --tasks "$TASKS" \
-  --root "$COACH_DEMO_ROOT" --collection-id "$BATCH" \
+  --root "$COACH_DEMO_ROOT" --collection-id "$COLLECTION" \
   --rule hp --episode-limit 512 --episodes 128 --workers 4
 
 python scripts/run_mappo_medium_coach.py \
   --bank "$TASK_BANK" --bank-sha256 "$TASK_SHA256" --tasks "$TASKS" \
-  --demo-root "$COACH_DEMO_ROOT" --collection-id "$BATCH" \
+  --demo-root "$COACH_DEMO_ROOT" --collection-id "$COLLECTION" \
   --root "$COACH_RUN_ROOT" --log-root "$COACH_LOG_ROOT" --batch-id "$BATCH" \
   --gpus "$GPUS" --jobs-per-gpu 12 --seeds 1 --eval-workers 4 --confirm-episodes 128
 
@@ -143,7 +144,9 @@ python scripts/collect_mappo_medium_coach_data.py \
   --data-root "$COACH_DATA_ROOT" --episodes-per-tier 500 --workers 4
 ```
 
-训练默认每个 job 执行 300 万在线环境步。B 做 10,000 次 BC 更新，原子发布供 B/C/D 共用的 actor 和 critic 起点。调度器为每个任务和训练 seed 预留三个名额，等三组登记启动后放行下一套。原训练命令追加 `--resume` 可复用已校验的完成清单、初筛和复核结果。未完成的在线训练开新 attempt，已封存 step 0 的 B 重试也从共享起点加载。
+训练默认每个 job 执行 300 万在线环境步。B 做 10,000 次 BC 更新，原子发布供 B/C/D 共用的 actor 和 critic 起点。每个作业单独申请一个 GPU 名额。示范就绪的 B 进入就绪队列，B 发布 step 0 后，对应的 C/D 加入队尾，B 可以继续在线训练。每空出一个名额，就从队首补一个就绪作业。原训练命令追加 `--resume` 可复用已校验的完成清单、初筛和复核结果。未完成的在线训练开新 attempt，已封存 step 0 的 B 重试也从共享起点加载。
+
+切换到新调度时用新的 `--batch-id` 启动批次，沿用原 `--demo-root` 和 `--collection-id` 可复用已采集的示范。旧批次的继续运行和 `--resume` 使用该批次绑定的源码版本。
 
 训练批次目录为 `COACH_RUN_ROOT/_batches/hp/<batch>`。其中 `COACH_REPORT.md` 和 `coach_candidates.csv` 汇总候选和胜率差，`coaches/<task>/coach_selection.json` 负责交接采集。默认纯 PPO 窗口从采样批次起点 `100000` 步开始。每组选最好的一份，以及用本 task 共同回报标尺最接近 0.5 的另一份。复核和官方 Medium 对照共用一套新环境种子。任务的 B/C/D 所有计划训练均须通过完成清单校验，才能发布教练档位。高档和半档均须取得更多胜局，半档还须落在复核 `q` 的 `0.4–0.6` 范围。每个任务可以发布零到两档。
 

@@ -1,6 +1,5 @@
-"""Train ordered groups of B, C and D from a shared, sealed BC checkpoint."""
+"""Schedule B, C and D jobs from a shared, sealed BC checkpoint."""
 from collections import deque
-from itertools import groupby
 import os
 import time
 import uuid
@@ -22,11 +21,8 @@ def coach_jobs(tasks, seeds):
 class CoachScheduler(MediumDemoScheduler):
     def __init__(self, args, directory, manifest, state):
         super().__init__(args, directory, manifest, state)
-        if len(args.gpus) * args.jobs_per_gpu < len(GROUPS):
-            raise ValueError("Coach training needs at least three GPU slots across all GPUs")
         self.pool = SharedGpuPool(self.root, args.rule, args.gpus, args.jobs_per_gpu, "coach", args.batch_id)
-        self.bundles = deque()
-        self.reserved = {}
+        self.b_jobs = {(job["task_id"], job["train_seed"]): job for job in self.jobs if job["group"] == "B"}
         self.lease = None
         self.sources = {}
 
@@ -36,7 +32,6 @@ class CoachScheduler(MediumDemoScheduler):
         try:
             code = super().run()
         finally:
-            self.release_reservations()
             self.pool.unregister()
         if code == 130:
             return code
@@ -56,10 +51,7 @@ class CoachScheduler(MediumDemoScheduler):
             job.pop("dependency_status", None)
             job.pop("dependency_error", None)
         super().prepare_resume()
-        for _, jobs in groupby(self.jobs, key=lambda job: (job["task_id"], job["train_seed"])):
-            bundle = {job["group"]: job for job in jobs}
-            if any(job["needs_training"] for job in bundle.values()):
-                self.bundles.append(bundle)
+        self.pending_train = deque(sorted(self.pending_train, key=lambda job_id: self.jobs_by_id[job_id]["group"] != "B"))
 
     def source_ready(self, job, *, refresh=False):
         task, seed = job["task_id"], job["train_seed"]
@@ -97,16 +89,27 @@ class CoachScheduler(MediumDemoScheduler):
         if any(weights.get(key) != entry[key] for key in WEIGHTS.values()):
             raise ValueError(f"{job['group']} started from different BC weights: {run}")
 
-    def release_reservations(self):
-        for _, _, fd in self.reserved.values():
-            os.close(fd)
-        self.reserved.clear()
+    def check_dependency(self, job):
+        task, seed = job["task_id"], job["train_seed"]
+        if job["group"] == "B":
+            if not self.demo_ready(task):
+                return "waiting_demo"
+            self.source_ready(job)
+            return None
+        if self.source_ready(job):
+            return None
+        b = self.b_jobs[task, seed]
+        attempt = b["attempts"][-1] if b["attempts"] else {}
+        if b["needs_training"] or attempt.get("run_id") in self.running:
+            return "waiting_step0"
+        error = b.get("dependency_error") or attempt.get("error") or "B exited without a sealed checkpoint"
+        raise ValueError(f"B failed before sealing step 0: {error}")
 
-    def launch_reserved(self, job):
-        self.lease = self.reserved.pop(job["group"])
-        gpu, _, fd = self.lease
-        self.set_dependency(job, None)
+    def launch_with_lease(self, job, lease):
+        self.lease = lease
+        gpu, _, fd = lease
         try:
+            self.set_dependency(job, None)
             self.launch(job, gpu)
             if job["attempts"][-1]["run_id"] in self.running:
                 self.gpu_in_use[gpu] += 1
@@ -114,53 +117,41 @@ class CoachScheduler(MediumDemoScheduler):
             os.close(fd)
             self.lease = None
 
+    def launch_ready(self, ready):
+        self.pool.ready(bool(ready) and not self.stopping)
+        while ready and not self.stopping:
+            lease = self.pool.acquire(more_ready=len(ready) > 1)
+            if lease is None:
+                return False
+            self.launch_with_lease(self.jobs_by_id[ready.popleft()], lease)
+        return not self.stopping
+
     def fill_slots(self):
-        while self.bundles and not self.stopping:
-            bundle = self.bundles[0]
-            b = bundle["B"]
-            task = b["task_id"]
-            waiting = [job for job in bundle.values() if job["needs_training"]]
+        ready, blocked, waiting = deque(), deque(), deque()
+        for job_id in self.pending_train:
+            queue = ready if self.jobs_by_id[job_id].get("dependency_status") == "waiting_gpu" else blocked
+            queue.append(job_id)
+
+        can_acquire = self.launch_ready(ready)
+        while blocked and not self.stopping:
+            job_id = blocked.popleft()
+            job = self.jobs_by_id[job_id]
             try:
-                if not self.reserved:
-                    if not self.demo_ready(task):
-                        self.pool.ready(False)
-                        for job in waiting:
-                            self.set_dependency(job, "waiting_demo")
-                        break
-                    self.pool.ready(True)
-                    leases = self.pool.acquire_many(len(waiting), more_ready=False)
-                    if not leases:
-                        for job in waiting:
-                            self.set_dependency(job, "waiting_gpu")
-                        break
-                    self.reserved = {job["group"]: lease for job, lease in zip(waiting, leases)}
-                    if b["needs_training"]:
-                        self.source_ready(b)
-                        self.launch_reserved(b)
-                if self.reserved:
-                    if not self.source_ready(b):
-                        last_b = b["attempts"][-1]["run_id"]
-                        if last_b not in self.running:
-                            error = b["attempts"][-1].get("error") or "B exited without a sealed checkpoint"
-                            raise ValueError(f"B failed before sealing step 0: {error}")
-                        for group in self.reserved:
-                            self.set_dependency(bundle[group], "waiting_step0")
-                        break
-                    for group in ("C", "D"):
-                        if group in self.reserved:
-                            self.source_ready(bundle[group])
-                            self.launch_reserved(bundle[group])
+                status = self.check_dependency(job)
             except (OSError, ValueError, KeyError, RuntimeError) as error:
-                for job in bundle.values():
-                    if job["needs_training"]:
-                        self.set_dependency(job, "dependency_failed", str(error))
-                        job["needs_training"] = False
-                self.release_reservations()
-            self.bundles.popleft()
-        if not self.bundles or self.stopping:
+                self.set_dependency(job, "dependency_failed", str(error))
+                job["needs_training"] = False
+                continue
+            self.set_dependency(job, status or "waiting_gpu")
+            if status:
+                waiting.append(job_id)
+                continue
+            ready.append(job_id)
+            if can_acquire:
+                can_acquire = self.launch_ready(ready)
+        if self.stopping:
             self.pool.ready(False)
-        self.pending_train = deque(job["job_id"] for bundle in self.bundles
-                                   for job in bundle.values() if job["needs_training"])
+        self.pending_train = ready + waiting + blocked
 
     def training_command(self, job, attempt):
         command = super().training_command(job, attempt)
