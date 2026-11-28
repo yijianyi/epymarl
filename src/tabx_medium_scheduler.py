@@ -21,18 +21,109 @@ def _read_status(path):
         return {}
 
 
-class MediumScheduler(BatchScheduler):
+class MediumDemoScheduler(BatchScheduler):
+    def __init__(self, args, directory, manifest, state):
+        super().__init__(args, directory, manifest, state)
+        self.config = manifest["training_config"]
+        self.demo_results = {}
+        self.demo_identity = None
+
+    def task_identity(self, task):
+        return dict(task_id=task, task_hash=self.manifest["task_hashes"][task], bank_hash=self.manifest["bank_hash"])
+
+    def demo_ready(self, task):
+        from tabx_dataset import SCHEMA_VERSION, verify_shard
+
+        if task in self.demo_results:
+            return self.demo_results[task]
+        directory = demonstration_directory(self.config["tabx_demo_root"], self.args.rule, task, "medium")
+        frozen = self.manifest["identity"]["demo_manifest_sha256"]
+        expected = frozen.get(task)
+        status_path = collection_status_path(self.config["tabx_demo_root"], self.args.rule, task)
+        status = None
+        if expected is None:
+            status = _read_status(status_path)
+            if status.get("collection_id") != self.manifest["identity"]["collection_id"]:
+                return False
+            for key, value in dict(self.task_identity(task), rule=self.args.rule,
+                                   episode_limit=self.config["env_args"]["max_episode_steps"]).items():
+                if status.get(key) != value:
+                    raise ValueError(f"Collection identity mismatch for {key}: {status_path}")
+            for key in ("teacher", "opponent"):
+                if status.get(key, "medium") != "medium":
+                    raise ValueError(f"Collection identity mismatch for {key}: {status_path}")
+            if status["status"] == "failed":
+                raise ValueError(f"Demonstration collection failed: {status['error']} ({status.get('log')})")
+            if status["status"] != "ready":
+                if status["status"] != "interrupted" and not process_alive(status["owner"]):
+                    raise ValueError(f"Demonstration collector exited before publishing {status_path}")
+                return False
+            expected = status["manifest_sha256"]
+            if not expected:
+                raise ValueError(f"Ready collection record is missing its manifest SHA-256: {status_path}")
+        try:
+            manifest, digest = read_expert_manifest(directory, expected)
+        except (FileNotFoundError, ValueError):
+            if status is not None and _read_status(status_path) != status:
+                return False
+            raise
+        metadata = manifest["metadata"]
+        fields = dict(self.task_identity(task), timeout_rule=self.args.rule,
+                      episode_limit=self.config["env_args"]["max_episode_steps"], teacher="medium",
+                      opponent="medium", label_teacher="medium", label_epsilon=0.0,
+                      collection_phase="expert_collect")
+        for key, value in fields.items():
+            if metadata.get(key) != value:
+                raise ValueError(f"Demonstration metadata mismatch for {key}: {directory}")
+        if self.demo_identity is None:
+            self.demo_identity = simulator_identity()
+        official = metadata.get("provenance", {}).get("tabx", {})
+        if any(official.get(key) != value for key, value in self.demo_identity.items()):
+            raise ValueError(f"Demonstration simulator differs from the current official medium: {directory}")
+        if status and (manifest["episodes"] != status["actual_episodes"]
+                       or status["actual_episodes"] < status["requested_episodes"]):
+            raise ValueError(f"Demonstration episode counts differ from the ready record: {directory}")
+        if status and "seed" in status and metadata.get("master_seed") != status["seed"]:
+            raise ValueError(f"Demonstration seed differs from the ready record: {directory}")
+        shard_metadata = {key: value for key, value in metadata.items() if key != "provenance"}
+        seeds = set()
+        for path in verified_expert_shards(directory, manifest):
+            shard = verify_shard(path, shard_metadata, verify_trajectories=False)
+            if shard["schema_version"] != SCHEMA_VERSION or shard["label_source"] != "deterministic_teacher":
+                raise ValueError(f"Expected v3 demonstration with deterministic teacher labels: {path}")
+            if seeds.intersection(shard["seeds"]):
+                raise ValueError(f"Duplicate demonstration episode seeds across shards: {path}")
+            seeds.update(shard["seeds"])
+        if not seeds or len(seeds) != manifest["episodes"]:
+            raise ValueError(f"Demonstration manifest episode count differs from the shard index: {directory}")
+        if status is not None:
+            frozen[task] = digest
+            atomic_json(self.directory / "batch.json", self.manifest)
+            self.emit(f"[PIN-DEMO] task={task} sha256={digest}")
+        self.demo_results[task] = True
+        return True
+
+    def set_dependency(self, job, status, error=None):
+        if (job.get("dependency_status") != status or job.get("dependency_error") != error
+                or job.get("scheduler_attempt_id") != self.scheduler_attempt_id):
+            if self.scheduler_attempt_id is not None:
+                job["scheduler_attempt_id"] = self.scheduler_attempt_id
+            job["dependency_status"] = status
+            job["dependency_error"] = error
+            self.mark_job(job, status or "gpu_admitted")
+            if error:
+                group = f" group={job['group']}" if "group" in job else ""
+                self.emit(f"[DEPENDENCY-FAILED] task={job['task_id']} seed={job['train_seed']}{group} error={error}")
+
+class MediumScheduler(MediumDemoScheduler):
     def __init__(self, args, directory, manifest, state):
         super().__init__(args, directory, manifest, state)
         self.group = args.medium_group
-        self.config = manifest["training_config"]
         self.pool = SharedGpuPool(self.root, args.rule, args.gpus, args.jobs_per_gpu, self.group, args.batch_id)
-        self.demo_results = {}
         self.sources = {}
         self.source_batch = None
         self.historical_source_failures = {}
         self.lease = None
-        self.demo_identity = None
 
     def run(self):
         runtime_path = self.directory / "runtime.json"
@@ -83,76 +174,6 @@ class MediumScheduler(BatchScheduler):
                         self.check_dependency(job)
                     except (OSError, ValueError, KeyError, RuntimeError) as error:
                         self.set_dependency(job, "dependency_failed", str(error))
-
-    def task_identity(self, task):
-        return dict(task_id=task, task_hash=self.manifest["task_hashes"][task], bank_hash=self.manifest["bank_hash"])
-
-    def demo_ready(self, task):
-        from tabx_dataset import SCHEMA_VERSION, verify_shard
-
-        if task in self.demo_results:
-            return self.demo_results[task]
-        directory = demonstration_directory(self.config["tabx_demo_root"], self.args.rule, task, "medium")
-        frozen = self.manifest["identity"]["demo_manifest_sha256"]
-        expected = frozen.get(task)
-        status_path = collection_status_path(self.config["tabx_demo_root"], self.args.rule, task)
-        status = None
-        if expected is None:
-            status = _read_status(status_path)
-            if status.get("collection_id") != self.manifest["identity"]["collection_id"]:
-                return False
-            for key, value in dict(self.task_identity(task), rule=self.args.rule,
-                                   episode_limit=self.config["env_args"]["max_episode_steps"]).items():
-                if status.get(key) != value:
-                    raise ValueError(f"Collection identity mismatch for {key}: {status_path}")
-            if status["status"] == "failed":
-                raise ValueError(f"Demonstration collection failed: {status['error']} ({status.get('log')})")
-            if status["status"] != "ready":
-                if status["status"] != "interrupted" and not process_alive(status["owner"]):
-                    raise ValueError(f"Demonstration collector exited before publishing {status_path}")
-                return False
-            expected = status["manifest_sha256"]
-            if not expected:
-                raise ValueError(f"Ready collection record is missing its manifest SHA-256: {status_path}")
-        try:
-            manifest, digest = read_expert_manifest(directory, expected)
-        except (FileNotFoundError, ValueError):
-            if status is not None and _read_status(status_path) != status:
-                return False
-            raise
-        metadata = manifest["metadata"]
-        fields = dict(self.task_identity(task), timeout_rule=self.args.rule,
-                      episode_limit=self.config["env_args"]["max_episode_steps"], teacher="medium",
-                      opponent="medium", label_teacher="medium", label_epsilon=0.0,
-                      collection_phase="expert_collect")
-        for key, value in fields.items():
-            if metadata.get(key) != value:
-                raise ValueError(f"Demonstration metadata mismatch for {key}: {directory}")
-        if self.demo_identity is None:
-            self.demo_identity = simulator_identity()
-        official = metadata.get("provenance", {}).get("tabx", {})
-        if any(official.get(key) != value for key, value in self.demo_identity.items()):
-            raise ValueError(f"Demonstration simulator differs from the current official medium: {directory}")
-        if status and (manifest["episodes"] != status["actual_episodes"]
-                       or status["actual_episodes"] < status["requested_episodes"]):
-            raise ValueError(f"Demonstration episode counts differ from the ready record: {directory}")
-        shard_metadata = {key: value for key, value in metadata.items() if key != "provenance"}
-        seeds = set()
-        for path in verified_expert_shards(directory, manifest):
-            shard = verify_shard(path, shard_metadata, verify_trajectories=False)
-            if shard["schema_version"] != SCHEMA_VERSION or shard["label_source"] != "deterministic_teacher":
-                raise ValueError(f"Expected v3 demonstration with deterministic teacher labels: {path}")
-            if seeds.intersection(shard["seeds"]):
-                raise ValueError(f"Duplicate demonstration episode seeds across shards: {path}")
-            seeds.update(shard["seeds"])
-        if not seeds or len(seeds) != manifest["episodes"]:
-            raise ValueError(f"Demonstration manifest episode count differs from the shard index: {directory}")
-        if status is not None:
-            frozen[task] = digest
-            atomic_json(self.directory / "batch.json", self.manifest)
-            self.emit(f"[PIN-DEMO] task={task} sha256={digest}")
-        self.demo_results[task] = True
-        return True
 
     def source_job_path(self, source, job):
         if self.source_batch is None:
@@ -249,17 +270,6 @@ class MediumScheduler(BatchScheduler):
                     raise ValueError("Completed job is missing its source B step-0 record")
                 return "waiting_step0"
         return None
-
-    def set_dependency(self, job, status, error=None):
-        if (job.get("dependency_status") != status or job.get("dependency_error") != error
-                or job.get("scheduler_attempt_id") != self.scheduler_attempt_id):
-            if self.scheduler_attempt_id is not None:
-                job["scheduler_attempt_id"] = self.scheduler_attempt_id
-            job["dependency_status"] = status
-            job["dependency_error"] = error
-            self.mark_job(job, status or "gpu_admitted")
-            if error:
-                self.emit(f"[DEPENDENCY-FAILED] task={job['task_id']} seed={job['train_seed']} error={error}")
 
     def fill_slots(self):
         ready, waiting = deque(), deque()

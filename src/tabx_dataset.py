@@ -215,7 +215,7 @@ def _shard_fields(data):
     return fields
 
 
-def verify_shard(path, expected=None, *, verify_trajectories=True):
+def verify_shard(path, expected=None, *, verify_trajectories=True, include_outcomes=False):
     """Validate a shard's structure, optionally decoding its episode payloads."""
     with h5py.File(path, "r") as data:
         fields = _shard_fields(data)
@@ -244,6 +244,11 @@ def verify_shard(path, expected=None, *, verify_trajectories=True):
         for name, dtype in EPISODE_FIELDS.items():
             if data[f"episodes/{name}"].shape != (len(lengths),) or data[f"episodes/{name}"].dtype != np.dtype(dtype):
                 raise ValueError(f"Invalid episode dataset {name}")
+        outcomes = {}
+        if include_outcomes:
+            returns = data["episodes/return"][:].tolist()
+            wins = data["episodes/is_win"][:].tolist()
+            outcomes["outcomes"] = [dict(is_win=win, **{"return": reward}) for reward, win in zip(returns, wins)]
     if verify_trajectories:
         for index in range(len(lengths)):
             episode = read_episode(path, index)
@@ -255,7 +260,16 @@ def verify_shard(path, expected=None, *, verify_trajectories=True):
                 raise ValueError("Trajectory checksum mismatch")
     return dict(episodes=len(lengths), steps=int(so[-1]), frames=int(fo[-1]), seeds=seeds,
                 trajectory_hashes=hashes, metadata=metadata, schema_version=schema,
-                label_source=metadata.get("label_source", "executed_actions"), bytes=Path(path).stat().st_size)
+                label_source=metadata.get("label_source", "executed_actions"), bytes=Path(path).stat().st_size, **outcomes)
+
+
+def collection_outcomes(rows):
+    returns = np.sort([row["return"] for row in rows])
+    wins = sum(row["is_win"] for row in rows)
+    low, median, high = np.quantile(returns, [0.05, 0.50, 0.95]).tolist()
+    return dict(episodes=len(rows), wins=wins, win_rate=wins / len(rows), mean_return=float(returns.mean()),
+                return_std=float(returns.std()), min_return=float(returns[0]), max_return=float(returns[-1]),
+                return_p05=low, return_median=median, return_p95=high)
 
 
 def read_episode_batch(path, indices=None, device="cpu"):

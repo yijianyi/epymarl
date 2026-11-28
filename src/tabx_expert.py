@@ -88,7 +88,10 @@ def teacher_rollout(env, teacher, seed, recorder=None):
         recorder.start(env.get_frame(), seed)
     total, length, ended = 0., 0, False
     while not ended:
-        actions, labels, label_mask = teacher.actions_and_labels()
+        if recorder is None:
+            actions = teacher.actions()
+        else:
+            actions, labels, label_mask = teacher.actions_and_labels()
         _, reward, terminated, truncated, info = env.step(actions)
         ended = terminated or truncated
         total += reward
@@ -102,6 +105,17 @@ def teacher_rollout(env, teacher, seed, recorder=None):
     if recorder is not None:
         recorder.finish(result)
     return result
+
+
+class UniformLegalPolicy:
+    def __init__(self, env):
+        self.env = env
+
+    def reset(self, seed):
+        self.rng = np.random.default_rng(seed)
+
+    def actions(self):
+        return np.array([self.rng.choice(np.flatnonzero(available)) for available in self.env.get_avail_actions()])
 
 
 def outcome_summary(rows):

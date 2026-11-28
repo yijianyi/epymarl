@@ -20,3 +20,5 @@ tabx_require_cuda: false
 tabx_batch_id: null
 tabx_assigned_gpu: null
 tabx_train_log: null
+tabx_log_root: null
+tabx_coach_group: null

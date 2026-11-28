@@ -8,7 +8,7 @@ from urllib.parse import quote
 from tabx_scheduler import process_alive, process_identity
 from tabx_storage import atomic_json, read_json
 
-GROUPS = "ABCD"
+GROUPS = ("A", "B", "C", "D", "coach")
 
 
 class SharedGpuPool:
@@ -69,6 +69,10 @@ class SharedGpuPool:
         return fd
 
     def acquire(self, *, more_ready):
+        leases = self.acquire_many(1, more_ready=more_ready)
+        return leases[0] if leases else None
+
+    def acquire_many(self, count, *, more_ready):
         with self._locked() as state:
             groups = state["groups"]
             start = GROUPS.index(state["last"]) + 1 if state["last"] else 0
@@ -76,23 +80,33 @@ class SharedGpuPool:
             winner = next((group for group in order if groups.get(group, {}).get("ready")
                            and process_alive(groups[group])), None)
             if winner != self.group:
-                return None
-            for gpu, slot in self.slots:
-                fd = self._try_lock(slot)
-                if fd is not None:
-                    try:
+                return []
+            leases = []
+            acquired = False
+            try:
+                for gpu, slot in self.slots:
+                    fd = self._try_lock(slot)
+                    if fd is None:
+                        continue
+                    leases.append((gpu, slot, fd))
+                    if len(leases) == count:
                         state["last"] = self.group
                         groups[self.group]["ready"] = more_ready
                         atomic_json(self.path, state)
-                    except BaseException:
+                        acquired = True
+                        return leases
+            finally:
+                if not acquired:
+                    for _, _, fd in leases:
                         os.close(fd)
-                        raise
-                    return gpu, slot, fd
-        return None
+        return []
 
     def record_launch(self, slot, job, attempt):
-        atomic_json(slot.with_name(f"{slot.name}.json"), dict(batch_id=self.member["batch_id"],
-                    task_id=job["task_id"], train_seed=job["train_seed"], run_id=attempt["run_id"]))
+        record = dict(batch_id=self.member["batch_id"], task_id=job["task_id"],
+                      train_seed=job["train_seed"], run_id=attempt["run_id"])
+        if "group" in job:
+            record["group"] = job["group"]
+        atomic_json(slot.with_name(f"{slot.name}.json"), record)
 
     def active_attempts(self):
         """An exec-inherited slot lock also covers a scheduler crash during spawn."""

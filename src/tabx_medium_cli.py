@@ -29,7 +29,8 @@ def repo_path(raw):
 
 
 def parser(group):
-    description = "Collect official medium vs medium demonstrations" if group is None else f"Run MAPPO Medium group {group}"
+    description = {None: "Collect official medium vs medium demonstrations",
+                   "coach": "Train and select B/C/D MAPPO coaches against Medium"}.get(group, f"Run MAPPO Medium group {group}")
     parser = argparse.ArgumentParser(description=description, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--bank", required=True, help="TABX task bank JSON")
     parser.add_argument("--tasks", required=True, help="Comma-separated task IDs")
@@ -39,7 +40,7 @@ def parser(group):
     parser.add_argument("--poll-seconds", type=positive_float, default=1.0, help="Scheduler polling interval")
     parser.add_argument("--root", type=repo_path, default=DEMO_ROOT if group is None else TRAIN_ROOT,
                         help="Output directory, resolved relative to the repository")
-    if group in (None, "B"):
+    if group in (None, "B", "coach"):
         parser.add_argument("--collection-id", default=DEFAULT_COLLECTION_ID,
                             help="Collection version shared by the collector and group B")
     if group is None:
@@ -58,22 +59,30 @@ def parser(group):
     parser.add_argument("--screen-episodes", type=positive_int, default=32, help="Greedy evaluation episodes per checkpoint")
     parser.add_argument("--save-model-interval", type=positive_int, default=25000, help="Environment step interval for checkpoint publication")
     parser.add_argument("--status-interval", type=positive_float, default=30.0, help="Seconds between progress messages")
-    parser.add_argument("--batch-id", default=BATCH_NAMES[group], help="Batch name within the output root and rule")
+    parser.add_argument("--batch-id", default=BATCH_NAMES.get(group, "coach-medium-v1"),
+                        help="Batch name within the output root and rule")
     parser.add_argument("--resume", action="store_true", help="Reuse completed work and retry interrupted or failed jobs")
-    if group == "B":
+    if group in ("B", "coach"):
         parser.add_argument("--demo-root", type=repo_path, default=DEMO_ROOT, help="Demonstration output directory")
         parser.add_argument("--bc-steps", type=positive_int, default=1000, help="Actor behavior cloning updates")
         parser.add_argument("--bc-batch-size", type=positive_int, default=32, help="Demonstrated episodes per BC update")
         parser.add_argument("--bc-lr", type=positive_float, default=0.0005, help="Behavior cloning learning rate")
     if group in ("C", "D"):
         parser.add_argument("--source-batch-id", default=BATCH_NAMES["B"], help="B batch in the same output root and rule")
+    if group in ("C", "D", "coach"):
         parser.add_argument("--mix-start", type=float, default=0.5, help="Initial medium control probability")
         parser.add_argument("--mix-decay-steps", type=positive_int, default=50000, help="Online step at which teacher control reaches zero")
         parser.add_argument("--mix-block-steps", type=positive_int, default=8, help="Environment steps between team control draws")
-    if group == "D":
+    if group in ("D", "coach"):
         parser.add_argument("--temp-peak", type=float, default=1.2, help="Peak MAPPO action temperature")
         parser.add_argument("--temp-peak-step", type=positive_int, default=20000, help="Online step at peak temperature")
         parser.add_argument("--temp-end-step", type=positive_int, default=100000, help="Online step at which temperature returns to 1")
+    if group == "coach":
+        parser.set_defaults(root="results/tabx-mappo-medium-coach", seeds="1", t_max=3000000,
+                            batch_size=32, bc_steps=10000, eval_workers=4)
+        parser.add_argument("--confirm-episodes", type=positive_int, default=128,
+                            help="Paired held-out evaluation episodes per candidate and baseline")
+        parser.add_argument("--log-root", type=repo_path, help="Separate root for scheduler, training and evaluation logs")
     return parser
 
 
@@ -115,6 +124,25 @@ def training_args(group, args):
     return options
 
 
+def coach_train(args):
+    from tabx_coach_scheduler import CoachScheduler, coach_jobs
+    from tabx_scheduler import batch_train
+    from tabx_storage import safe_component
+
+    options = training_args("B", args)
+    options.medium_group = None
+    options.log_root = args.log_root
+    safe_component(args.batch_id)
+    source = str(Path(args.root) / "_batches" / args.rule / args.batch_id)
+    mix = [f"tabx_online_source={source!r}", f"tabx_mix_start={args.mix_start!r}",
+           f"tabx_mix_decay_steps={args.mix_decay_steps}", f"tabx_mix_block_steps={args.mix_block_steps}"]
+    warmup = [f"tabx_mappo_temp_peak={args.temp_peak!r}", f"tabx_mappo_temp_peak_step={args.temp_peak_step}",
+              f"tabx_mappo_temp_end_step={args.temp_end_step}"]
+    return batch_train(options, scheduler_class=CoachScheduler, job_specs=coach_jobs,
+                       job_overrides={"C": mix, "D": mix + warmup},
+                       identity_fields=dict(confirm_episodes=args.confirm_episodes, log_root=args.log_root))
+
+
 def main(group=None, argv=None):
     cli = parser(group)
     args = cli.parse_args(argv)
@@ -126,6 +154,8 @@ def main(group=None, argv=None):
         from tabx_medium_collection import collect_parallel
         args.pilot = args.task_list = None
         return collect_parallel(args)
+    if group == "coach":
+        return coach_train(args)
     from tabx_medium_scheduler import MediumScheduler
     from tabx_scheduler import batch_train
     return batch_train(training_args(group, args), scheduler_class=MediumScheduler)

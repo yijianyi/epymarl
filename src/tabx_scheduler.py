@@ -27,6 +27,7 @@ BATCH_FIELDS = ("snapshot_time_utc", "task_id", "train_seed", "gpu", "status", "
                 "latest_eval_return_std", "log_path", "error")
 PROTECTED = {"env", "runner", "batch_size_run", "learner", "mixer", "mac", "agent", "use_rnn", "use_cuda",
              "device", "seed", "tabx_require_cuda", "tabx_batch_id", "tabx_assigned_gpu", "tabx_train_log",
+             "tabx_log_root", "tabx_coach_group",
              "tabx_run_id", "tabx_run_dir", "tabx_output_root", "tabx_source_index_sha256",
              "tabx_expected_demo_manifest_sha256", "tabx_source_step0_sha256", "tabx_publish_bc_step0",
              "local_results_path", "checkpoint_path",
@@ -99,7 +100,7 @@ def training_config(overrides, *, algorithm="qmix_tabx"):
             canonical[key] = config[key]
     config.update(use_cuda=True, tabx_require_cuda=True)
     # Identity and deployment are supplied independently, not part of hyperparameters.
-    for key in ("seed", "tabx_batch_id", "tabx_assigned_gpu", "tabx_train_log", "tabx_run_id",
+    for key in ("seed", "tabx_batch_id", "tabx_assigned_gpu", "tabx_train_log", "tabx_log_root", "tabx_coach_group", "tabx_run_id",
                 "tabx_output_root", "local_results_path"):
         config.pop(key, None)
     for key in ("key", "task_bank", "timeout_rule", "expected_bank_hash", "tabx_root"):
@@ -280,6 +281,8 @@ class BatchScheduler:
         self.process_start = process_identity(os.getpid())
         self.scheduler_attempt_id = None
         self.root = Path(args.root).expanduser().resolve()
+        self.log_root = Path(getattr(args, "log_root", None) or self.root).expanduser().resolve()
+        self.log_directory = self.log_root / directory.relative_to(self.root)
         self.queue = EvalQueue(self.root)
         self.jobs = state["jobs"]
         self.jobs_by_id = {}
@@ -287,7 +290,7 @@ class BatchScheduler:
             job.setdefault("job_id", f"{index:06d}")
             self.jobs_by_id[job["job_id"]] = job
         self.running, self.attempts, self.requests, self.records = {}, {}, {}, {}
-        self.worker = self.worker_log = self.worker_error = None
+        self.worker = self.worker_error = None
         self.dispatcher = None
         self.stopping = self.authorized = False
         self.log = None
@@ -338,6 +341,8 @@ class BatchScheduler:
         expected = dict(task_id=job["task_id"], train_seed=job["train_seed"], timeout_rule=self.args.rule,
                         batch_id=self.args.batch_id, bank_hash=self.manifest["bank_hash"],
                         task_hash=self.manifest["task_hashes"][job["task_id"]])
+        if "group" in job:
+            expected["group"] = job["group"]
         for key, value in expected.items():
             if saved.get(key) != value:
                 raise ValueError(f"Batch run identity differs: {key} in {run}")
@@ -388,7 +393,7 @@ class BatchScheduler:
     def reconcile_run(self, job, attempt, inventory, retry_failed=False, *, defer_summary=False):
         """Exactly once per completed run per invocation; never called by idle polls."""
         run = resolve_under(self.root, attempt["run"])
-        count = int(self.manifest["training_config"]["tabx_screen_episodes"])
+        count = int(self.training_parameters(job)[0]["tabx_screen_episodes"])
         requests = [evaluation_request(self.root, run, snapshot, "screen", count) for snapshot in inventory[2]]
         attempt.update(train_status="complete", inventory_verified=True, eval_expected=len(requests),
                        screen_requests={Path(request["snapshot"]).name: self.queue.request_id(request) for request in requests})
@@ -432,7 +437,8 @@ class BatchScheduler:
             self.args.eval_workers, self.eval_prefetch, on_request=self._adopt,
             known_status=lambda key: self.records.get(key, {}).get("status"))
         self.authorized = True
-        self.log = (self.directory / "batch.log").open("a", encoding="utf-8", buffering=1)
+        self.log_directory.mkdir(parents=True, exist_ok=True)
+        self.log = (self.log_directory / "batch.log").open("a", encoding="utf-8", buffering=1)
         if self.args.resume:
             self.queue.release_batch(self.args.rule, self.args.batch_id)
             self.queue.retry_failed(self.args.rule, self.args.batch_id, defer_summary=True)
@@ -451,10 +457,12 @@ class BatchScheduler:
                 if current:
                     try:
                         inventory = completed_checkpoints(run)
+                        if inventory is not None:
+                            self._check_run(job, run)
                     except (ValueError, KeyError, OSError) as error:
+                        inventory = None
                         attempt.update(train_status="failed", error=f"Invalid training completion: {error}")
                 if inventory is not None:
-                    self._check_run(job, run)
                     rows_by_request_id.update(self.reconcile_run(
                         job, attempt, inventory, retry_failed=self.args.resume, defer_summary=True))
                     job["needs_training"] = False
@@ -471,7 +479,7 @@ class BatchScheduler:
                         info = self.queue.info(reference["request_id"])
                         request = (info["request"] if info else evaluation_request(self.root, run,
                                    run / "checkpoints" / path.stem, "screen",
-                                   int(self.manifest["training_config"]["tabx_screen_episodes"])))
+                                   int(self.training_parameters(job)[0]["tabx_screen_episodes"])))
                         if self.queue.request_id(request) != reference["request_id"]:
                             raise ValueError("Saved evaluation request ID differs from the snapshot")
                         recovered = self.queue.recover(request, retry_failed=self.args.resume, defer_summary=True)
@@ -505,31 +513,42 @@ class BatchScheduler:
         self.dispatcher.restore()
         self.save("resume" if self.args.resume else "start")
 
-    def start_workers(self):
+    def spawn_eval_workers(self, scope, log_name):
         command = [sys.executable, str(REPOSITORY / "src/tabx_pipeline.py"), "eval-worker",
                    "--bank", self.manifest["bank"], "--root", str(self.root), "--rule", self.args.rule,
-                   "--batch-id", self.args.batch_id, "--workers", str(self.args.eval_workers),
+                   "--batch-id", scope, "--workers", str(self.args.eval_workers),
                    "--external-dispatch",
                    "--threads", str(self.args.eval_threads), "--poll-seconds", str(self.args.poll_seconds)]
         if self.args.eval_cpu_affinity:
             command.extend(["--cpu-affinity", self.args.eval_cpu_affinity])
-        if getattr(self.args, "medium_group", None):
+        if getattr(self.args, "medium_group", None) or self.manifest.get("job_settings"):
             command.extend(["--scheduler-pid", str(os.getpid()), "--scheduler-start", self.process_start])
         environment = dict(os.environ, CUDA_VISIBLE_DEVICES="", JAX_PLATFORMS="cpu", PYTHONUNBUFFERED="1")
-        self.worker_log = (self.directory / "eval-workers.log").open("a", encoding="utf-8", buffering=1)
-        self.worker = subprocess.Popen(command, cwd=REPOSITORY, env=environment, stdout=self.worker_log,
-                                       stderr=subprocess.STDOUT, start_new_session=True)
+        with (self.log_directory / log_name).open("a", encoding="utf-8", buffering=1) as log:
+            return subprocess.Popen(command, cwd=REPOSITORY, env=environment, stdout=log,
+                                    stderr=subprocess.STDOUT, start_new_session=True)
+
+    def start_workers(self):
+        self.worker = self.spawn_eval_workers(self.args.batch_id, "eval-workers.log")
         self.state["worker"] = dict(pid=self.worker.pid, process_start=process_identity(self.worker.pid))
         self.save("workers_started")
         self.emit(f"[WORKER] rule={self.args.rule} batch={self.args.batch_id} pid={self.worker.pid} workers={self.args.eval_workers}")
 
+    def training_parameters(self, job):
+        settings = self.manifest.get("job_settings", {}).get(job.get("group"), self.manifest)
+        return settings.get("training_config", {}), settings.get("overrides", {})
+
     def training_command(self, job, attempt):
-        values = dict(self.manifest["overrides"])
+        values = dict(self.training_parameters(job)[1])
         values.update({"env_args.key": job["task_id"], "env_args.task_bank": self.manifest["bank"],
                        "env_args.timeout_rule": self.args.rule,
                        "seed": job["train_seed"], "tabx_output_root": str(self.root), "tabx_run_id": attempt["run_id"],
                        "tabx_batch_id": self.args.batch_id, "tabx_assigned_gpu": attempt["gpu"],
                        "tabx_train_log": attempt["log"], "tabx_require_cuda": True, "use_cuda": True})
+        if getattr(self.args, "log_root", None):
+            values["tabx_log_root"] = str(self.log_root)
+        if "group" in job:
+            values["tabx_coach_group"] = job["group"]
         if not self.args.skip_bank_hash_check:
             values["env_args.expected_bank_hash"] = self.manifest["bank_hash"]
         demo_hashes = self.manifest.get("identity", {}).get("demo_manifest_sha256")
@@ -543,11 +562,12 @@ class BatchScheduler:
 
     def launch(self, job, gpu):
         number = len(job["attempts"]) + 1
-        run_id = f"{self.args.batch_id[:64]}-t{job['task_id'][:32]}-s{job['train_seed']}-a{number}-{uuid.uuid4().hex[:8]}"
-        log = self.directory / "logs" / run_id / "train.log"
+        group = f"-{job['group']}" if "group" in job else ""
+        run_id = f"{self.args.batch_id[:64]}-t{job['task_id'][:32]}-s{job['train_seed']}{group}-a{number}-{uuid.uuid4().hex[:8]}"
+        log = self.log_directory / "logs" / run_id / "train.log"
         log.parent.mkdir(parents=True, exist_ok=True)
         run = self.root / self.args.rule / job["task_id"] / str(job["train_seed"]) / run_id
-        attempt = dict(run_id=run_id, run=str(run.relative_to(self.root)), log=str(log.relative_to(self.root)),
+        attempt = dict(run_id=run_id, run=str(run.relative_to(self.root)), log=str(log.relative_to(self.log_root)),
                        gpu=gpu, status="running", train_status="running", started_at=time.time(), pid=None,
                        process_start=None, exit_code=None, error=None, eval_interrupted=bool(self.worker_error))
         job["attempts"].append(attempt)
@@ -591,11 +611,11 @@ class BatchScheduler:
             self.free_slots.append(attempt["gpu"])
             attempt.update(exit_code=code, ended_at=time.time())
             try:
-                if code != 0:
-                    raise RuntimeError(f"Training exited with code {code}")
                 run = resolve_under(self.root, attempt["run"])
                 inventory = completed_checkpoints(run)
                 if inventory is None:
+                    if code != 0:
+                        raise RuntimeError(f"Training exited with code {code}")
                     raise ValueError("Missing training_complete.json; process exit is insufficient")
                 self._check_run(job, run)
                 self.reconcile_run(job, attempt, inventory)
@@ -604,7 +624,7 @@ class BatchScheduler:
             except (OSError, ValueError, KeyError, RuntimeError) as error:
                 attempt.update(train_status="failed", error=str(error))
                 self.emit(f"[FAILED] rule={self.args.rule} task={job['task_id']} seed={job['train_seed']} "
-                          f"error={error} log={self.root / attempt['log']}")
+                          f"error={error} log={self.log_root / attempt['log']}")
             self.dirty_runs.add(run_id)
             self.save("training_finished", job)
             self.fill_slots()
@@ -724,7 +744,8 @@ class BatchScheduler:
     def log_remaining(self):
         for job in self.jobs:
             if job["status"] != "complete":
-                self.emit(f"[INCOMPLETE] task={job['task_id']} seed={job['train_seed']} "
+                group = f" group={job['group']}" if "group" in job else ""
+                self.emit(f"[INCOMPLETE] task={job['task_id']} seed={job['train_seed']}{group} "
                           f"train_status={job['train_status']} eval_status={job['eval_status']} status={job['status']} "
                           f"eval_done={job['eval_done']} eval_expected={job['eval_expected']} eval_remaining={job['eval_remaining']}")
 
@@ -802,10 +823,14 @@ class BatchScheduler:
                         attempt = job["attempts"][-1]
                         self.gpu_in_use[attempt["gpu"]] -= 1
                         attempt.update(train_status="interrupted", exit_code=process.returncode, ended_at=time.time())
-                        inventory = completed_checkpoints(resolve_under(self.root, attempt["run"]))
-                        if inventory is not None:
-                            self._check_run(job, resolve_under(self.root, attempt["run"]))
-                            self.reconcile_run(job, attempt, inventory)
+                        try:
+                            run = resolve_under(self.root, attempt["run"])
+                            inventory = completed_checkpoints(run)
+                            if inventory is not None:
+                                self._check_run(job, run)
+                                self.reconcile_run(job, attempt, inventory)
+                        except (OSError, ValueError, KeyError, RuntimeError) as error:
+                            attempt.update(train_status="failed", error=f"Invalid training completion: {error}")
                         self.dirty_runs.add(attempt["run_id"])
                         self.mark_job(job, "training_interrupted")
                     self.running.clear()
@@ -824,8 +849,6 @@ class BatchScheduler:
                     if self.stopping:
                         self.log_remaining()
                 finally:
-                    if self.worker_log:
-                        self.worker_log.close()
                     if self.dispatcher is not None:
                         self.dispatcher.close()
                     for signum, handler in previous_handlers.items():
@@ -894,6 +917,7 @@ class BatchScheduler:
         if elapsed is None and attempt:
             elapsed = attempt.get("ended_at", time.time()) - attempt["started_at"]
         return dict(task_id=job["task_id"], train_seed=job["train_seed"], gpu=attempt.get("gpu"),
+            **({"group": job["group"]} if "group" in job else {}),
             **{key: job.get(key) for key in ("status", "train_status", "eval_status", "eval_expected", "eval_done",
                     "eval_pending", "eval_running", "eval_failed", "eval_remaining")},
             run_id=attempt.get("run_id"), attempt=len(job["attempts"]), pid=attempt.get("pid"),
@@ -903,7 +927,7 @@ class BatchScheduler:
             latest_eval_episodes=latest.get("episodes"), latest_eval_wins=latest.get("wins"),
             latest_eval_win_rate_pct=latest.get("win_rate_pct"), latest_eval_mean_return=latest.get("mean_return"),
             latest_eval_return_std=latest.get("return_std"),
-            log_path=str(self.root / attempt["log"]) if attempt else None,
+            log_path=str(self.log_root / attempt["log"]) if attempt else None,
             error=job.get("dependency_error") or attempt.get("error"))
 
     def _flush_job(self, job_id):
@@ -921,7 +945,8 @@ class BatchScheduler:
             self.status_cache[job_id] = (derived["train_status"], derived["status"])
             signature = tuple(derived.values())
             if self.model_states.get(job_id) != signature:
-                self.emit(f"[MODEL] task={job['task_id']} seed={job['train_seed']} train_status={derived['train_status']} "
+                group = f" group={job['group']}" if "group" in job else ""
+                self.emit(f"[MODEL] task={job['task_id']} seed={job['train_seed']}{group} train_status={derived['train_status']} "
                           f"eval_status={derived['eval_status']} status={derived['status']} eval_done={derived['eval_done']} "
                           f"eval_expected={derived['eval_expected']} eval_remaining={derived['eval_remaining']}")
             self.model_states[job_id] = signature
@@ -932,6 +957,7 @@ class BatchScheduler:
         atomic_json(self.directory / "jobs" / f"{job_id}.json", job)
         events = sorted(self.job_events.pop(job_id, {"log_update"}))
         self._append_event(dict(time=time.time(), job_id=job_id, run_id=attempt.get("run_id"), events=events,
+            **({"group": job["group"]} if "group" in job else {}),
             **{key: job.get(key) for key in ("status", "train_status", "eval_status", "eval_done", "eval_expected", "eval_remaining")},
             t_env=self.summary_rows[job_id]["t_env"]))
 
@@ -946,7 +972,8 @@ class BatchScheduler:
             counters=dict(train=dict(self.train_counts), model=dict(self.model_counts), evaluation=dict(self.eval_counts)))
         self.state.pop("reported_metrics", None)
         self.state.pop("reported_evals", None)
-        write_csv(self.directory / "batch_summary.csv", BATCH_FIELDS,
+        fields = (*BATCH_FIELDS[:3], "group", *BATCH_FIELDS[3:]) if self.manifest.get("job_settings") else BATCH_FIELDS
+        write_csv(self.directory / "batch_summary.csv", fields,
                   (dict(row, snapshot_time_utc=stamp) for row in self.summary_rows.values()))
         atomic_json(self.directory / "state.json", self.state)
         self.last_snapshot = now
@@ -980,7 +1007,7 @@ def demonstration_manifest_hashes(config, rule, tasks):
     return hashes
 
 
-def batch_train(args, *, scheduler_class=BatchScheduler):
+def batch_train(args, *, scheduler_class=BatchScheduler, job_specs=None, job_overrides=None, identity_fields=None):
     for name in ("jobs_per_gpu", "eval_workers", "eval_threads", "eval_prefetch", "poll_seconds", "status_interval", "snapshot_interval"):
         if getattr(args, name) <= 0:
             raise ValueError(f"{name.replace('_', '-')} must be positive")
@@ -999,6 +1026,13 @@ def batch_train(args, *, scheduler_class=BatchScheduler):
             raise ValueError("Only the pinned official submodule may be used")
     config, overrides = training_config(args.overrides, algorithm=args.alg)
     medium_group = getattr(args, "medium_group", None)
+    grouped = job_specs is not None
+    specs = (job_specs(tasks, seeds) if grouped else
+             [dict(task_id=task, train_seed=seed) for task in tasks for seed in seeds])
+    job_settings = {}
+    for group, settings in (job_overrides or {}).items():
+        group_config, group_values = training_config([*args.overrides, *settings], algorithm=args.alg)
+        job_settings[group] = dict(training_config=group_config, overrides=group_values)
     if config.get("tabx_online_source") and not medium_group:
         from tabx_online_start import read_source_index, resolve_source
         index, digest = read_source_index(config["tabx_online_source"], args.rule, bank_hash)
@@ -1009,9 +1043,12 @@ def batch_train(args, *, scheduler_class=BatchScheduler):
         config["tabx_source_index_sha256"] = overrides["tabx_source_index_sha256"] = digest
     identity = dict(rule=args.rule, tasks=tasks, seeds=seeds, bank_hash=bank_hash, task_hashes=hashes,
                     training_config=config, source_hash=code_hash(REPOSITORY))
+    if grouped:
+        identity.update(jobs=specs, job_settings=job_settings, **(identity_fields or {}))
     if medium_group:
         identity["medium_group"] = medium_group
-    if medium_group == "B":
+    deferred_demos = medium_group == "B" or (grouped and getattr(args, "collection_id", None) is not None)
+    if deferred_demos:
         identity["collection_id"] = args.collection_id
     if args.skip_bank_hash_check:
         identity["skip_bank_hash_check"] = True
@@ -1022,7 +1059,7 @@ def batch_train(args, *, scheduler_class=BatchScheduler):
     with batch_lock(directory):
         path = directory / "batch.json"
         trains_bc = config.get("tabx_bc") and not config["tabx_online_source"]
-        if medium_group == "B":
+        if deferred_demos:
             identity["demo_manifest_sha256"] = {}
         elif trains_bc:
             demo_hashes = demonstration_manifest_hashes(config, args.rule, tasks)
@@ -1031,7 +1068,7 @@ def batch_train(args, *, scheduler_class=BatchScheduler):
             if not args.resume:
                 raise FileExistsError(f"Batch already exists: {directory}; use --resume")
             manifest = read_json(path)
-            if medium_group == "B":
+            if deferred_demos:
                 identity["demo_manifest_sha256"] = manifest["identity"].get("demo_manifest_sha256")
             elif trains_bc:
                 saved_identity = manifest["identity"]
@@ -1051,7 +1088,7 @@ def batch_train(args, *, scheduler_class=BatchScheduler):
             state = read_json(directory / "state.json")
             runtime_path = directory / "runtime.json"
             runtime = read_json(runtime_path) if runtime_path.exists() else {}
-            if not medium_group:
+            if not (medium_group or grouped):
                 for previous in (state.get("worker", {}), runtime.get("worker", {})):
                     if process_alive(previous):
                         raise RuntimeError(f"Previous batch worker PID {previous['pid']} is still running")
@@ -1072,14 +1109,15 @@ def batch_train(args, *, scheduler_class=BatchScheduler):
                     if not any(attempt["run_id"] == saved["run_id"] for attempt in job["attempts"]):
                         job["attempts"].append(dict(saved, status="running", train_status="running",
                                                     exit_code=None, error=None))
-            expected = [(task, seed) for task in tasks for seed in seeds]
-            if [(job["task_id"], job["train_seed"]) for job in state["jobs"]] != expected:
-                raise ValueError("Batch job state differs from its frozen task/seed list")
+            if len(state["jobs"]) != len(specs) or any(
+                    any(job.get(key) != value for key, value in spec.items())
+                    for job, spec in zip(state["jobs"], specs)):
+                raise ValueError("Batch job state differs from its frozen job list")
             manifest["bank"] = str(bank)
         else:
             if args.resume:
                 raise FileNotFoundError(f"Cannot resume a batch that has no batch.json: {directory}")
-            if trains_bc and not medium_group:
+            if trains_bc and not deferred_demos:
                 missing = sorted(task for task, digest in demo_hashes.items() if digest is None)
                 if missing:
                     raise FileNotFoundError(f"Missing demonstration manifests for tasks: {', '.join(missing)} "
@@ -1088,8 +1126,9 @@ def batch_train(args, *, scheduler_class=BatchScheduler):
                             identity=identity, bank=str(bank), bank_hash=bank_hash, task_hashes=hashes,
                             tasks=tasks, seeds=seeds, rule=args.rule, training_config=config, overrides=overrides,
                             code=git_version(REPOSITORY), source_hash=identity["source_hash"], versions=runtime_versions())
-            state = dict(status="new", jobs=[dict(task_id=task, train_seed=seed, status="pending", attempts=[])
-                                             for task in tasks for seed in seeds])
+            if grouped:
+                manifest["job_settings"] = job_settings
+            state = dict(status="new", jobs=[dict(spec, status="pending", attempts=[]) for spec in specs])
             atomic_json(path, manifest)
             atomic_json(directory / "state.json", state)
         scheduler = scheduler_class(args, directory, manifest, state)

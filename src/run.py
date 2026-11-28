@@ -256,6 +256,7 @@ def run_sequential(args, logger):
 
     logger.console_logger.info("Beginning training for {} timesteps".format(args.t_max))
 
+    ppo_batch = None
     while runner.t_env < args.t_max or (
         not async_tabx and not tabx_ppo and runner.t_env == args.t_max
     ):
@@ -292,8 +293,13 @@ def run_sequential(args, logger):
             if episode_sample.device != args.device:
                 episode_sample.to(args.device)
 
+            previous_updates = learner.training_steps if rollout_ready else None
             learner.train(episode_sample, runner.t_env, episode)
             if rollout_ready:
+                if record_ppo_behavior and learner.training_steps > previous_updates:
+                    ppo_batch = dict(batch_start_t_env=runner.batch_start_t_env,
+                                     teacher_probability=runner.teacher_probability,
+                                     policy_temperature=runner.policy_temperature)
                 buffer = new_buffer()
             if async_tabx:
                 logger.log_stat("learner_updates", learner.training_steps, runner.t_env)
@@ -318,7 +324,7 @@ def run_sequential(args, logger):
 
         can_save = not tabx_ppo or rollout_ready
         if publisher is not None and can_save and runner.t_env >= publisher.next_save:
-            publisher.publish(learner, runner.t_env)
+            publisher.publish(learner, runner.t_env, ppo_batch=ppo_batch)
 
         if not async_tabx and can_save and args.save_model and (
             runner.t_env - model_save_time >= args.save_model_interval
@@ -360,7 +366,7 @@ def run_sequential(args, logger):
             t_env=runner.t_env, learner_updates=learner.training_steps, episodes=episode,
             elapsed_seconds=time.time() - start_time,
             peak_rss_kib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
-            peak_cuda_bytes=th.cuda.max_memory_allocated() if args.use_cuda else 0))
+            peak_cuda_bytes=th.cuda.max_memory_allocated() if args.use_cuda else 0), ppo_batch=ppo_batch)
     runner.close_env()
     logger.console_logger.info("Finished Training")
 

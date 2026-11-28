@@ -119,10 +119,10 @@ def ensure_output_contract(root):
     if marker.exists():
         if read_json(marker) != expected:
             raise ValueError("Output root uses different TABX semantics/parameters; specify a new output directory")
-        return
+        return expected
     if (root / "eval_queue.sqlite3").exists() or any(root.glob("hp/*/*/*/manifest.json")) or any(root.glob("loss/*/*/*/manifest.json")):
         if marker.exists() and read_json(marker) == expected:
-            return
+            return expected
         raise ValueError("Existing output contains legacy TABX runs; migration requires a new output directory")
     # Exclusive publish avoids two initial training jobs accepting different
     # simulator identities into the same root.
@@ -138,6 +138,7 @@ def ensure_output_contract(root):
                 raise ValueError("Concurrent run initialized a different TABX output contract")
     finally:
         os.unlink(temporary)
+    return expected
 
 
 def provenance():
@@ -220,8 +221,10 @@ def create_run(config, task_manifest):
                                 "gpu_name": config.get("tabx_cuda_device_name")})
     if config.get("tabx_batch_id"):
         manifest["batch_id"] = safe_component(config["tabx_batch_id"])
+    if config.get("tabx_coach_group"):
+        manifest["group"] = safe_component(config["tabx_coach_group"])
     if config.get("tabx_train_log"):
-        log = resolve_under(root, config["tabx_train_log"])
+        log = resolve_under(config.get("tabx_log_root") or root, config["tabx_train_log"])
         if not log.is_file():
             raise ValueError("The scheduler must open the training log before launching a job")
         (path / "train.log").symlink_to(os.path.relpath(log, path))
@@ -264,7 +267,7 @@ class SnapshotPublisher:
         self.last_step = None
         self.next_save = self.interval
 
-    def publish(self, learner, step, *, force_eval=False, policy_stage=None, initial_weights=None):
+    def publish(self, learner, step, *, force_eval=False, policy_stage=None, initial_weights=None, ppo_batch=None):
         step = int(step)
         if self.last_step == step:
             return self.run_dir / "checkpoints" / str(step)
@@ -294,6 +297,8 @@ class SnapshotPublisher:
                 manifest["critic_sha256"] = file_sha256(tmp / "critic.th")
             if policy_stage:
                 manifest["policy_stage"] = policy_stage
+            if ppo_batch is not None:
+                manifest.update(ppo_batch, policy_stage="online_ppo")
             manifest["train_seed_protocol"] = TRAIN_SEED_PROTOCOL
             manifest["training_metrics_version"] = run.get("training_metrics_version")
             if run.get("batch_id"):
@@ -317,12 +322,12 @@ class SnapshotPublisher:
         self.next_save = (step // self.interval + 1) * self.interval
         return path
 
-    def complete(self, learner, step, summary):
+    def complete(self, learner, step, summary, *, ppo_batch=None):
         """Final snapshot first, then one immutable, atomically published inventory."""
         complete_path = self.run_dir / "training_complete.json"
         if complete_path.exists():
             raise FileExistsError(f"Training completion is immutable: {complete_path}")
-        self.publish(learner, step, force_eval=True)
+        self.publish(learner, step, force_eval=True, ppo_batch=ppo_batch)
         checkpoints = []
         for path in sorted((p for p in (self.run_dir / "checkpoints").iterdir() if p.name.isdigit()),
                            key=lambda p: int(p.name)):

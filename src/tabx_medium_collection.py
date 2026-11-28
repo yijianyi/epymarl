@@ -36,7 +36,7 @@ def collect_parallel(args):
             atomic_json(collection_status_path(root, args.rule, task), dict(
                 status=status, task_id=task, task_hash=hashes[task], bank_hash=bank_hash, rule=args.rule,
                 owner=owner, collection_id=collection_id, requested_episodes=args.episodes,
-                episode_limit=args.episode_limit, seed=args.seed, **extra))
+                episode_limit=args.episode_limit, teacher="medium", opponent="medium", seed=args.seed, **extra))
 
         handlers = {sig: signal.signal(sig, stop) for sig in (signal.SIGINT, signal.SIGTERM)}
         try:

@@ -60,7 +60,8 @@ class EpisodeRunner:
 
     def start_ppo_batch(self):
         from tabx_config import rollout_schedule
-        self.teacher_probability, self.policy_temperature = rollout_schedule(self.args, self.t_env)
+        self.batch_start_t_env = self.t_env
+        self.teacher_probability, self.policy_temperature = rollout_schedule(self.args, self.batch_start_t_env)
 
     def get_env_info(self):
         return self.env.get_env_info()

@@ -207,7 +207,8 @@ class EvalQueue:
             if "return_value" in row and not math.isfinite(float(row["return_value"])):
                 raise ValueError("Non-finite evaluation return")
         if request.get("snapshot"):
-            manifest = self._read(self._resolve(self.root, request["snapshot"]) / "manifest.json")
+            path = self._resolve(self.root, request["snapshot"]) / "manifest.json"
+            manifest = self._read(path)
             for field, source in (("checkpoint_hash", "agent_sha256"), ("run_id", "run_id"),
                                   ("task_id", "task_id"), ("task_hash", "task_hash"),
                                   ("bank_hash", "bank_hash"), ("rule", "timeout_rule")):
@@ -215,6 +216,10 @@ class EvalQueue:
                     raise ValueError(f"Evaluation result checkpoint mismatch: {field}")
             if manifest["t_env"] != info["checkpoint_step"]:
                 raise ValueError("Evaluation result checkpoint step mismatch")
+            if request.get("request_type") == "coach_checkpoint":
+                from tabx_storage import file_sha256
+                if request["snapshot_manifest_sha256"] != file_sha256(path):
+                    raise ValueError("Evaluation result checkpoint manifest SHA-256 mismatch")
         return report
 
     def completed_result(self, key):

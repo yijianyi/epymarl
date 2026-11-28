@@ -102,33 +102,64 @@ def rollout(runner, seed, recorder=None):
                 elapsed_seconds=time.monotonic() - started)
 
 
+def build_evaluation(request, root, bank, tabx_root):
+    from tabx_storage import file_sha256, read_json, resolve_under
+
+    if request.get("request_type") in ("medium", "uniform_legal"):
+        from envs.tabx_wrapper import TABXWrapper
+        from tabx_expert import HeuristicTeacher, UniformLegalPolicy, teacher_rollout
+
+        env = TABXWrapper(request["task_id"], task_bank=bank, timeout_rule=request["rule"], tabx_root=tabx_root,
+                          max_episode_steps=request["episode_limit"], expected_bank_hash=request["bank_hash"],
+                          expected_task_hash=request["task_hash"])
+        try:
+            policy = HeuristicTeacher(env) if request["request_type"] == "medium" else UniformLegalPolicy(env)
+            return lambda seed: teacher_rollout(env, policy, seed), env.get_env_info(), env.get_layout_info(), env.close
+        except BaseException:
+            env.close()
+            raise
+
+    snapshot = resolve_under(root, request["snapshot"])
+    manifest_path = snapshot / "manifest.json"
+    manifest = read_json(manifest_path)
+    for field, snapshot_field in (("checkpoint_hash", "agent_sha256"), ("task_hash", "task_hash"),
+                                  ("bank_hash", "bank_hash"), ("task_id", "task_id"),
+                                  ("run_id", "run_id"), ("rule", "timeout_rule")):
+        if request[field] != manifest[snapshot_field]:
+            raise ValueError(f"Request/snapshot mismatch: {field}")
+    if request.get("request_type") == "coach_checkpoint":
+        if request["snapshot_manifest_sha256"] != file_sha256(manifest_path):
+            raise ValueError("Coach evaluation snapshot manifest checksum mismatch")
+        if request["episode_limit"] != read_json(snapshot / "config.json")["env_args"]["max_episode_steps"]:
+            raise ValueError("Coach evaluation episode limit differs from the checkpoint")
+    runner = build_rollout(snapshot, bank, request["rule"], tabx_root, request["random_policy"])
+    return lambda seed: rollout(runner, seed), runner.get_env_info(), runner.env.get_layout_info(), runner.close_env
+
+
 def process_request(queue, claim, bank, tabx_root=None):
     import jax
     import resource
     import torch
-    from tabx_storage import atomic_json, read_json, resolve_under, provenance
+    from tabx_storage import provenance
     key, owner, request = claim
-    runner = None
+    close = None
     try:
         if os.environ.get("CUDA_VISIBLE_DEVICES") != "" or jax.default_backend() != "cpu":
             raise RuntimeError("Evaluator must run with no visible GPU and JAX CPU")
-        snapshot = resolve_under(queue.root, request["snapshot"])
-        manifest = read_json(snapshot / "manifest.json")
-        for field, snapshot_field in (("checkpoint_hash", "agent_sha256"), ("task_hash", "task_hash"),
-                                      ("bank_hash", "bank_hash"), ("task_id", "task_id"),
-                                      ("run_id", "run_id"), ("rule", "timeout_rule")):
-            if request[field] != manifest[snapshot_field]:
-                raise ValueError(f"Request/snapshot mismatch: {field}")
-        runner = build_rollout(snapshot, bank, request["rule"], tabx_root, request["random_policy"])
+        identity = provenance()
+        if request.get("request_type") and any(identity["tabx"].get(key) != value
+                                              for key, value in request["official_tabx"].items()):
+            raise ValueError("Coach evaluation simulator differs from the request")
+        evaluate, layout, native_layout, close = build_evaluation(request, queue.root, bank, tabx_root)
         finished = {row["seed"] for row in queue.results(key)}
         for seed in request["seeds"]:
             queue.heartbeat(key, owner)
             if seed not in finished:
-                queue.record(key, owner, rollout(runner, seed))
+                queue.record(key, owner, evaluate(seed))
         rows = queue.results(key)
         total_seconds = sum(row["elapsed_seconds"] for row in rows)
-        report = dict(request=request, episodes=rows, provenance=provenance(), layout=runner.get_env_info(),
-                      native_layout=runner.env.get_layout_info(), worker=dict(
+        report = dict(request=request, episodes=rows, provenance=identity, layout=layout,
+                      native_layout=native_layout, worker=dict(
             jax_backend=jax.default_backend(), cuda_visible_devices=os.environ["CUDA_VISIBLE_DEVICES"],
             torch_device="cpu", torch_threads=torch.get_num_threads(),
             peak_rss_kib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
@@ -147,8 +178,8 @@ def process_request(queue, claim, bank, tabx_root=None):
         print(json.dumps(dict(request_id=key, status="failed", error=error)), file=sys.stderr, flush=True)
         return False
     finally:
-        if runner is not None:
-            runner.close_env()
+        if close is not None:
+            close()
 
 
 def eval_worker(args):
@@ -300,68 +331,143 @@ def load_tiers(root, path, rule):
     return tiers, run_dir
 
 
-def collect(args):
-    configure_cpu(args.threads, args.cpu_affinity)
-    os.environ.setdefault("JAX_COMPILATION_CACHE_DIR", str(Path(args.root).expanduser().resolve() / "_jax_cache"))
-    import torch
+def collect_tier(args, target, metadata, snapshot, desired, *, outcome_metrics=False):
     from tabx_dataset import EpisodeRecorder, verify_shard, write_shard
-    from tabx_storage import atomic_json, file_sha256, resolve_under, stable_seed
+    from tabx_storage import atomic_json, file_sha256, read_json
+    import hashlib
+
+    with collection_lock(target):
+        keys = ("task_hash", "timeout_rule", "tier", "checkpoint_hash", "tiers_hash")
+        expected = {key: metadata[key] for key in keys}
+        if outcome_metrics:
+            expected.update({key: metadata[key] for key in ("episode_limit", "run_id", "seed_protocol")})
+        manifest_path = target / "manifest.json"
+        registered = {entry["path"]: entry["sha256"] for entry in read_json(manifest_path)["shards"]} if manifest_path.exists() else {}
+        complete, outcomes, shards = set(), [], []
+        existing = sorted(target.glob("*.h5"))
+        if not registered.keys() <= {path.name for path in existing}:
+            raise ValueError("A shard from the collection manifest is missing")
+        for path in existing:
+            digest = file_sha256(path)
+            if path.name in registered and digest != registered[path.name]:
+                raise ValueError(f"Published shard SHA-256 mismatch: {path}")
+            verified = verify_shard(path, expected, include_outcomes=outcome_metrics)
+            if complete.intersection(verified["seeds"]):
+                raise ValueError("Duplicate collection seeds across shards")
+            complete.update(verified["seeds"])
+            outcomes.extend(verified.get("outcomes", []))
+            shards.append(dict(path=path.name, sha256=digest, bytes=path.stat().st_size))
+        missing = [seed for seed in desired if seed not in complete]
+        runner = None
+        started = time.monotonic()
+        steps = 0
+        try:
+            if missing:
+                runner = build_rollout(snapshot, args.bank, args.rule, args.tabx_root)
+                metadata["episode_limit"] = runner.episode_limit
+            for start in range(0, len(missing), args.shard_episodes):
+                episodes = []
+                seeds = missing[start:start + args.shard_episodes]
+                for seed in seeds:
+                    recorder = EpisodeRecorder()
+                    result = rollout(runner, seed, recorder)
+                    steps += result["length"]
+                    episodes.append(recorder.episode)
+                name = hashlib.sha256(json.dumps(seeds).encode()).hexdigest()[:20] + ".h5"
+                path = write_shard(target / name, episodes, metadata)
+                complete.update(seeds)
+                shards.append(dict(path=path.name, sha256=file_sha256(path), bytes=path.stat().st_size))
+                if outcome_metrics:
+                    outcomes.extend(episode["episode"] for episode in episodes)
+                print(json.dumps(dict(tier=metadata["tier"], shard=str(path), episodes=len(seeds))), flush=True)
+            collection = dict(metadata=metadata, requested_episodes=len(desired), published_episodes=len(complete),
+                              seeds=sorted(complete), shards=sorted(shards, key=lambda entry: entry["path"]),
+                              last_session_steps_per_second=steps / max(time.monotonic() - started, 1e-9))
+            if outcomes:
+                from tabx_dataset import collection_outcomes
+                collection["outcomes"] = collection_outcomes(outcomes)
+            atomic_json(manifest_path, collection)
+            return collection
+        finally:
+            if runner is not None:
+                runner.close_env()
+
+
+def configure_collection(args, root):
+    configure_cpu(args.threads, args.cpu_affinity)
+    os.environ.setdefault("JAX_COMPILATION_CACHE_DIR", str(root / "_jax_cache"))
+    import torch
     torch.set_num_threads(args.threads)
+
+
+def collect(args):
+    from tabx_storage import file_sha256, resolve_under, stable_seed
+
     root = Path(args.root).expanduser().resolve()
+    configure_collection(args, root)
     tiers, run_dir = load_tiers(root, args.tiers, args.rule)
     tiers_hash = file_sha256(args.tiers)
     for tier in ("medium", "high"):
         target = run_dir / "data" / tiers_hash[:16] / tier
-        with collection_lock(target):
-            metadata = dict(task_id=tiers["task_id"], task_hash=tiers["task_hash"], bank_hash=tiers["bank_hash"],
-                            timeout_rule=args.rule, tier=tier, run_id=tiers["run_id"],
-                            checkpoint_hash=tiers["tiers"][tier]["checkpoint_hash"], tiers_hash=tiers_hash,
-                            seed_protocol=tiers["seed_protocol"], action_selection="greedy", provenance=tiers["provenance"],
-                            tier_metrics=tiers["tiers"][tier], selection_metrics={k: tiers[k] for k in ("R0", "RH", "paired_difference")})
-            metadata.update(layout_version=tiers["layout_version"], simulator_contract=tiers["simulator_contract"],
-                            native_shape=tiers["native_shape"], official_tabx=tiers["provenance"].get("tabx", {}))
-            complete = set()
-            for shard in sorted(target.glob("*.h5")):
-                verified = verify_shard(shard, {k: metadata[k] for k in ("task_hash", "timeout_rule", "tier", "checkpoint_hash", "tiers_hash")})
-                if complete.intersection(verified["seeds"]):
-                    raise ValueError("Duplicate collection seeds across shards")
-                complete.update(verified["seeds"])
-            desired = [stable_seed(tiers["task_hash"], tiers["master_seed"], "collect", i) for i in range(args.episodes_per_tier)]
-            missing = [seed for seed in desired if seed not in complete]
-            runner = None
-            started = time.monotonic()
-            steps = 0
-            try:
-                if missing:
-                    runner = build_rollout(resolve_under(root, tiers["tiers"][tier]["snapshot"]), args.bank,
-                                           args.rule, args.tabx_root)
-                    metadata["episode_limit"] = runner.episode_limit
-                for start in range(0, len(missing), args.shard_episodes):
-                    episodes = []
-                    seeds = missing[start:start + args.shard_episodes]
-                    for seed in seeds:
-                        recorder = EpisodeRecorder()
-                        result = rollout(runner, seed, recorder)
-                        steps += result["length"]
-                        episodes.append(recorder.episode)
-                    import hashlib
-                    name = hashlib.sha256(json.dumps(seeds).encode()).hexdigest()[:20] + ".h5"
-                    path = write_shard(target / name, episodes, metadata)
-                    complete.update(seeds)
-                    print(json.dumps(dict(tier=tier, shard=str(path), episodes=len(seeds))), flush=True)
-                shards = [dict(path=p.name, sha256=file_sha256(p), bytes=p.stat().st_size) for p in sorted(target.glob("*.h5"))]
-                atomic_json(target / "manifest.json", dict(metadata=metadata, requested_episodes=args.episodes_per_tier,
-                                                           published_episodes=len(complete), seeds=sorted(complete), shards=shards,
-                                                           last_session_steps_per_second=steps / max(time.monotonic() - started, 1e-9)))
-            finally:
-                if runner is not None:
-                    runner.close_env()
+        metadata = dict(task_id=tiers["task_id"], task_hash=tiers["task_hash"], bank_hash=tiers["bank_hash"],
+                        timeout_rule=args.rule, tier=tier, run_id=tiers["run_id"],
+                        checkpoint_hash=tiers["tiers"][tier]["checkpoint_hash"], tiers_hash=tiers_hash,
+                        seed_protocol=tiers["seed_protocol"], action_selection="greedy", provenance=tiers["provenance"],
+                        tier_metrics=tiers["tiers"][tier], selection_metrics={k: tiers[k] for k in ("R0", "RH", "paired_difference")},
+                        layout_version=tiers["layout_version"], simulator_contract=tiers["simulator_contract"],
+                        native_shape=tiers["native_shape"], official_tabx=tiers["provenance"].get("tabx", {}))
+        desired = [stable_seed(tiers["task_hash"], tiers["master_seed"], "collect", i) for i in range(args.episodes_per_tier)]
+        collect_tier(args, target, metadata, resolve_under(root, tiers["tiers"][tier]["snapshot"]), desired)
+
+
+def verify_collection_tier(directory, metadata, desired_seeds, expected_episodes=None, *, outcome_metrics=False):
+    import numpy as np
+    from tabx_dataset import read_episode, read_episode_batch, verify_shard
+    from tabx_storage import file_sha256, read_json
+
+    collection = read_json(directory / "manifest.json")
+    seeds, hashes, steps, size, outcomes = set(), [], 0, 0, []
+    shards = sorted(directory.glob("*.h5"))
+    published = {entry["path"]: entry for entry in collection["shards"]}
+    if set(published) != {path.name for path in shards} or len(published) != len(collection["shards"]):
+        raise ValueError("Shard list differs from published manifest; rerun collect to reconcile")
+    for shard in shards:
+        if file_sha256(shard) != published[shard.name]["sha256"]:
+            raise ValueError("Published shard SHA-256 mismatch")
+        result = verify_shard(shard, metadata, include_outcomes=outcome_metrics)
+        if seeds.intersection(result["seeds"]):
+            raise ValueError("Duplicate seeds across shards")
+        seeds.update(result["seeds"])
+        hashes.extend(result["trajectory_hashes"])
+        steps += result["steps"]
+        size += result["bytes"]
+        outcomes.extend(result.get("outcomes", []))
+        # Exercise every published shard through the downstream reader.
+        batch, lengths = read_episode_batch(shard, [0])
+        ep = read_episode(shard, 0)
+        length = int(lengths[0])
+        for name in ("obs", "state", "avail_actions"):
+            np.testing.assert_array_equal(batch[name][0, :length + 1].cpu().numpy(), ep["frames"][name])
+        for name in ("actions", "reward", "terminated"):
+            np.testing.assert_array_equal(batch[name][0, :length].cpu().numpy(), ep["transitions"][name])
+    desired = set(desired_seeds(collection["requested_episodes"]))
+    if not desired.issubset(seeds) or seeds != set(collection["seeds"]) or len(seeds) != collection["published_episodes"]:
+        raise ValueError("Missing or mismatched collection seeds")
+    if expected_episodes is not None and len(seeds) != expected_episodes:
+        raise ValueError(f"Expected {expected_episodes} episodes per tier; found {len(seeds)}")
+    report = dict(episodes=len(seeds), steps=steps, bytes=size, bytes_per_episode=size / max(len(seeds), 1),
+                  duplicate_trajectory_fraction=1 - len(set(hashes)) / max(len(hashes), 1))
+    if outcome_metrics:
+        from tabx_dataset import collection_outcomes
+        report["outcomes"] = collection_outcomes(outcomes)
+        if report["outcomes"] != collection["outcomes"]:
+            raise ValueError("Published outcomes differ from recorded trajectories")
+    return report
 
 
 def verify(args):
-    import numpy as np
-    from tabx_dataset import read_episode, read_episode_batch, verify_shard
     from tabx_storage import atomic_json, file_sha256, stable_seed
+
     root = Path(args.root).expanduser().resolve()
     tiers, run_dir = load_tiers(root, args.tiers, args.rule)
     if str(args.task) != tiers["task_id"]:
@@ -370,44 +476,11 @@ def verify(args):
     reports = {}
     for tier in ("medium", "high"):
         directory = run_dir / "data" / tiers_hash[:16] / tier
-        manifest_path = directory / "manifest.json"
-        if not manifest_path.is_file():
-            raise ValueError(f"No collection manifest for {tier}")
-        from tabx_storage import read_json
-        collection = read_json(manifest_path)
-        seeds, hashes, steps, size = set(), [], 0, 0
-        shards = sorted(directory.glob("*.h5"))
-        published = {entry["path"]: entry for entry in collection["shards"]}
-        if set(published) != {p.name for p in shards}:
-            raise ValueError("Shard list differs from published manifest; rerun collect to reconcile")
-        for shard in shards:
-            if file_sha256(shard) != published[shard.name]["sha256"]:
-                raise ValueError("Published shard SHA-256 mismatch")
-            result = verify_shard(shard, dict(task_hash=tiers["task_hash"], timeout_rule=args.rule,
-                                              checkpoint_hash=tiers["tiers"][tier]["checkpoint_hash"], tier=tier, tiers_hash=tiers_hash))
-            if seeds.intersection(result["seeds"]):
-                raise ValueError("Duplicate seeds across shards")
-            seeds.update(result["seeds"])
-            hashes.extend(result["trajectory_hashes"])
-            steps += result["steps"]
-            size += result["bytes"]
-            # Every published shard is exercised through the downstream reader.
-            batch, lengths = read_episode_batch(shard, [0])
-            ep = read_episode(shard, 0)
-            length = int(lengths[0])
-            for name in ("obs", "state", "avail_actions"):
-                np.testing.assert_array_equal(batch[name][0, :length + 1].cpu().numpy(), ep["frames"][name])
-            for name in ("actions", "reward", "terminated"):
-                np.testing.assert_array_equal(batch[name][0, :length].cpu().numpy(), ep["transitions"][name])
-        desired = {stable_seed(tiers["task_hash"], tiers["master_seed"], "collect", i)
-                   for i in range(collection["requested_episodes"])}
-        if not desired.issubset(seeds) or seeds != set(collection["seeds"]) or len(seeds) != collection["published_episodes"]:
-            raise ValueError("Missing or mismatched collection seeds")
-        if args.expected_episodes is not None and len(seeds) != args.expected_episodes:
-            raise ValueError(f"Expected {args.expected_episodes} episodes per tier; found {len(seeds)}")
-        reports[tier] = dict(episodes=len(seeds), steps=steps, bytes=size,
-                             bytes_per_episode=size / max(len(seeds), 1),
-                             duplicate_trajectory_fraction=1 - len(set(hashes)) / max(len(hashes), 1),
+        metadata = dict(task_hash=tiers["task_hash"], timeout_rule=args.rule,
+                        checkpoint_hash=tiers["tiers"][tier]["checkpoint_hash"], tier=tier, tiers_hash=tiers_hash)
+        def desired(count):
+            return [stable_seed(tiers["task_hash"], tiers["master_seed"], "collect", i) for i in range(count)]
+        reports[tier] = dict(verify_collection_tier(directory, metadata, desired, args.expected_episodes),
                              q=tiers["tiers"][tier]["q"])
     report = dict(status="verified", task_id=tiers["task_id"], timeout_rule=args.rule, tiers=reports)
     atomic_json(run_dir / "data" / tiers_hash[:16] / "verification.json", report)
